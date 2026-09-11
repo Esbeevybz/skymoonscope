@@ -294,23 +294,23 @@ export default function Home() {
     switch (tab) {
       case 'analytics':
         return {
-          pageTitle: 'SoroScope | Liquidity Pool APY & TVL Analytics',
+          pageTitle: 'Sky Moon Scope | Liquidity Pool APY & TVL Analytics',
           seoDescription: 'Explore historical APY, TVL, and volume charts for the XLM/USDC liquidity pool.',
         };
       case 'transactions':
         return {
-          pageTitle: 'SoroScope | Transaction History Telemetry',
+          pageTitle: 'Sky Moon Scope | Transaction History Telemetry',
           seoDescription: 'Monitor real-time Soroban contract events, transaction fees, and telemetry records.',
         };
       case 'history':
         return {
-          pageTitle: 'SoroScope | Invocation History Analysis',
+          pageTitle: 'Sky Moon Scope | Invocation History Analysis',
           seoDescription: 'Review previous Soroban contract runs and CPU/RAM instruction summaries.',
         };
       case 'explorer':
       default:
         return {
-          pageTitle: `SoroScope | ${selectedFunction.name} - Contract Analyzer`,
+          pageTitle: `Sky Moon Scope | ${selectedFunction.name} - Contract Analyzer`,
           seoDescription: `Analyze CPU, RAM, and ledger footprint of the ${selectedFunction.name} function on contract ${contractId}.`,
         };
     }
@@ -319,7 +319,7 @@ export default function Home() {
   return (
     <>
       <Head>
-        <title>SoroScope - Soroban Smart Contract Resource Analyzer</title>
+        <title>Sky Moon Scope - Soroban Smart Contract Resource Analyzer</title>
         <meta
           name="description"
           content="Explore, test, and analyze the CPU, RAM, and ledger footprint of Soroban smart contracts with absolute precision, utilizing live node queries and direct WASM bytecode analysis."
@@ -337,7 +337,7 @@ export default function Home() {
         <header className="sticky top-0 z-[100] flex flex-col gap-4 border-b border-[#30363d] bg-[#1a1f26] px-6 py-6 sm:flex-row sm:items-center sm:justify-between sm:px-10 lg:pl-[140px] lg:pr-[125px]">
           <div className="max-w-[1200px]">
             <h1 style={{ margin: '0 0 12px 0', fontSize: '28px', fontWeight: '700', color: '#00d9ff', letterSpacing: '0.5px' }}>
-              SoroScope
+              SkyMoonScope
             </h1>
             <p style={{ margin: '0', color: '#8b949e', fontSize: '14px' }}>
               Explore and test Soroban smart contracts with precision

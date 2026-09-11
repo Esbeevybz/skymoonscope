@@ -3,7 +3,7 @@ version: '3.8'
 services:
   redis:
     image: redis:7-alpine
-    container_name: soroscope-redis
+    container_name: sky-moon-scope-redis
     ports:
       - "6379:6379"
     healthcheck:
@@ -15,7 +15,7 @@ services:
 
   soroban-rpc:
     image: stellar/soroban-rpc:latest
-    container_name: soroscope-soroban-rpc
+    container_name: sky-moon-scope-soroban-rpc
     ports:
       - "8000:8000"
     restart: always
@@ -25,7 +25,7 @@ services:
     build:
       context: .
       dockerfile: core/Dockerfile
-    container_name: soroscope-core
+    container_name: sky-moon-scope-core
     ports:
       - "8080:8080"
     depends_on:
@@ -47,7 +47,7 @@ services:
     build:
       context: .
       dockerfile: web/Dockerfile
-    container_name: soroscope-web
+    container_name: sky-moon-scope-web
     ports:
       - "3000:3000"
     depends_on:

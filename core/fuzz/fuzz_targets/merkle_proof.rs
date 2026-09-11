@@ -10,7 +10,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use soroscope_core::merkle_tree::{MerkleTree, MerkleProof, ProofNode};
+use sky_moon_scope_core::merkle_tree::{MerkleTree, MerkleProof, ProofNode};
 
 fuzz_target!(|data: &[u8]| {
     if data.len() < 2 {

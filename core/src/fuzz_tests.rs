@@ -1,4 +1,4 @@
-//! Property-based fuzz tests for the soroscope simulation engine.
+//! Property-based fuzz tests for the Sky Moon Scope simulation engine.
 //!
 //! These tests use `proptest` to generate a wide variety of ledger states,
 //! contract arguments, and resource configurations to find edge cases where

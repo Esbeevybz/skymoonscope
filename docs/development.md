@@ -1,6 +1,6 @@
 # Development Guide
 
-This guide covers setting up your environment and the development standards we follow at SoroScope.
+This guide covers setting up your environment and the development standards we follow at Sky Moon Scope.
 
 ## 🚀 Getting Started
 
@@ -13,7 +13,7 @@ This guide covers setting up your environment and the development standards we f
 1.  **Fork** the repository and clone it locally.
 2.  **Rust Core**: Build the backend.
     ```bash
-    cargo build -p soroscope-core
+    cargo build -p Sky Moon Scope-core
     ```
 3.  **Web Dashboard**: Install frontend dependencies.
     ```bash

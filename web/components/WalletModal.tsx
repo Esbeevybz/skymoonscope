@@ -59,7 +59,7 @@ export function WalletModal() {
                   Connect Wallet
                 </h2>
                 <p className="mt-2 text-[#92A5A8] text-sm">
-                  Connect your wallet to get started with SoroScope
+                  Connect your wallet to get started with Sky Moon Scope
                 </p>
               </div>
 

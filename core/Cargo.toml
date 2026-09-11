@@ -1,11 +1,11 @@
 [package]
-name = "soroscope-core"
+name = "sky-moon-scope-core"
 version = "0.1.0"
 edition = "2021"
 
 
 [lib]
-name = "soroscope_core"
+name = "sky_moon_scope_core"
 path = "src/lib.rs"
 crate-type = ["rlib"]
 

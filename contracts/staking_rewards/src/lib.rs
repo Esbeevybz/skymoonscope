@@ -2,8 +2,8 @@
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
 
 use emergency_guard::{DefaultEmergencyGuard, EmergencyGuard, EmergencyGuardTrait, PauseType};
-pub use soroscope_error_codes::ContractError;
-use soroscope_math::Fixed;
+pub use Sky Moon Scope_error_codes::ContractError;
+use Sky Moon Scope_math::Fixed;
 
 pub const SCALE: i128 = 1_000_000_000_000_000_000; // 18 decimals
 

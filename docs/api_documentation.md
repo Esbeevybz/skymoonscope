@@ -1,6 +1,6 @@
 # API Documentation
 
-SoroScope Core generates its own OpenAPI description from the route handlers
+Sky Moon Scope Core generates its own OpenAPI description from the route handlers
 using [`utoipa`](https://docs.rs/utoipa). The description is produced from the
 same Rust types the handlers use, so the published contract cannot drift away
 from the implementation.
@@ -10,7 +10,7 @@ from the implementation.
 Start the server and open the documentation browser:
 
 ```bash
-cargo run -p soroscope-core
+cargo run -p Sky Moon Scope-core
 # then visit:
 #   http://localhost:8080/docs
 ```
@@ -33,10 +33,10 @@ writes the document straight to disk instead:
 
 ```bash
 # writes ./openapi.json
-cargo run -p soroscope-core -- openapi
+cargo run -p Sky Moon Scope-core -- openapi
 
 # or choose the destination
-cargo run -p soroscope-core -- openapi --out dist/openapi.json
+cargo run -p Sky Moon Scope-core -- openapi --out dist/openapi.json
 ```
 
 The command exits non-zero and logs the cause if serialization or the write

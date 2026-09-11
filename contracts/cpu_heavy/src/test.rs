@@ -208,7 +208,7 @@ fn test_rejected_call_does_no_work() {
     );
 }
 
-/// Error discriminants are part of the contract's public surface: the SoroScope
+/// Error discriminants are part of the contract's public surface: the Sky Moon Scope
 /// UI decodes them by number, so reordering the enum would silently change what
 /// users see.
 #[test]

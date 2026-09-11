@@ -9,7 +9,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use soroscope_core::merkle_tree::MerkleTree;
+use sky_moon_scope_core::merkle_tree::MerkleTree;
 
 fuzz_target!(|data: &[u8]| {
     // Split at null bytes to create a variable number of leaves.

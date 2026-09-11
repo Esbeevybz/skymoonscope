@@ -1,17 +1,17 @@
 # Token Guard Storage Analysis — Issue #230
 
-> **SoroScope analysis confirming the expected storage efficiency gain from integrating
+> **Sky Moon Scope analysis confirming the expected storage efficiency gain from integrating
 > `EmergencyGuard` into the `token` contract.**
 
 ---
 
 ## Background
 
-GitHub Issue [#230](https://github.com/Ndanusa/soroscope/issues/230) asked us to:
+GitHub Issue [#230](https://github.com/Ndanusa/Sky Moon Scope/issues/230) asked us to:
 
 1. Integrate the `emergency_guard` library into the `token` contract to enable
    granular pause control over `mint`, `transfer`, and `burn` operations.
-2. **Run SoroScope analysis** to confirm the expected storage efficiency gain —
+2. **Run Sky Moon Scope analysis** to confirm the expected storage efficiency gain —
    i.e., verify that adding guard state does **not** increase the transaction
    footprint (no extra ledger entries).
 
@@ -102,7 +102,7 @@ instance keys**. The bitmask approach adds exactly **0 extra keys**.
 
 ---
 
-## SoroScope Simulation Summary
+## Sky Moon Scope Simulation Summary
 
 Simulated using the Soroban test environment (budget metering enabled), with
 `mock_all_auths()`. All measurements are **ledger footprint entry counts**, not
@@ -175,5 +175,5 @@ minting paths, and a single shared read on transfer/burn paths.
 
 ---
 
-*Analysis generated for [issue #230](https://github.com/Ndanusa/soroscope/issues/230).
+*Analysis generated for [issue #230](https://github.com/Ndanusa/Sky Moon Scope/issues/230).
 Branch: `fix/issue-230-token-guard-storage-analysis`.*

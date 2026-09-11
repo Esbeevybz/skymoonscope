@@ -14,7 +14,7 @@ import {
   stripControlChars,
 } from './security';
 
-const LATEST_ANALYSIS_KEY = 'soroscope-latest-analysis';
+const LATEST_ANALYSIS_KEY = 'sky-moon-scope-latest-analysis';
 
 const MAX_FUNCTION_NAME_LENGTH = 64;
 const MAX_RESULT_FIELD_LENGTH = 1_000_000;

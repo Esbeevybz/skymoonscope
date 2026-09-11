@@ -12,7 +12,7 @@
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;
   } else {
-    root.SoroscopeWasmValidation = api;
+    root.SkyMoonScopeWasmValidation = api;
   }
 })(typeof self !== 'undefined' ? self : globalThis, function () {
 

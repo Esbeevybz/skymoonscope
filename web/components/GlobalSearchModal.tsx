@@ -18,7 +18,7 @@ import { MOCK_CONTRACT_FUNCTIONS } from '../lib/sorobantypes';
  * Custom event fired when a non-navigation command is picked, so pages can
  * react without the modal needing to know about their internal state.
  */
-export const SEARCH_COMMAND_EVENT = 'soroscope:search-command';
+export const SEARCH_COMMAND_EVENT = 'sky-moon-scope:search-command';
 
 /**
  * App-wide quick search overlay.

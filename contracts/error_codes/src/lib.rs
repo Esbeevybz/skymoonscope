@@ -1,9 +1,9 @@
 #![no_std]
 use soroban_sdk::contracterror;
 
-/// Unified error codes shared across all SoroScope contracts.
+/// Unified error codes shared across all Sky Moon Scope contracts.
 ///
-/// Each variant maps to a stable `u32` discriminant so that the SoroScope UI
+/// Each variant maps to a stable `u32` discriminant so that the Sky Moon Scope UI
 /// can decode errors consistently regardless of which contract emitted them.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -81,7 +81,7 @@ pub const ERROR_SCHEMA_JSON: &str = r#"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ContractError",
   "type": "object",
-  "description": "Explicit numerical discriminant mappings for SoroScope smart contract error codes.",
+  "description": "Explicit numerical discriminant mappings for Sky Moon Scope smart contract error codes.",
   "error_codes": [
     { "name": "AlreadyInitialized", "code": 1, "description": "Contract has already been initialized." },
     { "name": "NotInitialized", "code": 2, "description": "Contract has not been initialized yet." },

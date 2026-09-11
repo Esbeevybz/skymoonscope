@@ -2,7 +2,7 @@
 
 # Testnet Release — Final Release Notes
 
-Release: Testnet release of SoroLabs/soroscope — curated set of new contracts, security tooling, and integration tests for the Soroban ecosystem.
+Release: Testnet release of SkyMoonLabs/Sky Moon Scope — curated set of new contracts, security tooling, and integration tests for the Soroban ecosystem.
 
 ## Summary
 - **Scope:** New AMM and auction primitives, governance & emergency controls, token/transfer utilities, oracle tooling, and developer test harnesses.

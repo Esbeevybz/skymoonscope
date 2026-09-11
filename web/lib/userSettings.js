@@ -1,13 +1,13 @@
 /**
  * User preference storage for custom Soroban RPC and indexer endpoints.
  *
- * Power users running a self-hosted RPC node or indexer can point SoroScope at
+ * Power users running a self-hosted RPC node or indexer can point Sky Moon Scope at
  * their own infrastructure. Preferences live in LocalStorage only — nothing is
  * sent to the backend — and every read is defensive because the value can be
  * edited by hand or left over from an older schema.
  */
 
-const SETTINGS_STORAGE_KEY = 'soroscope-user-settings';
+const SETTINGS_STORAGE_KEY = 'sky-moon-scope-user-settings';
 
 /** Empty string means "fall back to the built-in endpoint for the network". */
 const DEFAULT_SETTINGS = {
@@ -129,7 +129,7 @@ function saveSettings(settings, storage) {
   try {
     store.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(normalized));
   } catch (error) {
-    console.warn('Failed to persist SoroScope settings:', error);
+    console.warn('Failed to persist Sky Moon Scope settings:', error);
   }
 
   return normalized;
@@ -141,7 +141,7 @@ function clearSettings(storage) {
     try {
       store.removeItem(SETTINGS_STORAGE_KEY);
     } catch (error) {
-      console.warn('Failed to clear SoroScope settings:', error);
+      console.warn('Failed to clear Sky Moon Scope settings:', error);
     }
   }
   return { ...DEFAULT_SETTINGS };

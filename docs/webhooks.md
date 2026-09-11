@@ -1,15 +1,15 @@
 # Contract event webhooks
 
-`soroscope-core::webhooks` provides the outbound delivery layer for contract
+`Sky Moon Scope-core::webhooks` provides the outbound delivery layer for contract
 subscriptions. Event ingestion creates a `ContractEvent` and enqueues it through
 `WebhookSender`; the worker finds active subscriptions for that contract and
 event type without blocking the ingestion task.
 
 Each request contains:
 
-- `x-soroscope-delivery`: a stable UUID for all attempts of one delivery
-- `x-soroscope-timestamp`: the Unix timestamp used for the attempt
-- `x-soroscope-signature`: `sha256=<hex HMAC-SHA256>`
+- `x-Sky Moon Scope-delivery`: a stable UUID for all attempts of one delivery
+- `x-Sky Moon Scope-timestamp`: the Unix timestamp used for the attempt
+- `x-Sky Moon Scope-signature`: `sha256=<hex HMAC-SHA256>`
 
 The signed bytes are `<timestamp>.<raw request body>`. Consumers should reject
 old timestamps, compute the HMAC over the unmodified body, and compare it in

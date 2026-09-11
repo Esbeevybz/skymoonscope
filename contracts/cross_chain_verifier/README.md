@@ -246,7 +246,7 @@ Use the `MerkleTree` utility in `core/src/merkle_tree.rs` to build trees and gen
 **Quick example (Rust):**
 
 ```rust
-use soroscope_core::merkle_tree::MerkleTree;
+use Sky Moon Scope_core::merkle_tree::MerkleTree;
 
 // 1. Hash your messages
 let messages: Vec<Vec<u8>> = vec![

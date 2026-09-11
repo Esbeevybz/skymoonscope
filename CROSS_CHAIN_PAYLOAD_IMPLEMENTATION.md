@@ -1,7 +1,7 @@
 # Cross-Chain Payload Verification - Implementation Summary
 
 ## Overview
-A comprehensive, production-ready data structure library for cross-chain payload verification has been successfully implemented for the SoroScope Soroban smart contract project.
+A comprehensive, production-ready data structure library for cross-chain payload verification has been successfully implemented for the Sky Moon Scope Soroban smart contract project.
 
 ## Project Location
 📁 `contracts/cross_chain_payload/`
@@ -358,4 +358,4 @@ let verification_status = VerificationStatus::Verified;
 
 **Status**: ✅ Ready for Production
 
-All data structures have been implemented professionally with no errors or conflicts. The module is fully integrated into the SoroScope workspace and ready for immediate use in cross-chain verification scenarios.
+All data structures have been implemented professionally with no errors or conflicts. The module is fully integrated into the Sky Moon Scope workspace and ready for immediate use in cross-chain verification scenarios.

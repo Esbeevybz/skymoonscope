@@ -29,7 +29,7 @@ pub enum AppError {
 #[derive(Serialize, ToSchema)]
 pub struct ErrorResponse {
     /// A URI reference that identifies the problem type
-    #[schema(example = "https://soroscope.dev/errors/not-found")]
+    #[schema(example = "https://Sky Moon Scope.dev/errors/not-found")]
     r#type: String,
     /// A short, human-readable summary of the problem type
     #[schema(example = "Not Found")]
@@ -77,7 +77,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let body = Json(ErrorResponse {
-            r#type: format!("https://soroscope.dev/errors/{}", self.error_type()),
+            r#type: format!("https://Sky Moon Scope.dev/errors/{}", self.error_type()),
             title: self.title().to_string(),
             status: status.as_u16(),
             detail: self.to_string(),

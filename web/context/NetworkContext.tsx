@@ -97,7 +97,7 @@ export const useNetwork = () => {
   return context;
 };
 
-export const STORAGE_KEY = "soroscope_selected_network";
+export const STORAGE_KEY = "sky_moon_scope_selected_network";
 
 export const NetworkProvider = ({ children }: { children: React.ReactNode }) => {
   const [networkId, setNetworkIdState] = useState<NetworkId>("testnet");

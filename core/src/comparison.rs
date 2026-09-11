@@ -227,7 +227,7 @@ fn pct_change(current: u64, base: u64) -> f64 {
 /// Pretty-print a `RegressionReport` to stdout (used by the CLI).
 pub fn print_report(report: &RegressionReport) {
     println!("\n{}", "=".repeat(60));
-    println!("  SoroScope — Contract Regression Report");
+    println!("  Sky Moon Scope — Contract Regression Report");
     println!("{}\n", "=".repeat(60));
 
     println!(

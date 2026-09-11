@@ -11,20 +11,20 @@ Add these lines to your `.env` file in the `core/` directory:
 FEE_COLLECTION_INTERVAL_SECS=5
 FEE_RETENTION_DAYS=30
 FEE_ANALYSIS_ENABLED=true
-DATABASE_URL=sqlite://soroscope.db
+DATABASE_URL=sqlite://Sky Moon Scope.db
 ```
 
 ### Step 2: Build and Run
 
 ```bash
 # Navigate to project root
-cd c:\Users\SWAYY\Desktop\skibi\soroscope
+cd c:\Users\SWAYY\Desktop\skibi\Sky Moon Scope
 
 # Build the project
-cargo build -p soroscope-core
+cargo build -p Sky Moon Scope-core
 
 # Run the server
-cargo run -p soroscope-core
+cargo run -p Sky Moon Scope-core
 ```
 
 ### Step 3: Access the API
@@ -134,7 +134,7 @@ INFO Collected fee data ledger=123456 base_fee=100
 ### Check database
 ```bash
 # If using SQLite
-sqlite3 soroscope.db "SELECT COUNT(*) FROM ledger_fee_samples;"
+sqlite3 Sky Moon Scope.db "SELECT COUNT(*) FROM ledger_fee_samples;"
 ```
 
 ### View analytics dashboard
@@ -171,15 +171,15 @@ FEE_ANALYSIS_ENABLED=false
 **Solution**: 
 ```bash
 # Delete old database and restart
-rm soroscope.db
-cargo run -p soroscope-core
+rm Sky Moon Scope.db
+cargo run -p Sky Moon Scope-core
 ```
 
 ### Problem: High API latency
 **Solution**: Check database size
 ```bash
 # Should be < 10MB for optimal performance
-ls -lh soroscope.db
+ls -lh Sky Moon Scope.db
 ```
 
 ### Problem: Incorrect predictions
@@ -198,7 +198,7 @@ ls -lh soroscope.db
 1. **Read full documentation**: `core/FEE_MARKET_README.md`
 2. **View API docs**: `http://localhost:8080/docs`
 3. **Check implementation**: `FEE_MARKET_IMPLEMENTATION_SUMMARY.md`
-4. **Run tests**: `cargo test -p soroscope-core fee_`
+4. **Run tests**: `cargo test -p Sky Moon Scope-core fee_`
 
 ## 💡 Pro Tips
 

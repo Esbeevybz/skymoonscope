@@ -280,7 +280,7 @@ export default function SettingsPage() {
   return (
     <>
       <Head>
-        <title>Settings - SoroScope</title>
+        <title>Settings - Sky Moon Scope</title>
         <meta name="description" content="Configure custom Soroban RPC and indexer endpoints." />
       </Head>
 
@@ -296,7 +296,7 @@ export default function SettingsPage() {
 
           <h1 className="text-2xl font-bold tracking-tight text-white">Settings</h1>
           <p className="mt-1 text-sm text-slate-400">
-            Point SoroScope at your own self-hosted infrastructure. Preferences are stored in this
+            Point Sky Moon Scope at your own self-hosted infrastructure. Preferences are stored in this
             browser only and never leave your machine.
           </p>
 

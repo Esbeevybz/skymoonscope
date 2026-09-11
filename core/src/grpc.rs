@@ -26,14 +26,14 @@
 //! not conflict with the existing HTTP/REST server:
 //!
 //! ```bash
-//! GRPC_PORT=50051 RUST_LOG=info cargo run -p soroscope-core
+//! GRPC_PORT=50051 RUST_LOG=info cargo run -p Sky Moon Scope-core
 //! ```
 //!
 //! # Client example (grpcurl)
 //!
 //! ```bash
 //! grpcurl -plaintext -d '{"contract_id":"CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"}' \
-//!   localhost:50051 soroscope.events.v1.EventStreamService/StreamContractEvents
+//!   localhost:50051 Sky Moon Scope.events.v1.EventStreamService/StreamContractEvents
 //! ```
 
 use std::fs;
@@ -55,7 +55,7 @@ use crate::ws::{SimulationBus, SimulationEvent};
 
 // Include the tonic-generated code from the compiled proto.
 pub mod proto {
-    tonic::include_proto!("soroscope.events.v1");
+    tonic::include_proto!("Sky Moon Scope.events.v1");
 }
 
 use proto::event_stream_service_server::EventStreamService;
@@ -503,10 +503,10 @@ mod tests {
     /// Generate a throwaway root CA used as the trust anchor for the test.
     fn make_test_ca() -> (RcCert, KeyPair) {
         let mut params =
-            CertificateParams::new(vec!["soroscope.test".to_string()]).expect("ca params");
+            CertificateParams::new(vec!["Sky Moon Scope.test".to_string()]).expect("ca params");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "soroscope test root CA".to_string());
+        dn.push(DnType::CommonName, "Sky Moon Scope test root CA".to_string());
         params.distinguished_name = dn;
         let key = KeyPair::generate().expect("generate ca key");
         let cert = params.self_signed(&key).expect("self-sign ca");

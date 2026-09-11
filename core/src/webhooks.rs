@@ -22,9 +22,9 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub const SIGNATURE_HEADER: &str = "x-soroscope-signature";
-pub const DELIVERY_HEADER: &str = "x-soroscope-delivery";
-pub const TIMESTAMP_HEADER: &str = "x-soroscope-timestamp";
+pub const SIGNATURE_HEADER: &str = "x-Sky Moon Scope-signature";
+pub const DELIVERY_HEADER: &str = "x-Sky Moon Scope-delivery";
+pub const TIMESTAMP_HEADER: &str = "x-Sky Moon Scope-timestamp";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ContractSubscription {

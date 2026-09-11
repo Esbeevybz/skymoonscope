@@ -100,7 +100,7 @@ All technical details match the actual contract behavior:
 
 ## Documentation Quality
 
-The document follows SoroScope documentation conventions:
+The document follows Sky Moon Scope documentation conventions:
 
 - **Clear structure**: Logical sections with table of contents
 - **Technical precision**: Exact field types, sizes, and validation rules
@@ -135,7 +135,7 @@ This documentation serves multiple audiences:
 2. **Relayer Operators**: Running state root submission services
 3. **Security Auditors**: Reviewing bridge implementations
 4. **Protocol Architects**: Understanding cross-chain verification design
-5. **Integration Partners**: Evaluating SoroScope for their projects
+5. **Integration Partners**: Evaluating Sky Moon Scope for their projects
 
 ## Benefits
 
@@ -153,12 +153,12 @@ This documentation serves multiple audiences:
 - Easier auditing and security reviews
 - Lower barrier to entry for new bridges
 
-### For SoroScope
+### For Sky Moon Scope
 
 - Professional documentation demonstrates maturity
 - Attracts bridge developers to the platform
 - Reduces support burden with self-service docs
-- Establishes SoroScope as cross-chain infrastructure
+- Establishes Sky Moon Scope as cross-chain infrastructure
 
 ## Testing and Validation
 

@@ -8,14 +8,14 @@ This guide outlines how to test the new WASM error handling system with descript
 
 1. **Backend Running**:
    ```bash
-   cd soroscope/core
-   RUST_LOG=info cargo run -p soroscope-core
+   cd Sky Moon Scope/core
+   RUST_LOG=info cargo run -p Sky Moon Scope-core
    ```
    Listens on `http://localhost:8080`
 
 2. **Frontend Running**:
    ```bash
-   cd soroscope/web
+   cd Sky Moon Scope/web
    npm run dev
    ```
    Accessible at `http://localhost:3000`

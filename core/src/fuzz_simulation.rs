@@ -1,4 +1,4 @@
-//! Property-based fuzz tests for the soroscope **simulation engine**.
+//! Property-based fuzz tests for the Sky Moon Scope **simulation engine**.
 //!
 //! These tests exercise internal functions (parsing, XDR handling, cost
 //! calculation, TTL analysis, cache, call-graph) with randomly generated

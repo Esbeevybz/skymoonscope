@@ -1,4 +1,4 @@
-# 📚 SoroScope Documentation Index
+# 📚 Sky Moon Scope Documentation Index
 
 ## 🎯 Quick Navigation
 
@@ -152,7 +152,7 @@ contracts/emergency_guard/
 ### What's at Root Level?
 
 ```
-soroscope/
+Sky Moon Scope/
 ├── README_EMERGENCY_GUARD.md        - Complete summary ⭐ START HERE
 ├── IMPLEMENTATION_GUIDE.md          - Usage guide
 ├── ARCHITECTURE.md                  - System design

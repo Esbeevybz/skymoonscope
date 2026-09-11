@@ -205,7 +205,7 @@ fn default_gossip_interval_secs() -> u64 {
 }
 
 fn default_database_url() -> String {
-    "sqlite://soroscope.db".to_string()
+    "sqlite://sky-moon-scope.db".to_string()
 }
 
 fn default_inbound_webhook_secret() -> String {
@@ -277,7 +277,7 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("gossip_interval_secs", 30)?
         .set_default("simulation_timeout_secs", 30)?
         .set_default("simulation_mode", "failover")?
-        .set_default("database_url", "sqlite://soroscope.db")?
+        .set_default("database_url", "sqlite://sky-moon-scope.db")?
         .set_default("inbound_webhook_secret", "")?
         .set_default("job_timeout_secs", 300)?
         .set_default("max_concurrent_jobs", 10)?
@@ -301,7 +301,7 @@ fn load_config() -> Result<AppConfig, ConfigError> {
 /// (`RUST_LOG`, defaulting to `"info"` — see [`AppConfig::rust_log`]).
 ///
 /// Supports the standard `tracing_subscriber` directive syntax, including
-/// per-module overrides (e.g. `soroscope_core=debug,tower_http=warn`). An
+/// per-module overrides (e.g. `Sky Moon Scope_core=debug,tower_http=warn`). An
 /// empty or unparsable directive falls back to `"info"` so a startup typo
 /// degrades verbosity instead of crashing the server.
 fn build_env_filter(directive: &str) -> EnvFilter {
@@ -339,16 +339,16 @@ mod log_filter_tests {
 
     #[test]
     fn per_module_directives_are_supported() {
-        let filter = build_env_filter("soroscope_core=debug,tower_http=warn");
+        let filter = build_env_filter("Sky Moon Scope_core=debug,tower_http=warn");
         let rendered = filter.to_string();
-        assert!(rendered.contains("soroscope_core=debug"));
+        assert!(rendered.contains("Sky Moon Scope_core=debug"));
         assert!(rendered.contains("tower_http=warn"));
     }
 
     #[test]
     fn invalid_directive_falls_back_to_info_instead_of_panicking() {
         assert_eq!(
-            build_env_filter("soroscope_core=not_a_real_level").to_string(),
+            build_env_filter("Sky Moon Scope_core=not_a_real_level").to_string(),
             "info"
         );
     }
@@ -468,7 +468,7 @@ pub(crate) struct AppMetrics {
     /// Host-wide memory usage percentage (0–100) sampled by the
     /// system alarm monitor (issue #592).
     pub(crate) host_memory_usage_percent: prometheus::GaugeVec,
-    /// Resident memory size of the SoroScope process itself, in bytes.
+    /// Resident memory size of the Sky Moon Scope process itself, in bytes.
     pub(crate) process_memory_bytes: prometheus::GaugeVec,
     /// Wall-clock time spent per indexing/collection cycle, by stage.
     indexing_latency_seconds: HistogramVec,
@@ -524,7 +524,7 @@ impl AppMetrics {
                 "Host-wide memory usage percentage (0-100) sampled by the system alarm monitor",
         let process_memory_bytes = prometheus::GaugeVec::new(
                 "process_memory_bytes",
-                "Resident memory size of the SoroScope process in bytes",
+                "Resident memory size of the Sky Moon Scope process in bytes",
             &["process"],
         let indexing_latency_seconds = HistogramVec::new(
             prometheus::HistogramOpts::new(
@@ -1085,11 +1085,11 @@ async fn analyze(
 
     let mut headers = HeaderMap::new();
     headers.insert(
-        HeaderName::from_static("x-soroscope-cache"),
+        HeaderName::from_static("x-sky-moon-scope-cache"),
         HeaderValue::from_static(cache_status),
     );
     headers.insert(
-        HeaderName::from_static("x-soroscope-latency-ms"),
+        HeaderName::from_static("x-sky-moon-scope-latency-ms"),
         HeaderValue::from_str(&latency_ms.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0")),
     );
@@ -1780,7 +1780,7 @@ async fn fee_analytics(
         (name = "Streaming", description = "WebSocket real-time simulation progress streaming")
     ),
     info(
-        title = "SoroScope API",
+        title = "Sky Moon Scope API",
         version = "0.1.0",
         description = "API for analyzing Soroban smart contract resource consumption and fee market predictions"
     )
@@ -2012,22 +2012,22 @@ async fn main() {
     }
         .with(build_env_filter(&config.rust_log))
 
-    tracing::info!(rust_log = %config.rust_log, "SoroScope Starting...");
-    tracing::info!("SoroScope initialized with config: {:?}", config);
+    tracing::info!(rust_log = %config.rust_log, "Sky Moon Scope Starting...");
+    tracing::info!("Sky Moon Scope initialized with config: {:?}", config);
     tracing::info!(
         redis_url = %config.redis_url,
         "Cache config: using in-memory (moka) MVP; Redis URL reserved for future migration"
     );
     if config.inbound_webhook_secret.is_empty() {
         tracing::warn!(
-            "Inbound webhook secret is not configured; set INBOUND_WEBHOOK_SECRET or SOROSCOPE_INBOUND_WEBHOOK_SECRET"
+            "Inbound webhook secret is not configured; set INBOUND_WEBHOOK_SECRET or SKY_MOON_SCOPE_INBOUND_WEBHOOK_SECRET"
         );
     }
 
     let args: Vec<String> = env::args().collect();
 
     if args.len() > 1 && args[1] == "benchmark" {
-        tracing::info!("Starting SoroScope Benchmark...");
+        tracing::info!("Starting Sky Moon Scope Benchmark...");
 
         let possible_paths = vec![
             "target/wasm32-unknown-unknown/release/soroban_token_contract.wasm",
@@ -2044,9 +2044,9 @@ async fn main() {
         }
 
         if let Some(path) = wasm_path {
-            let db_path = env::var("SOROSCOPE_DB_PATH")
-                .unwrap_or_else(|_| "soroscope_metrics.db".to_string());
-            let webhook_url = env::var("SOROSCOPE_ALERT_WEBHOOK_URL").ok();
+            let db_path = env::var("SKY_MOON_SCOPE_DB_PATH")
+                .unwrap_or_else(|_| "sky_moon_scope_metrics.db".to_string());
+            let webhook_url = env::var("SKY_MOON_SCOPE_ALERT_WEBHOOK_URL").ok();
             let simulation_service = SimulationService::new(db_path, webhook_url)
                 .expect("initialize simulation service");
             if let Err(e) = benchmarks::run_token_benchmark(path, &simulation_service).await {
@@ -2064,7 +2064,7 @@ async fn main() {
     // ── CLI: merkle subcommand ──────────────────────────────────────────
     if args.len() > 1 && args[1] == "merkle" {
         if args.len() < 4 {
-            eprintln!("Usage: soroscope-core merkle <build|proof> <args>");
+            eprintln!("Usage: sky-moon-scope-core merkle <build|proof> <args>");
             eprintln!("Commands:");
             eprintln!("  build <leaf1> <leaf2> ...            Build a Merkle tree and print the root hash");
             eprintln!("  proof <leaf_index> <leaf1> <leaf2> ... Generate a Merkle proof for the given leaf index");
@@ -2075,7 +2075,7 @@ async fn main() {
         match command.as_str() {
             "build" => {
                 if args.len() < 4 {
-                    eprintln!("Usage: soroscope-core merkle build <leaf1> <leaf2> ...");
+                    eprintln!("Usage: sky-moon-scope-core merkle build <leaf1> <leaf2> ...");
                     std::process::exit(1);
                 }
                 let leaves: Vec<Vec<u8>> = args[3..]
@@ -2094,7 +2094,7 @@ async fn main() {
             "proof" => {
                 if args.len() < 5 {
                     eprintln!(
-                        "Usage: soroscope-core merkle proof <leaf_index> <leaf1> <leaf2> ..."
+                        "Usage: sky-moon-scope-core merkle proof <leaf_index> <leaf1> <leaf2> ..."
                     );
                     std::process::exit(1);
                 }
@@ -2140,12 +2140,12 @@ async fn main() {
     }
 
     // Default Web Server
-    println!("SoroScope CLI Initialized. Run with 'benchmark' argument to profile token contract.");
+    println!("Sky Moon Scope CLI Initialized. Run with 'benchmark' argument to profile token contract.");
 
     // ── CLI: compare subcommand ──────────────────────────────────────────
     if args.len() > 1 && args[1] == "compare" {
         if args.len() < 4 {
-            eprintln!("Usage: soroscope-core compare <current.wasm> <base.wasm>");
+            eprintln!("Usage: sky-moon-scope-core compare <current.wasm> <base.wasm>");
             eprintln!("\nCompare two WASM contract versions and detect resource regressions.");
             eprintln!("\nArguments:");
             eprintln!("  <current.wasm>  Path to the new (current) version WASM file");
@@ -2194,7 +2194,7 @@ async fn main() {
     if args.len() > 1 && args[1] == "export" {
         if args.len() < 6 {
             eprintln!(
-                "Usage: soroscope-core export <contract_id> <function> <args_json> <output_file>"
+                "Usage: sky-moon-scope-core export <contract_id> <function> <args_json> <output_file>"
             );
             eprintln!("\nSimulate a transaction and export the touched state to a JSON file.");
             std::process::exit(1);
@@ -2240,7 +2240,7 @@ async fn main() {
     // ── CLI: restore subcommand ──────────────────────────────────────────
     if args.len() > 1 && args[1] == "restore" {
         if args.len() < 6 {
-            eprintln!("Usage: soroscope-core restore <snapshot_file> <contract_id> <function> <args_json>");
+            eprintln!("Usage: sky-moon-scope-core restore <snapshot_file> <contract_id> <function> <args_json>");
             eprintln!("\nRestore state from a JSON file and run a simulation.");
             std::process::exit(1);
         }
@@ -2314,7 +2314,7 @@ async fn main() {
             (Some(s), Some(e)) if s <= e => (s, e),
             _ => {
                 eprintln!(
-                    "Usage: soroscope-cli reindex --start-ledger <N> --end-ledger <M>"
+                    "Usage: sky-moon-scope-cli reindex --start-ledger <N> --end-ledger <M>"
                 );
                 eprintln!("\nRe-fetch and re-process ledger fee data for the given ledger range.");
                 eprintln!("\nArguments:");
@@ -2390,7 +2390,7 @@ async fn main() {
         return;
     }
 
-    tracing::info!("Starting SoroScope API Server...");
+    tracing::info!("Starting Sky Moon Scope API Server...");
 
     let auth_state = Arc::new(auth::AuthState::new(
         config.jwt_private_key.clone(),
@@ -2560,7 +2560,7 @@ async fn main() {
             .expect("Failed to create Redis client for leader lock");
         let leader_lock = Arc::new(leader_lock::RedisLeaderLock::new(
             leader_redis_client,
-            "soroscope:leader:fee_collector",
+            "sky-moon-scope:leader:fee_collector",
             std::time::Duration::from_secs(config.fee_collection_interval_secs.max(1) * 3),
         ));
 
@@ -2617,7 +2617,7 @@ async fn main() {
     }
 
     // ── Persistent Cache Setup (L2) ─────────────────────────────────────
-    let sled_db = sled::open("soroscope_cache").expect("Failed to open sled database");
+    let sled_db = sled::open("sky_moon_scope_cache").expect("Failed to open sled database");
     let simulation_cache = SimulationCache::new(&sled_db);
     let contract_cache = Arc::new(ContractCache::new(&sled_db));
 
@@ -2675,7 +2675,7 @@ async fn main() {
         graphql::build_schema(app_state.job_queue.clone(), app_state.engine.clone());
 
     let cors = CorsLayer::new().allow_origin(Any);
-    let cors = soroscope_core::cors::build_cors_layer(&config.cors_allowed_origins);
+    let cors = Sky Moon Scope_core::cors::build_cors_layer(&config.cors_allowed_origins);
     let cors = {
         let raw = config.allowed_origins.trim().to_string();
         if raw.is_empty() {
@@ -2705,7 +2705,7 @@ async fn main() {
         .route(
             "/",
             get(|| async {
-                "Hello from SoroScope! Usage: cargo run -p soroscope-core -- benchmark"
+                "Hello from Sky Moon Scope! Usage: cargo run -p sky-moon-scope-core -- benchmark"
             }),
         )
         .route("/health", get(health_check))

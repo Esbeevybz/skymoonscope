@@ -28,10 +28,10 @@
 //!
 //! | Env var                                | Default | Purpose                                |
 //! |----------------------------------------|---------|----------------------------------------|
-//! | `SOROSCOPE_ALARM_THRESHOLD_PERCENT`    | `85.0`  | Trip threshold (0–100).                 |
-//! | `SOROSCOPE_ALARM_INTERVAL_SECS`        | `10`    | Sampling cadence.                      |
-//! | `SOROSCOPE_ALARM_WEBHOOK_URL`          | unset   | POST target for breach/recovery events.|
-//! | `SOROSCOPE_ALARM_DISABLE`              | `false` | Set `1`/`true` to disable entirely.    |
+//! | `Sky Moon Scope_ALARM_THRESHOLD_PERCENT`    | `85.0`  | Trip threshold (0–100).                 |
+//! | `Sky Moon Scope_ALARM_INTERVAL_SECS`        | `10`    | Sampling cadence.                      |
+//! | `Sky Moon Scope_ALARM_WEBHOOK_URL`          | unset   | POST target for breach/recovery events.|
+//! | `Sky Moon Scope_ALARM_DISABLE`              | `false` | Set `1`/`true` to disable entirely.    |
 
 use crate::AppMetrics;
 use reqwest::Client;
@@ -51,11 +51,11 @@ const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Environment variable names (kept in one place to make typos visible
 /// only at one site).
-pub const ENV_THRESHOLD: &str = "SOROSCOPE_ALARM_THRESHOLD_PERCENT";
-pub const ENV_INTERVAL: &str = "SOROSCOPE_ALARM_INTERVAL_SECS";
-pub const ENV_WEBHOOK: &str = "SOROSCOPE_ALARM_WEBHOOK_URL";
-pub const ENV_DISABLE: &str = "SOROSCOPE_ALARM_DISABLE";
-pub const ENV_INSTANCE_ID: &str = "SOROSCOPE_INSTANCE_ID";
+pub const ENV_THRESHOLD: &str = "Sky Moon Scope_ALARM_THRESHOLD_PERCENT";
+pub const ENV_INTERVAL: &str = "Sky Moon Scope_ALARM_INTERVAL_SECS";
+pub const ENV_WEBHOOK: &str = "Sky Moon Scope_ALARM_WEBHOOK_URL";
+pub const ENV_DISABLE: &str = "Sky Moon Scope_ALARM_DISABLE";
+pub const ENV_INSTANCE_ID: &str = "Sky Moon Scope_INSTANCE_ID";
 
 /// Confguration for the alarm monitor.
 #[derive(Debug, Clone)]
@@ -369,7 +369,7 @@ impl SysAlarmMonitor {
                     .set(mem_percent);
                 metrics
                     .process_memory_bytes
-                    .with_label_values(&["soroscope-core"])
+                    .with_label_values(&["Sky Moon Scope-core"])
                     .set(process_memory_bytes as f64);
             } else {
                 // Even without a metrics sink we still want operators
@@ -619,7 +619,7 @@ mod tests {
     // compile time is available since Rust 1.63.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// RAII guard that restores every `SOROSCOPE_ALARM_*` env value on
+    /// RAII guard that restores every `Sky Moon Scope_ALARM_*` env value on
     /// drop so a panic mid-test can't pollute later suites.
     struct EnvRestore {
         prev: Vec<(&'static str, Option<String>)>,

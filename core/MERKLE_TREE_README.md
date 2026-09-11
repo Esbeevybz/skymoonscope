@@ -105,7 +105,7 @@ The raw root bytes, available directly after `build()`.
 ### Example 1: Build a Tree and Get the Root
 
 ```rust
-use soroscope_core::merkle_tree::MerkleTree;
+use Sky Moon Scope_core::merkle_tree::MerkleTree;
 use sha2::{Digest, Sha256};
 
 fn main() {
@@ -133,7 +133,7 @@ fn main() {
 ### Example 2: Generate a Proof for a Specific Leaf
 
 ```rust
-use soroscope_core::merkle_tree::MerkleTree;
+use Sky Moon Scope_core::merkle_tree::MerkleTree;
 use sha2::{Digest, Sha256};
 
 fn main() {
@@ -169,7 +169,7 @@ fn main() {
 Use this to sanity-check a proof off-chain before paying transaction fees.
 
 ```rust
-use soroscope_core::merkle_tree::MerkleTree;
+use Sky Moon Scope_core::merkle_tree::MerkleTree;
 use sha2::{Digest, Sha256};
 
 fn verify_proof_locally(
@@ -216,7 +216,7 @@ fn main() {
 This is the complete flow a bridge relayer would run: collect messages, build the tree, post the root, and hand off proofs to recipients.
 
 ```rust
-use soroscope_core::merkle_tree::MerkleTree;
+use Sky Moon Scope_core::merkle_tree::MerkleTree;
 use sha2::{Digest, Sha256};
 
 struct CrossChainMessage {
@@ -281,7 +281,7 @@ fn main() {
 The tree handles odd-length levels by duplicating the last node. This example shows a 5-leaf tree.
 
 ```rust
-use soroscope_core::merkle_tree::MerkleTree;
+use Sky Moon Scope_core::merkle_tree::MerkleTree;
 use sha2::{Digest, Sha256};
 
 fn main() {
@@ -378,10 +378,10 @@ The `MerkleTree` struct has no external configuration. The `levels` parameter pa
 
 ```bash
 # Run the merkle_tree unit tests
-cargo test -p soroscope-core merkle_tree
+cargo test -p Sky Moon Scope-core merkle_tree
 
 # Run with output
-cargo test -p soroscope-core merkle_tree -- --nocapture
+cargo test -p Sky Moon Scope-core merkle_tree -- --nocapture
 ```
 
 The test suite covers:
@@ -437,7 +437,7 @@ Common causes:
 - [ ] `generate_proof(index)` method (currently a placeholder — implement alongside full tree storage)
 - [ ] Incremental leaf insertion without full rebuild
 - [ ] Sparse Merkle Tree variant for key-value inclusion proofs
-- [ ] CLI binary (`soroscope-merkle`) for scripting without writing Rust
+- [ ] CLI binary (`Sky Moon Scope-merkle`) for scripting without writing Rust
 - [ ] Multi-proof generation (prove multiple leaves in one pass)
 - [ ] Integration with `private_transfer` commitment tree
 

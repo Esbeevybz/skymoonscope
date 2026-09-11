@@ -1,6 +1,6 @@
 # Mainnet Release — Deployment Guide & CLI Installation
 
-This guide covers installing the SoroScope CLI, running a local simulation, and preparing for Stellar Mainnet deployment.
+This guide covers installing the Sky Moon Scope CLI, running a local simulation, and preparing for Stellar Mainnet deployment.
 
 ---
 
@@ -20,21 +20,21 @@ This guide covers installing the SoroScope CLI, running a local simulation, and 
 ### From Source (Recommended)
 
 ```bash
-git clone https://github.com/SoroLabs/soroscope
-cd soroscope
+git clone https://github.com/SkyMoonLabs/Sky Moon Scope
+cd Sky Moon Scope
 
 # Build the core CLI binary
-cargo build --release -p soroscope-core
+cargo build --release -p Sky Moon Scope-core
 
 # The binary is at:
-./target/release/soroscope-core
+./target/release/Sky Moon Scope-core
 ```
 
 To make it available system-wide:
 
 ```bash
-cp target/release/soroscope-core /usr/local/bin/soroscope
-soroscope --help
+cp target/release/Sky Moon Scope-core /usr/local/bin/Sky Moon Scope
+Sky Moon Scope --help
 ```
 
 ### Verify the Build
@@ -53,7 +53,7 @@ The core server exposes an HTTP API on `http://localhost:8080` for profiling con
 ### Start the Server
 
 ```bash
-RUST_LOG=info cargo run -p soroscope-core
+RUST_LOG=info cargo run -p Sky Moon Scope-core
 ```
 
 ### Build Contract WASMs for Profiling

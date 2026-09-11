@@ -1,6 +1,6 @@
 # Frontend Features
 
-Reference for four browser-side features of the SoroScope web app. All code
+Reference for four browser-side features of the Sky Moon Scope web app. All code
 lives under [`web/`](../web).
 
 Shared conventions:
@@ -67,7 +67,7 @@ Commands come from `buildCommandRegistry()`:
   `next/router`. Home-page panels are addressed as `/?tab=<id>`, which
   `pages/index.tsx` reads back out of the query string.
 - **Contract function** entries carry an `action` instead. Selecting one
-  dispatches a `soroscope:search-command` `CustomEvent`, which the home page
+  dispatches a `Sky Moon Scope:search-command` `CustomEvent`, which the home page
   listens for — so the modal never needs to know page-internal state.
 
 Ranking (`scoreCommand`), strongest first: exact title, title prefix, word start
@@ -89,7 +89,7 @@ Adding a command means appending one object to `BASE_COMMANDS`.
 | `pages/settings.tsx` | The form, with per-endpoint connection tests |
 | `lib/userSettings.test.cjs` | Unit tests |
 
-Stored under the LocalStorage key `soroscope-user-settings`:
+Stored under the LocalStorage key `Sky Moon Scope-user-settings`:
 
 | Field | Meaning |
 | --- | --- |

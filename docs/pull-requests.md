@@ -3,15 +3,15 @@
 We follow the standard **Fork & Pull** workflow. If you're new to this, here is the exact step-by-step:
 
 ### 1. Fork & Clone
-1.  Click the **Fork** button at the top of the [Soroban Scope repository](https://github.com/SoroLabs/soroscope).
+1.  Click the **Fork** button at the top of the [Soroban Scope repository](https://github.com/SkyMoonLabs/Sky Moon Scope).
 2.  Clone your fork locally:
     ```bash
-    git clone https://github.com/YOUR_USERNAME/soroscope.git
-    cd soroscope
+    git clone https://github.com/YOUR_USERNAME/Sky Moon Scope.git
+    cd Sky Moon Scope
     ```
 3.  Add the original repository as an `upstream` remote:
     ```bash
-    git remote add upstream https://github.com/SoroLabs/soroscope.git
+    git remote add upstream https://github.com/SkyMoonLabs/Sky Moon Scope.git
     ```
 
 ### 2. Create a Branch
@@ -39,7 +39,7 @@ npm run lint
     git commit -m "feat: descriptive message"
     git push origin feat/your-feature-name
     ```
-2.  Go to the [Soroban Scope PR page](https://github.com/SoroLabs/soroscope/pulls).
+2.  Go to the [Soroban Scope PR page](https://github.com/SkyMoonLabs/Sky Moon Scope/pulls).
 3.  You should see a yellow banner saying **"Compare & pull request"**. Click it!
 4.  Write a clear description of your changes and submit.
 

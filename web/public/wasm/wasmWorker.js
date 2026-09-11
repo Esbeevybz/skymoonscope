@@ -23,7 +23,7 @@
 
 importScripts('/wasm/wasmValidation.js');
 
-const { validateWasmModule } = self.SoroscopeWasmValidation;
+const { validateWasmModule } = self.SkyMoonScopeWasmValidation;
 
 self.onmessage = (event) => {
   const data = event && event.data;

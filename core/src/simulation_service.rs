@@ -376,7 +376,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock should be after unix epoch")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!("soroscope_{test_name}_{nanos}.db"));
+            let path = std::env::temp_dir().join(format!("Sky Moon Scope_{test_name}_{nanos}.db"));
             Self(path)
         }
     }

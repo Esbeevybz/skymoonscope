@@ -2,7 +2,7 @@
 
 ## Overview
 
-The SoroScope Fee Market Prediction System analyzes historical Stellar/Soroban network fee data to provide intelligent recommendations for optimal transaction fee bidding. This ensures your transactions are included in the blockchain within your desired timeframe while minimizing costs.
+The Sky Moon Scope Fee Market Prediction System analyzes historical Stellar/Soroban network fee data to provide intelligent recommendations for optimal transaction fee bidding. This ensures your transactions are included in the blockchain within your desired timeframe while minimizing costs.
 
 ## Features
 
@@ -155,7 +155,7 @@ Add these environment variables to your `.env` file:
 FEE_COLLECTION_INTERVAL_SECS=5        # How often to collect fee data (default: 5)
 FEE_RETENTION_DAYS=30                 # How long to keep fee data (default: 30)
 FEE_ANALYSIS_ENABLED=true             # Enable/disable fee analysis (default: true)
-DATABASE_URL=sqlite://soroscope.db    # Database URL for storing fee data
+DATABASE_URL=sqlite://Sky Moon Scope.db    # Database URL for storing fee data
 ```
 
 ## How It Works
@@ -303,9 +303,9 @@ Stores individual transaction fee data (future enhancement):
 
 Run the unit tests:
 ```bash
-cargo test -p soroscope-core fee_analytics
-cargo test -p soroscope-core fee_store
-cargo test -p soroscope-core fee_collector
+cargo test -p Sky Moon Scope-core fee_analytics
+cargo test -p Sky Moon Scope-core fee_store
+cargo test -p Sky Moon Scope-core fee_collector
 ```
 
 ## Contributing

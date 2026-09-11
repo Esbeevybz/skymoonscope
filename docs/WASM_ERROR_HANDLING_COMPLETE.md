@@ -2,7 +2,7 @@
 
 ## Summary
 
-Your SoroScope platform now provides **comprehensive, descriptive error messages** when the backend rejects WASM files. Users receive actionable feedback with clear explanations of what went wrong and how to fix it.
+Your Sky Moon Scope platform now provides **comprehensive, descriptive error messages** when the backend rejects WASM files. Users receive actionable feedback with clear explanations of what went wrong and how to fix it.
 
 ---
 
@@ -178,7 +178,7 @@ idle → hover → scanning → submitting → success ✓
 
 1. **Start Backend**:
    ```bash
-   cd core && RUST_LOG=info cargo run -p soroscope-core
+   cd core && RUST_LOG=info cargo run -p Sky Moon Scope-core
    ```
 
 2. **Start Frontend**:
@@ -352,7 +352,7 @@ POST /analyze/wasm
 
 ### Backend Not Responding
 **Problem**: Upload stuck at "Validating with server..."  
-**Solution**: Verify backend is running: `RUST_LOG=info cargo run -p soroscope-core`
+**Solution**: Verify backend is running: `RUST_LOG=info cargo run -p Sky Moon Scope-core`
 
 ### Error Messages Don't Match Backend
 **Problem**: UI shows generic error, not specific backend message  

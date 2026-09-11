@@ -3,10 +3,10 @@
 //! # Security design
 //!
 //! Each inbound request must carry three headers:
-//!   - `x-soroscope-signature` — `sha256=<hex>`, the HMAC-SHA256 over
+//!   - `x-Sky Moon Scope-signature` — `sha256=<hex>`, the HMAC-SHA256 over
 //!     `<timestamp_bytes>.<raw_body_bytes>` using the pre-shared secret.
-//!   - `x-soroscope-timestamp` — Unix timestamp (seconds) as an ASCII integer.
-//!   - `x-soroscope-delivery` — opaque delivery UUID (validated for presence only).
+//!   - `x-Sky Moon Scope-timestamp` — Unix timestamp (seconds) as an ASCII integer.
+//!   - `x-Sky Moon Scope-delivery` — opaque delivery UUID (validated for presence only).
 //!
 //! **Replay protection:** timestamps older than [`MAX_TIMESTAMP_SKEW_SECS`] are
 //! rejected. This bounds the window in which a stolen signature can be reused.
@@ -85,7 +85,7 @@ where
             req.extensions().get::<InboundWebhookSecret>().cloned()
         {
             (*s).clone()
-        } else if let Ok(s) = std::env::var("SOROSCOPE_INBOUND_WEBHOOK_SECRET") {
+        } else if let Ok(s) = std::env::var("Sky Moon Scope_INBOUND_WEBHOOK_SECRET") {
             if s.len() < 32 {
                 return Err(WebhookValidationError::MissingSecret);
             }

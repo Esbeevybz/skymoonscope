@@ -228,4 +228,4 @@ cargo test -p soroban-token-contract --lib
 
 ## License
 
-This contract is part of the SoroScope project.
+This contract is part of the Sky Moon Scope project.

@@ -15,11 +15,11 @@ use crate::jobs::{Job, JobListFilter, JobPayload, JobQueue, JobResult};
 use crate::jobs::{JobStatus as CoreJobStatus, JobType as CoreJobType};
 use crate::simulation::{SimulationEngine, SorobanResources};
 
-/// The soroscope-core GraphQL schema: query-only (no mutations/subscriptions).
-pub type SoroscopeSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
+/// The Sky Moon Scope-core GraphQL schema: query-only (no mutations/subscriptions).
+pub type Sky Moon ScopeSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 
 /// Build the schema, wiring in the data sources resolvers read from.
-pub fn build_schema(job_queue: JobQueue, engine: SimulationEngine) -> SoroscopeSchema {
+pub fn build_schema(job_queue: JobQueue, engine: SimulationEngine) -> Sky Moon ScopeSchema {
     Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
         .data(job_queue)
         .data(engine)
@@ -244,9 +244,9 @@ impl QueryRoot {
 // handler below talks to `async-graphql` directly instead — a GraphQL
 // request/response is just JSON, so this is a thin, dependency-free bridge.
 
-/// `POST /graphql` — executes a GraphQL request against [`SoroscopeSchema`].
+/// `POST /graphql` — executes a GraphQL request against [`Sky Moon ScopeSchema`].
 pub async fn graphql_handler(
-    axum::extract::Extension(schema): axum::extract::Extension<SoroscopeSchema>,
+    axum::extract::Extension(schema): axum::extract::Extension<Sky Moon ScopeSchema>,
     axum::Json(request): axum::Json<async_graphql::Request>,
 ) -> axum::Json<async_graphql::Response> {
     axum::Json(schema.execute(request).await)

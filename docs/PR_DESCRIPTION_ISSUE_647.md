@@ -3,7 +3,7 @@
 ## 🎯 Overview
 This PR addresses **Issue #647** by annotating all contract error enums with explicit `#[repr(u32)]` numerical discriminants (e.g. `AlreadyInitialized = 1`) and exporting a standardized JSON schema specification. 
 
-Previously, implicit error discriminant mappings caused cross-language mapping between Rust contracts, the SoroScope web dashboard (Next.js/TypeScript), and external clients to be fragile and prone to decoding mismatches when enums were extended. Explicit numerical discriminants guarantee a stable on-chain ABI and deterministic cross-language error decoding.
+Previously, implicit error discriminant mappings caused cross-language mapping between Rust contracts, the Sky Moon Scope web dashboard (Next.js/TypeScript), and external clients to be fragile and prone to decoding mismatches when enums were extended. Explicit numerical discriminants guarantee a stable on-chain ABI and deterministic cross-language error decoding.
 
 ## ✨ Features Implemented
 - **Explicit `#[repr(u32)]` Discriminants**:
@@ -11,12 +11,12 @@ Previously, implicit error discriminant mappings caused cross-language mapping b
   - Added conversion utility methods `as_u32(&self)` and `from_u32(code: u32) -> Option<Self>`.
 - **Exported JSON Schema Specification**:
   - Defined `ERROR_SCHEMA_JSON` constant in `contracts/error_codes`.
-  - Created [`contracts/error_codes/schema.json`](file:///c:/Users/chris/Desktop/d/soroscope/contracts/error_codes/schema.json) mapping variant names, integer codes, and descriptions.
+  - Created [`contracts/error_codes/schema.json`](file:///c:/Users/chris/Desktop/d/Sky Moon Scope/contracts/error_codes/schema.json) mapping variant names, integer codes, and descriptions.
 - **Contract Error Enums Cleanup & Audit**:
-  - Cleaned up duplicate variant declarations in [`contracts/liquidity_pool/src/lib.rs`](file:///c:/Users/chris/Desktop/d/soroscope/contracts/liquidity_pool/src/lib.rs).
-  - Updated `CrossChainError` in [`contracts/cross_chain_payload/src/errors.rs`](file:///c:/Users/chris/Desktop/d/soroscope/contracts/cross_chain_payload/src/errors.rs) with `#[contracterror]`, `#[repr(u32)]`, and explicit variant discriminants matching `as_u32()`.
+  - Cleaned up duplicate variant declarations in [`contracts/liquidity_pool/src/lib.rs`](file:///c:/Users/chris/Desktop/d/Sky Moon Scope/contracts/liquidity_pool/src/lib.rs).
+  - Updated `CrossChainError` in [`contracts/cross_chain_payload/src/errors.rs`](file:///c:/Users/chris/Desktop/d/Sky Moon Scope/contracts/cross_chain_payload/src/errors.rs) with `#[contracterror]`, `#[repr(u32)]`, and explicit variant discriminants matching `as_u32()`.
 - **Dual-Directory Alignment**:
-  - Synchronized changes across both root `contracts/` and nested `soroscope/contracts/` structures.
+  - Synchronized changes across both root `contracts/` and nested `Sky Moon Scope/contracts/` structures.
 
 ## 🔧 Technical Implementation
 - `ContractError` enum definition:
@@ -50,7 +50,7 @@ Previously, implicit error discriminant mappings caused cross-language mapping b
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "title": "ContractError",
     "type": "object",
-    "description": "Explicit numerical discriminant mappings for SoroScope smart contract error codes.",
+    "description": "Explicit numerical discriminant mappings for Sky Moon Scope smart contract error codes.",
     "error_codes": [
       { "name": "AlreadyInitialized", "code": 1, "description": "Contract has already been initialized." },
       ...
@@ -64,11 +64,11 @@ Follow these steps to verify that the assignment was successfully completed:
 1. **Verify Contract Error Code Discriminant Tests**:
    Run cargo test on the error codes crate:
    ```bash
-   cargo test -p soroscope-error-codes
+   cargo test -p Sky Moon Scope-error-codes
    ```
    *(If testing on Windows without MSVC linker installed, use the GNU toolchain)*:
    ```bash
-   cargo +stable-x86_64-pc-windows-gnu test -p soroscope-error-codes
+   cargo +stable-x86_64-pc-windows-gnu test -p Sky Moon Scope-error-codes
    ```
    *Expected Result*: All 3 tests (`test_explicit_numerical_discriminants`, `test_from_u32_conversion`, `test_schema_json_contains_all_variants`) pass cleanly.
 
@@ -97,9 +97,9 @@ Follow these steps to verify that the assignment was successfully completed:
 - `contracts/error_codes/schema.json` - Added exported JSON schema specification.
 - `contracts/liquidity_pool/src/lib.rs` - Removed duplicate enum variants.
 - `contracts/cross_chain_payload/src/errors.rs` - Added `#[contracterror]`, `#[repr(u32)]`, and explicit discriminants.
-- `soroscope/contracts/error_codes/src/lib.rs` - Synchronized nested crate file.
-- `soroscope/contracts/error_codes/schema.json` - Synchronized nested schema file.
-- `soroscope/contracts/cross_chain_payload/src/errors.rs` - Synchronized nested cross-chain errors.
+- `Sky Moon Scope/contracts/error_codes/src/lib.rs` - Synchronized nested crate file.
+- `Sky Moon Scope/contracts/error_codes/schema.json` - Synchronized nested schema file.
+- `Sky Moon Scope/contracts/cross_chain_payload/src/errors.rs` - Synchronized nested cross-chain errors.
 - `docs/PR_DESCRIPTION_ISSUE_647.md` - Added PR documentation.
 
 ## ✅ Acceptance Criteria Checklist

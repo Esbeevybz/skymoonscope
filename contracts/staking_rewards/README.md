@@ -73,7 +73,7 @@ Returns the full staking configuration.
 
 ## Error Codes
 
-The contract uses `soroscope_error_codes::ContractError`.
+The contract uses `Sky Moon Scope_error_codes::ContractError`.
 
 | Code | Variant | Meaning |
 | --- | --- | --- |

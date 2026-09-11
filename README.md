@@ -1,12 +1,12 @@
-# 🔬 SoroScope: Soroban Resource Profiler
+# 🔬 Sky Moon Scope: Soroban Resource Profiler
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Stellar Wave](https://img.shields.io/badge/Stellar-Wave_Program-blue)](https://www.drips.network/wave/stellar)
 
-**SoroScope** is a developer tool designed to provide deep visibility into Soroban smart contract resource consumption (CPU, RAM, and Ledger Footprint).
+**Sky Moon Scope** is a developer tool designed to provide deep visibility into Soroban smart contract resource consumption (CPU, RAM, and Ledger Footprint).
 
 ## 🚀 The Vision
-Building on Soroban requires careful resource management. SoroScope provides a "Nutrition Label" for your smart contracts, helping you optimize for lower fees and higher performance before you deploy to Mainnet.
+Building on Soroban requires careful resource management. Sky Moon Scope provides a "Nutrition Label" for your smart contracts, helping you optimize for lower fees and higher performance before you deploy to Mainnet.
 
 ## 🧱 Monorepo Structure
 - `/core`: Rust-based CLI for simulating and profiling contracts.
@@ -23,15 +23,15 @@ Building on Soroban requires careful resource management. SoroScope provides a "
 
 ### Clone the Repository
 ```bash
-git clone https://github.com/SoroLabs/soroscope
-cd soroscope
+git clone https://github.com/SkyMoonLabs/sky-moon-scope
+cd sky-moon-scope
 ```
 
 ---
 
 ## 🧰 Core CLI (`/core`)
 
-The **core** crate is a Rust binary that will power SoroScope's resource profiling.
+The **core** crate is a Rust binary that will power Sky Moon Scope's resource profiling.
 
 ### Features
 - **Resource Profiling**: Analyze CPU, RAM, and ledger footprint consumption
@@ -42,10 +42,10 @@ The **core** crate is a Rust binary that will power SoroScope's resource profili
 ### Build & Run
 ```bash
 # Build the binary
-cargo build -p soroscope-core
+cargo build -p sky-moon-scope-core
 
 # Run the server (RUST_LOG=info is required to see API logs)
-RUST_LOG=info cargo run -p soroscope-core
+RUST_LOG=info cargo run -p sky-moon-scope-core
 ```
 
 The server listens on `http://localhost:8080` by default.
@@ -86,7 +86,7 @@ soroban contract invoke \
 **Run Merkle Tree tests:**
 
 ```bash
-cargo test -p soroscope-core merkle_tree
+cargo test -p sky-moon-scope-core merkle_tree
 ```
 
 See [`core/MERKLE_TREE_README.md`](./core/MERKLE_TREE_README.md) for full API reference, proof generation examples, and the complete relayer pipeline.
@@ -187,7 +187,7 @@ Contributions are welcome! Please read our [**Contributing Guide**](./CONTRIBUTI
 
 ---
 ### 🧪 Live Analysis
-SoroScope now supports live simulation via the web dashboard. Connect your wallet, select a function, and get your **Contract Nutrition Label** instantly.
+Sky Moon Scope now supports live simulation via the web dashboard. Connect your wallet, select a function, and get your **Contract Nutrition Label** instantly.
 
 ---
-Built with ❤️ by **SoroLabs**. Powered by the Soroban ecosystem.
+Built with ❤️ by **SkyMoonLabs**. Powered by the Soroban ecosystem.

@@ -1,5 +1,5 @@
 [package]
-name = "soroscope-math"
+name = "Sky Moon Scope-math"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,7 +8,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk.workspace = true
-soroscope-error-codes = { path = "../error_codes" }
+Sky Moon Scope-error-codes = { path = "../error_codes" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

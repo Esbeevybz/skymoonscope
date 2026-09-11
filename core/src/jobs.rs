@@ -430,7 +430,7 @@ impl JobQueue {
                 JobError::ProcessingFailed(format!("Failed to get Redis connection: {}", e))
             })?;
 
-        conn.lpush::<_, _, ()>("soroscope:jobs:queue", id.0.to_string())
+        conn.lpush::<_, _, ()>("sky-moon-scope:jobs:queue", id.0.to_string())
             .await
             .map_err(|e| JobError::ProcessingFailed(format!("Redis LPUSH failed: {}", e)))?;
 
@@ -450,7 +450,7 @@ impl JobQueue {
             })?;
 
         let depth: i64 = conn
-            .llen("soroscope:jobs:queue")
+            .llen("sky-moon-scope:jobs:queue")
             .await
             .map_err(|e| JobError::ProcessingFailed(format!("Redis LLEN failed: {}", e)))?;
 
@@ -840,7 +840,7 @@ impl JobQueue {
                     Ok(c) => c,
                     Err(_) => return,
                 };
-                let _: Result<(), _> = conn.lpush("soroscope:jobs:queue", id_str).await;
+                let _: Result<(), _> = conn.lpush("sky-moon-scope:jobs:queue", id_str).await;
             })
             .await;
 
@@ -1145,7 +1145,7 @@ impl JobWorker {
                         break;
                     }
                     _ = interval.tick() => {
-                        let key = format!("soroscope:workers:{}:heartbeat", worker_id_clone);
+                        let key = format!("sky-moon-scope:workers:{}:heartbeat", worker_id_clone);
                         let _: Result<(), _> = conn.set_ex(key, "alive", 30).await;
                     }
                 }
@@ -1175,8 +1175,8 @@ impl JobWorker {
                     break;
                 }
                 result = conn.brpoplpush(
-                    "soroscope:jobs:queue",
-                    "soroscope:jobs:processing",
+                    "sky-moon-scope:jobs:queue",
+                    "sky-moon-scope:jobs:processing",
                     1.0,
                 ) => result,
             };
@@ -1227,7 +1227,7 @@ impl JobWorker {
                             Err(_) => return,
                         };
                         let _: Result<(), _> = conn
-                            .lrem("soroscope:jobs:processing", 1, id_str_clone)
+                            .lrem("sky-moon-scope:jobs:processing", 1, id_str_clone)
                             .await;
                     });
                 }

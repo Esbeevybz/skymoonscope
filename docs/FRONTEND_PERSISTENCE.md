@@ -1,6 +1,6 @@
 # Frontend State Persistence
 
-This document describes how the SoroScope frontend persists WASM analysis results across page refreshes using browser local storage.
+This document describes how the Sky Moon Scope frontend persists WASM analysis results across page refreshes using browser local storage.
 
 ## Overview
 
@@ -22,7 +22,7 @@ The following data is saved for the latest analysis:
 
 ### Storage Key
 
-The latest analysis is stored under the key: `soroscope-latest-analysis`
+The latest analysis is stored under the key: `Sky Moon Scope-latest-analysis`
 
 ### Save Behavior
 
@@ -138,7 +138,7 @@ The persistence feature complements but does not replace the existing history fe
 
 | Feature | Latest Analysis Persistence | Invocation History |
 |---------|----------------------------|-------------------|
-| **Storage Key** | `soroscope-latest-analysis` | `soroban-invocation-history` |
+| **Storage Key** | `Sky Moon Scope-latest-analysis` | `soroban-invocation-history` |
 | **Capacity** | 1 result (latest only) | Up to 10 results |
 | **Purpose** | Restore UI state on refresh | Track multiple past invocations |
 | **UI Location** | Result tab (auto-restored) | History tab (user-selected) |
@@ -167,7 +167,7 @@ To verify the persistence feature works correctly:
 
 4. **Invalid Storage**
    - Open browser DevTools → Application → Local Storage
-   - Manually corrupt the `soroscope-latest-analysis` value
+   - Manually corrupt the `Sky Moon Scope-latest-analysis` value
    - Refresh the page
    - Verify the app doesn't crash and shows empty state
 

@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, Env};
 
-pub use soroscope_error_codes::ContractError as MathError;
+pub use Sky Moon Scope_error_codes::ContractError as MathError;
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]

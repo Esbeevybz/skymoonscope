@@ -1,5 +1,5 @@
 [package]
-name = "soroscope-merkle-fuzz"
+name = "sky-moon-scope-merkle-fuzz"
 version = "0.0.1"
 edition = "2021"
 publish = false
@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.soroscope-core]
+[dependencies.sky-moon-scope-core]
 path = ".."
 
 # Disable all default features of the parent crate that require network / DB

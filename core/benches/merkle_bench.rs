@@ -4,13 +4,13 @@
 //! 1 M leaves, plus proof generation and verification at representative sizes.
 //!
 //! Run with:
-//!   cargo bench -p soroscope-core
+//!   cargo bench -p sky-moon-scope-core
 //!
 //! HTML reports are written to target/criterion/ when the `html_reports`
 //! feature is enabled (enabled by default via Cargo.toml).
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use soroscope_core::merkle_tree::MerkleTree;
+use sky_moon_scope_core::merkle_tree::MerkleTree;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

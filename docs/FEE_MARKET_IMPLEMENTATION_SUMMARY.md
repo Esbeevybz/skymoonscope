@@ -165,14 +165,14 @@ Add to `.env`:
 FEE_COLLECTION_INTERVAL_SECS=5
 FEE_RETENTION_DAYS=30
 FEE_ANALYSIS_ENABLED=true
-DATABASE_URL=sqlite://soroscope.db
+DATABASE_URL=sqlite://Sky Moon Scope.db
 ```
 
 ## 🚀 Usage
 
 ### Start the server:
 ```bash
-cargo run -p soroscope-core
+cargo run -p Sky Moon Scope-core
 ```
 
 ### Get fee recommendation:

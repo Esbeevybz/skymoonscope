@@ -659,11 +659,11 @@ impl TokenBridge {
 
 ## Reference Implementation
 
-The reference implementation is available in the SoroScope repository:
+The reference implementation is available in the Sky Moon Scope repository:
 
 - **Contract**: `contracts/cross_chain_verifier/src/lib.rs`
 - **Tests**: `contracts/cross_chain_verifier/src/test.rs`
-- **Repository**: https://github.com/SoroLabs/soroscope
+- **Repository**: https://github.com/SkyMoonLabs/Sky Moon Scope
 
 ### Key Functions
 
@@ -708,8 +708,8 @@ pub fn verify_message(
 
 For questions, issues, or suggestions regarding this standard:
 
-- **GitHub Issues**: https://github.com/SoroLabs/soroscope/issues
-- **Documentation**: https://github.com/SoroLabs/soroscope/tree/main/docs
+- **GitHub Issues**: https://github.com/SkyMoonLabs/Sky Moon Scope/issues
+- **Documentation**: https://github.com/SkyMoonLabs/Sky Moon Scope/tree/main/docs
 - **Contributing**: See [CONTRIBUTING.md](../CONTRIBUTING.md)
 
 ---
@@ -717,4 +717,4 @@ For questions, issues, or suggestions regarding this standard:
 **Version**: 1.0  
 **Last Updated**: May 30, 2026  
 **Status**: ✅ Active Standard  
-**Maintainer**: SoroLabs
+**Maintainer**: SkyMoonLabs

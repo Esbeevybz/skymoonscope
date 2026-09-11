@@ -14,13 +14,13 @@
 //!   work-objects have gone out of scope; should be ≈ 0 for leak-free code.
 //!
 //! Run with:
-//!   cargo bench --bench memory_bench -p soroscope-core
+//!   cargo bench --bench memory_bench -p sky-moon-scope-core
 //!
 //! HTML reports are written to `target/criterion/` when the `html_reports`
 //! feature is active (default via Criterion dependency).
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use soroscope_core::merkle_tree::MerkleTree;
+use sky_moon_scope_core::merkle_tree::MerkleTree;
 use tikv_jemalloc_ctl::{epoch, stats};
 
 // ── Global allocator ──────────────────────────────────────────────────────────

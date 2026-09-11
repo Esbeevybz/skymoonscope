@@ -1,6 +1,6 @@
-# SoroScope 160 Roadmap & Production Issue Index
+# Sky Moon Scope 160 Roadmap & Production Issue Index
 
-This document serves as the master index for all **160 GitHub issues** created for [SoroLabs/soroscope](https://github.com/SoroLabs/soroscope).
+This document serves as the master index for all **160 GitHub issues** created for [SkyMoonLabs/Sky Moon Scope](https://github.com/SkyMoonLabs/Sky Moon Scope).
 
 ---
 

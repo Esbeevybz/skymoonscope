@@ -189,7 +189,7 @@ export function HeaderNav({ tab, setTab }: HeaderNavProps) {
               <div className="flex items-center justify-between border-b border-slate-800 pb-4">
                 <div className="flex items-center gap-2">
                   <Activity className="h-5 w-5 text-cyan-400" />
-                  <span className="font-bold text-white">SoroScope Menu</span>
+                  <span className="font-bold text-white">Sky Moon Scope Menu</span>
                 </div>
                 <button
                   type="button"
@@ -265,7 +265,7 @@ export function HeaderNav({ tab, setTab }: HeaderNavProps) {
                 </div>
               )}
               <p className="text-center text-xs text-slate-500">
-                Soroban Resource Analyzer &bull; SoroScope
+                Soroban Resource Analyzer &bull; Sky Moon Scope
               </p>
             </div>
           </div>

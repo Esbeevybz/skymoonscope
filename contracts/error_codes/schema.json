@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ContractError",
   "type": "object",
-  "description": "Explicit numerical discriminant mappings for SoroScope smart contract error codes.",
+  "description": "Explicit numerical discriminant mappings for Sky Moon Scope smart contract error codes.",
   "error_codes": [
     { "name": "AlreadyInitialized", "code": 1, "description": "Contract has already been initialized." },
     { "name": "NotInitialized", "code": 2, "description": "Contract has not been initialized yet." },

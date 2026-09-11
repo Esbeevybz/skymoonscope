@@ -1,13 +1,13 @@
-# 🚀 SoroScope: Production Readiness Checklist & Architecture Guide
+# 🚀 Sky Moon Scope: Production Readiness Checklist & Architecture Guide
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Stellar Wave](https://img.shields.io/badge/Stellar-Wave_Program-blue)](https://www.drips.network/wave/stellar)
 
-> Complete guide for deploying SoroScope to production Mainnet with security hardening, monitoring setup, scaling strategies, and troubleshooting procedures.
+> Complete guide for deploying Sky Moon Scope to production Mainnet with security hardening, monitoring setup, scaling strategies, and troubleshooting procedures.
 
 **Last Updated**: 2026-08-29  
 **Status**: Production Ready  
-**Maintained By**: SoroLabs Team
+**Maintained By**: SkyMoonLabs Team
 
 ---
 
@@ -32,7 +32,7 @@
 
 ### Core Components
 
-SoroScope is a monorepo with three primary production components:
+Sky Moon Scope is a monorepo with three primary production components:
 
 #### 1. **Core Profiler Engine** (`/core`)
 
@@ -102,7 +102,7 @@ Benchmark and reference implementations demonstrating:
 └───────────┼───────────────────┼─────────────────┼────────────────┘
             │                   │                 │
 ┌───────────▼───────────────────▼─────────────────▼────────────────┐
-│             SoroScope Core Profiler Engine (Rust)                │
+│             Sky Moon Scope Core Profiler Engine (Rust)                │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │ HTTP API Server (Actix-web)                              │   │
 │  │ ├─ POST /simulate (WASM payload, state, network config)  │   │
@@ -239,7 +239,7 @@ Every production contract **must** integrate the `EmergencyGuard` crate for secu
 
 ```rust
 use soroban_sdk::{contract, contractimpl, Address, Env};
-use soroscope_emergency_guard::{DefaultEmergencyGuard, PauseType};
+use Sky Moon Scope_emergency_guard::{DefaultEmergencyGuard, PauseType};
 
 #[contract]
 pub struct MyProductionContract;
@@ -448,13 +448,13 @@ process_resident_memory_bytes
 process_open_fds
 
 # Application metrics
-soroscope_simulation_duration_ms{contract="liquidity_pool"}
-soroscope_gas_units_consumed{contract="flash_loan"}
-soroscope_cache_hits_total
-soroscope_cache_misses_total
-soroscope_merkle_tree_verifications_total{status="success|failed"}
-soroscope_rpc_call_duration_ms{endpoint="getLatestLedger"}
-soroscope_rpc_errors_total{error_type="timeout|rate_limit|invalid_response"}
+Sky Moon Scope_simulation_duration_ms{contract="liquidity_pool"}
+Sky Moon Scope_gas_units_consumed{contract="flash_loan"}
+Sky Moon Scope_cache_hits_total
+Sky Moon Scope_cache_misses_total
+Sky Moon Scope_merkle_tree_verifications_total{status="success|failed"}
+Sky Moon Scope_rpc_call_duration_ms{endpoint="getLatestLedger"}
+Sky Moon Scope_rpc_errors_total{error_type="timeout|rate_limit|invalid_response"}
 ```
 
 #### Web Dashboard Metrics
@@ -513,7 +513,7 @@ Deploy an ELK Stack (Elasticsearch, Logstash, Kibana) or equivalent:
 # Alerts triggered on error patterns
 
 # Example: Alert on RPC connection failures
-GET logs-soroscope-*/_search
+GET logs-Sky Moon Scope-*/_search
 {
   "query": {
     "match": {
@@ -624,7 +624,7 @@ Deploy multiple Core Server instances behind a load balancer:
 **NGINX Configuration Example:**
 
 ```nginx
-upstream soroscope_backend {
+upstream Sky Moon Scope_backend {
     least_conn;  # Load balancing strategy
     server localhost:8080;
     server localhost:8081;
@@ -635,7 +635,7 @@ upstream soroscope_backend {
 server {
     listen 80;
     location /api {
-        proxy_pass http://soroscope_backend;
+        proxy_pass http://Sky Moon Scope_backend;
         proxy_set_header Connection "";
         proxy_http_version 1.1;
         proxy_buffering off;
@@ -892,7 +892,7 @@ curl http://localhost:8080/health/ready
 ```bash
 # 1. Check current rate limit usage
 soroban_rpc_rate_limit_percent=$(curl -s http://localhost:8080/metrics | \
-  grep soroscope_rpc_rate_limit_percent | tail -1 | awk '{print $2}')
+  grep Sky Moon Scope_rpc_rate_limit_percent | tail -1 | awk '{print $2}')
 
 if (( $(echo "$soroban_rpc_rate_limit_percent > 80" | bc -l) )); then
     echo "Rate limit approaching: $soroban_rpc_rate_limit_percent%"
@@ -961,7 +961,7 @@ if !response.has_required_fields() {
 ```bash
 # 1. Profile memory usage
 valgrind --leak-check=full --show-leak-kinds=all \
-  cargo run -p soroscope-core
+  cargo run -p Sky Moon Scope-core
 
 # 2. Optimize contract memory usage
 # Replace Vec::new() with pre-allocated capacity
@@ -969,7 +969,7 @@ let mut buf = Vec::with_capacity(1024);
 
 # 3. Increase simulator memory limit
 export RUST_MIN_STACK=8388608  # 8MB min stack
-cargo run -p soroscope-core
+cargo run -p Sky Moon Scope-core
 
 # 4. Consider chunking large simulations
 # Simulate contract function in smaller batches
@@ -992,10 +992,10 @@ cargo run -p soroscope-core
 ```bash
 # 1. Enable instruction tracing
 export SOROBAN_DEBUG_TRACE=1
-cargo run -p soroscope-core
+cargo run -p Sky Moon Scope-core
 
 # 2. Identify hotspot via gas analysis
-# Review soroscope_gas_units_consumed metrics
+# Review Sky Moon Scope_gas_units_consumed metrics
 # Look for unexpectedly high values
 
 # 3. Optimize contract code
@@ -1111,7 +1111,7 @@ curl http://localhost:8080/metrics
 # 2. Check Prometheus scrape config
 cat /etc/prometheus/prometheus.yml
 # Should include:
-# - job_name: 'soroscope'
+# - job_name: 'Sky Moon Scope'
 #   static_configs:
 #     - targets: ['localhost:8080']
 #   scrape_interval: 15s
@@ -1171,10 +1171,10 @@ War Room Opened (Slack/PagerDuty)
 curl http://localhost:8080/health/live
 
 # 2. Review recent logs
-journalctl -u soroscope-core -n 100 --no-pager
+journalctl -u Sky Moon Scope-core -n 100 --no-pager
 
 # 3. Restart service if safe
-systemctl restart soroscope-core
+systemctl restart Sky Moon Scope-core
 
 # 4. Verify startup
 sleep 5
@@ -1229,7 +1229,7 @@ curl -X POST http://localhost:8080/admin/reload-config
 
 ```bash
 # 1. Collect logs from incident window
-journalctl -u soroscope-core \
+journalctl -u Sky Moon Scope-core \
   --since "2024-01-15 10:00:00" \
   --until "2024-01-15 10:30:00" > incident_logs.txt
 
@@ -1269,7 +1269,7 @@ git log --since="1 day ago" --oneline
 **Post-Mortem Template:**
 
 ```markdown
-# Incident Report: SoroScope Outage - 2024-01-15
+# Incident Report: Sky Moon Scope Outage - 2024-01-15
 
 **Severity**: Sev-1 (Complete Outage)
 **Duration**: 45 minutes (10:00-10:45 UTC)
@@ -1327,7 +1327,7 @@ Affected version: v1.2.3 (deployed 2024-01-14)
 
 set -e
 
-echo "Running SoroScope Smoke Tests..."
+echo "Running Sky Moon Scope Smoke Tests..."
 
 # 1. Health check
 echo "✓ Testing health endpoints..."
@@ -1363,7 +1363,7 @@ curl -f http://localhost:8080/api/fee-market
 
 # 5. Check metrics export
 echo "✓ Verifying metrics endpoint..."
-curl -f http://localhost:8080/metrics | grep -q soroscope_simulation_duration_ms
+curl -f http://localhost:8080/metrics | grep -q Sky Moon Scope_simulation_duration_ms
 
 echo ""
 echo "✅ All smoke tests passed!"
@@ -1530,9 +1530,9 @@ Create and verify deployment manifest:
 - [Postmortem Culture Guide](https://www.blameless.com/incident-management)
 
 ### Community
-- [SoroScope GitHub](https://github.com/SoroLabs/soroscope)
+- [Sky Moon Scope GitHub](https://github.com/SkyMoonLabs/Sky Moon Scope)
 - [Stellar Developers Discord](https://discord.gg/stellar)
-- [SoroLabs Community](https://sorolabs.dev/)
+- [SkyMoonLabs Community](https://SkyMoonLabs.dev/)
 
 ---
 
@@ -1566,8 +1566,8 @@ A: Error rate (< 0.1%), latency (p95 < 1s), and RPC endpoint health. Set aggress
 
 ---
 
-**Created by**: SoroLabs Team  
+**Created by**: SkyMoonLabs Team  
 **Last Reviewed**: 2026-08-29  
 **Next Review**: 2026-09-29  
 
-For questions or updates, please open an issue on the [SoroScope GitHub repository](https://github.com/SoroLabs/soroscope/issues).
+For questions or updates, please open an issue on the [Sky Moon Scope GitHub repository](https://github.com/SkyMoonLabs/Sky Moon Scope/issues).

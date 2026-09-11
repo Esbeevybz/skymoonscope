@@ -2,7 +2,7 @@
 
 ## Overview
 
-SoroScope now provides comprehensive error handling for WASM file uploads and backend validation. When the backend rejects a WASM file, users see detailed, actionable error messages describing what went wrong and how to fix it.
+Sky Moon Scope now provides comprehensive error handling for WASM file uploads and backend validation. When the backend rejects a WASM file, users see detailed, actionable error messages describing what went wrong and how to fix it.
 
 ## Architecture
 
@@ -191,7 +191,7 @@ Create a minimal invalid WASM file and upload via the UI to see error handling.
 Set `RUST_LOG=debug` on backend to see detailed profiling logs:
 
 ```bash
-RUST_LOG=debug cargo run -p soroscope-core
+RUST_LOG=debug cargo run -p Sky Moon Scope-core
 ```
 
 ## UI States
@@ -231,7 +231,7 @@ The upload component now has these states:
 ### Backend Returns 500 Error
 
 **Cause**: Analysis or validation logic failed  
-**Fix**: Check backend logs with `RUST_LOG=info cargo run -p soroscope-core`
+**Fix**: Check backend logs with `RUST_LOG=info cargo run -p Sky Moon Scope-core`
 
 ### Upload Always Succeeds (No Backend Validation)
 

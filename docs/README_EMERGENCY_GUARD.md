@@ -135,7 +135,7 @@ pub fn swap(env: Env, amount: i128) -> i128 {
 ## 📁 File Structure Created
 
 ```
-soroscope/
+Sky Moon Scope/
 ├── contracts/
 │   ├── emergency_guard/          ← NEW CRATE
 │   │   ├── Cargo.toml

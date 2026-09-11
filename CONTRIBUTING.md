@@ -1,6 +1,6 @@
-# Contributing to SoroScope
+# Contributing to Sky Moon Scope
 
-Thank you for your interest in contributing to *SoroScope*! We are excited to have you as part of our community.
+Thank you for your interest in contributing to *Sky Moon Scope*! We are excited to have you as part of our community.
 
 As a project in the *Stellar Wave Program*, we value collaboration and clear communication. Please use the following guides to help you get started:
 
@@ -24,4 +24,4 @@ To prevent horizontal scroll overflow on mobile screen widths, follow these step
 - Confirm zero horizontal body scrollbar.
 
 ## 💅 Questions?
-Feel free to open an **Issue**or reach out to the *SoroLabs team. Let's build the best Soroban developer tools together!
+Feel free to open an **Issue**or reach out to the *SkyMoonLabs team. Let's build the best Soroban developer tools together!

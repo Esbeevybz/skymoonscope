@@ -288,7 +288,7 @@ impl Default for ScannerConfig {
 /// # Example
 ///
 /// ```
-/// use soroscope_core::parser::WasmSecurityScanner;
+/// use Sky Moon Scope_core::parser::WasmSecurityScanner;
 ///
 /// let wasm_bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
 /// let report = WasmSecurityScanner::new().scan(wasm_bytes);

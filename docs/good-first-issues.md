@@ -1,4 +1,4 @@
-# 🌟 Structured Issues for Soroscope
+# 🌟 Structured Issues for Sky Moon Scope
 
 We have refined our issue list to ensure every contribution is meaningful and impactful. Below are the open issues for you to tackle, structured with clear context, expectations, and timeframes.
 

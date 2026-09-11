@@ -12,7 +12,7 @@ By adding structured `BurnEvent` emissions, we ensure that indexers can track bu
   - `amount`: The `i128` quantity of tokens burned.
 - **Direct Burn Event Emission**: Updated `burn` to emit the burn event.
 - **Delegated Burn Event Emission**: Updated `burn_from` to emit the burn event containing the authorized spender as the `burner`.
-- **Dual-Directory Alignment**: Updated both the active root-level contract (`contracts/token`) and the stale nested contract (`soroscope/contracts/token`) to keep both implementations consistent.
+- **Dual-Directory Alignment**: Updated both the active root-level contract (`contracts/token`) and the stale nested contract (`Sky Moon Scope/contracts/token`) to keep both implementations consistent.
 
 ## 🔧 Technical Implementation
 - Added `contracttype` macro usage to imports in `contract.rs`.
@@ -56,8 +56,8 @@ Added comprehensive test suites to both the root and nested `test.rs` files:
 ## 📁 Files Changed
 - `contracts/token/src/contract.rs` - Defined event and published events in `burn`/`burn_from`
 - `contracts/token/src/test.rs` - Added unit tests for events and cleaned up duplicate imports
-- `soroscope/contracts/token/src/contract.rs` - Mirrored nested implementation changes
-- `soroscope/contracts/token/src/test.rs` - Mirrored nested test suite changes
+- `Sky Moon Scope/contracts/token/src/contract.rs` - Mirrored nested implementation changes
+- `Sky Moon Scope/contracts/token/src/test.rs` - Mirrored nested test suite changes
 
 ## ✅ Checklist
 - [x] Implementation completed according to issue specifications.

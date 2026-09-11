@@ -767,7 +767,7 @@ export function UploadZone({
 
       {/* Caption hint */}
       <p className="text-xs text-slate-600 text-center mt-3 font-mono">
-        WASM Resource Analyzer · Soroscope · compiled Soroban contracts only
+        WASM Resource Analyzer · Sky Moon Scope · compiled Soroban contracts only
       </p>
 
       <style>{`

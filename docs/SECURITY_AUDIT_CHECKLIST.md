@@ -1,6 +1,6 @@
 # Security Audit Checklist — Production Deployment
 
-This checklist must be reviewed and signed off before deploying any SoroScope contract to Stellar Mainnet.
+This checklist must be reviewed and signed off before deploying any Sky Moon Scope contract to Stellar Mainnet.
 
 ---
 

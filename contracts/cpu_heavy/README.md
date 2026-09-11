@@ -1,7 +1,7 @@
 # CPU Heavy Contract
 
 A benchmark contract whose entry points deliberately burn CPU, used to observe
-how SoroScope reports invocation cost. Every entry point is a pure computation:
+how Sky Moon Scope reports invocation cost. Every entry point is a pure computation:
 there is no state, no authorisation, and no storage access.
 
 ## Hard caps
@@ -82,7 +82,7 @@ exceeds its sub-cap.
 | 4    | `LoopOpsTooLarge`        |
 | 5    | `CombinedInputTooLarge`  |
 
-The discriminants are part of the contract's public surface — the SoroScope UI
+The discriminants are part of the contract's public surface — the Sky Moon Scope UI
 decodes errors by number — so new variants must be appended rather than
 inserted.
 

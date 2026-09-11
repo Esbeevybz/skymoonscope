@@ -3,7 +3,7 @@ name: Deploy Contracts to Testnet
 # Triggers after the CI workflow succeeds on main, or manually via the Actions UI.
 on:
   workflow_run:
-    workflows: ["SoroScope CI"]
+    workflows: ["Sky Moon Scope CI"]
     branches: [main]
     types: [completed]
   workflow_dispatch:
@@ -132,7 +132,7 @@ jobs:
           )
 
           {
-            echo "# SoroScope Testnet Deployment"
+            echo "# Sky Moon Scope Testnet Deployment"
             echo "# Timestamp : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
             echo "# Commit    : ${GITHUB_SHA}"
             echo "# Network   : Soroban Testnet"

@@ -2,7 +2,7 @@
 LP DEPOSIT/WITHDRAWAL FEE - WORK COMPLETED SUMMARY
 ================================================================================
 
-PROJECT: Soroscope AMM LP Fee Implementation
+PROJECT: Sky Moon Scope AMM LP Fee Implementation
 ISSUE: #104 - Mitigate JIT Liquidity Attacks
 BRANCH: feature/issue-104-amm-deposit-fee
 DATE: 2026-07-28

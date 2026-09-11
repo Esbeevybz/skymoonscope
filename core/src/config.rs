@@ -1,4 +1,4 @@
-//! Unified configuration loader for SoroScope Core (Issue #39).
+//! Unified configuration loader for Sky Moon Scope Core (Issue #39).
 //!
 //! [`AppConfig`] is the single source of truth for every runtime parameter.
 //! Values are resolved in priority order:
@@ -10,7 +10,7 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use soroscope_core::config::load_config;
+//! use Sky Moon Scope_core::config::load_config;
 //!
 //! let cfg = load_config().expect("failed to load configuration");
 //! println!("Listening on port {}", cfg.server_port);
@@ -93,7 +93,7 @@ fn default_redis_url() -> String {
 }
 
 fn default_database_url() -> String {
-    "sqlite://soroscope.db".to_string()
+    "sqlite://Sky Moon Scope.db".to_string()
 }
 
 fn default_simulation_mode() -> String {
@@ -161,7 +161,7 @@ fn default_log_format_json() -> bool {
 // AppConfig struct
 // ---------------------------------------------------------------------------
 
-/// Complete runtime configuration for the SoroScope Core server.
+/// Complete runtime configuration for the Sky Moon Scope Core server.
 ///
 /// All fields map 1-to-1 to environment variables (upper-case, with the same
 /// name). E.g. `server_port` is read from `SERVER_PORT`.
@@ -209,7 +209,7 @@ pub struct AppConfig {
     // --- Database ---
 
     /// Connection URL for the job queue / fee store (PostgreSQL or SQLite).
-    /// Env: `DATABASE_URL` · Default: `"sqlite://soroscope.db"`
+    /// Env: `DATABASE_URL` · Default: `"sqlite://Sky Moon Scope.db"`
     #[serde(default = "default_database_url")]
     pub database_url: String,
 
@@ -481,7 +481,7 @@ impl AppConfig {
 /// # Example
 ///
 /// ```rust,no_run
-/// use soroscope_core::config::load_config;
+/// use Sky Moon Scope_core::config::load_config;
 ///
 /// match load_config() {
 ///     Ok(cfg) => println!("Server port: {}", cfg.server_port),
@@ -591,7 +591,7 @@ mod tests {
             cfg.network_passphrase,
             "Test SDF Network ; September 2015"
         );
-        assert_eq!(cfg.database_url, "sqlite://soroscope.db");
+        assert_eq!(cfg.database_url, "sqlite://Sky Moon Scope.db");
         assert!(!cfg.is_production());
     }
 
@@ -662,7 +662,7 @@ mod tests {
     fn production_validation_passes_with_correct_values() {
         let cfg = AppConfig {
             app_env: "production".to_string(),
-            database_url: "postgres://user:pass@db.example.com/soroscope".to_string(),
+            database_url: "postgres://user:pass@db.example.com/Sky Moon Scope".to_string(),
             network_passphrase: "Public Global Stellar Network ; September 2015".to_string(),
             soroban_rpc_url: "https://rpc.mainnet.example.com".to_string(),
             cors_allowed_origins: "https://app.example.com".to_string(),
@@ -702,7 +702,7 @@ mod tests {
         // Deliberately misconfigured: all required production fields are wrong.
         let cfg = AppConfig {
             app_env: "production".to_string(),
-            database_url: "sqlite://soroscope.db".to_string(),      // ← bad: SQLite
+            database_url: "sqlite://Sky Moon Scope.db".to_string(),      // ← bad: SQLite
             network_passphrase: "Test SDF Network ; September 2015".to_string(), // ← bad: testnet
             soroban_rpc_url: "https://soroban-testnet.stellar.org".to_string(),  // ← bad: testnet
             cors_allowed_origins: String::new(), // ← bad: allow-all
@@ -754,7 +754,7 @@ mod tests {
         // Even with bad "production-only" values, dev mode skips the gate.
         let cfg = AppConfig {
             app_env: "development".to_string(),
-            database_url: "sqlite://soroscope.db".to_string(),
+            database_url: "sqlite://Sky Moon Scope.db".to_string(),
             network_passphrase: "Test SDF Network ; September 2015".to_string(),
             soroban_rpc_url: "https://soroban-testnet.stellar.org".to_string(),
             cors_allowed_origins: String::new(),
