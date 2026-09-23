@@ -57,6 +57,7 @@ use axum::{
 use config::{Config, ConfigError};
 use prometheus::{Encoder, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use simulation_service::{AnalysisResult, SimulationMetric, SimulationService};
 use std::collections::HashMap;
 use std::env;
@@ -68,7 +69,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 struct AppConfig {
     /// Port for the HTTP server
@@ -208,6 +209,27 @@ fn default_max_ledger_age() -> u32 {
 
 fn default_max_cache_size_mb() -> u64 {
     100
+}
+
+fn redacted_config(config: &AppConfig) -> Value {
+    let mut value = serde_json::to_value(config).expect("AppConfig should serialize");
+    redact_sensitive_values(&mut value);
+    value
+}
+
+fn redact_sensitive_values(value: &mut Value) {
+    if let Value::Object(fields) = value {
+        for (name, value) in fields.iter_mut() {
+            if ["_KEY", "_SECRET", "_PASSWORD", "_URL"]
+                .iter()
+                .any(|suffix| name.to_ascii_uppercase().ends_with(suffix))
+            {
+                *value = Value::String("[REDACTED]".to_string());
+            } else {
+                redact_sensitive_values(value);
+            }
+        }
+    }
 }
 
 fn load_config() -> Result<AppConfig, ConfigError> {
@@ -1618,11 +1640,8 @@ async fn main() {
     tracing::info!("SoroScope Starting...");
 
     let config = load_config().expect("Failed to load configuration");
-    tracing::info!("SoroScope initialized with config: {:?}", config);
-    tracing::info!(
-        redis_url = %config.redis_url,
-        "Cache config: using in-memory (moka) MVP; Redis URL reserved for future migration"
-    );
+    tracing::info!("SoroScope initialized with config: {:?}", redacted_config(&config));
+    tracing::info!("Cache config: using in-memory (moka) MVP; Redis URL reserved for future migration");
 
     let args: Vec<String> = env::args().collect();
 

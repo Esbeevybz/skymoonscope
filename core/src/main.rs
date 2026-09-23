@@ -59,6 +59,7 @@ use axum::{
 use config::{Config, ConfigError};
 use prometheus::{Encoder, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use simulation_service::{AnalysisResult, SimulationMetric, SimulationService};
 use std::collections::HashMap;
 use std::env;
@@ -82,7 +83,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 struct AppConfig {
     /// Port for the HTTP server
@@ -266,6 +267,27 @@ fn default_allowed_origins() -> String {
     String::new()
 }
 
+fn redacted_config(config: &AppConfig) -> Value {
+    let mut value = serde_json::to_value(config).expect("AppConfig should serialize");
+    redact_sensitive_values(&mut value);
+    value
+}
+
+fn redact_sensitive_values(value: &mut Value) {
+    if let Value::Object(fields) = value {
+        for (name, value) in fields.iter_mut() {
+            if ["_KEY", "_SECRET", "_PASSWORD", "_URL"]
+                .iter()
+                .any(|suffix| name.to_ascii_uppercase().ends_with(suffix))
+            {
+                *value = Value::String("[REDACTED]".to_string());
+            } else {
+                redact_sensitive_values(value);
+            }
+        }
+    }
+}
+
 fn load_config() -> Result<AppConfig, ConfigError> {
     dotenvy::dotenv().ok();
 
@@ -359,6 +381,33 @@ mod log_filter_tests {
             build_env_filter("Sky Moon Scope_core=not_a_real_level").to_string(),
             "info"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_redaction_tests {
+    use super::redact_sensitive_values;
+    use serde_json::json;
+
+    #[test]
+    fn masks_sensitive_environment_suffixes_and_preserves_other_values() {
+        let mut value = json!({
+            "database_url": "postgres://user:password@example/db",
+            "rpc_key": "rpc-secret",
+            "webhook_secret": "webhook-secret",
+            "admin_password": "admin-password",
+            "server_port": 8080,
+            "nested": {"signing_key": "nested-secret"}
+        });
+
+        redact_sensitive_values(&mut value);
+
+        assert_eq!(value["database_url"], "[REDACTED]");
+        assert_eq!(value["rpc_key"], "[REDACTED]");
+        assert_eq!(value["webhook_secret"], "[REDACTED]");
+        assert_eq!(value["admin_password"], "[REDACTED]");
+        assert_eq!(value["server_port"], 8080);
+        assert_eq!(value["nested"]["signing_key"], "[REDACTED]");
     }
 }
 
@@ -2021,11 +2070,8 @@ async fn main() {
         .with(build_env_filter(&config.rust_log))
 
     tracing::info!(rust_log = %config.rust_log, "Sky Moon Scope Starting...");
-    tracing::info!("Sky Moon Scope initialized with config: {:?}", config);
-    tracing::info!(
-        redis_url = %config.redis_url,
-        "Cache config: using in-memory (moka) MVP; Redis URL reserved for future migration"
-    );
+    tracing::info!("Sky Moon Scope initialized with config: {:?}", redacted_config(&config));
+    tracing::info!("Cache config: using in-memory (moka) MVP; Redis URL reserved for future migration");
     if config.inbound_webhook_secret.is_empty() {
         tracing::warn!(
             "Inbound webhook secret is not configured; set INBOUND_WEBHOOK_SECRET or SKY_MOON_SCOPE_INBOUND_WEBHOOK_SECRET"
