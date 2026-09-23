@@ -16,10 +16,12 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use redis::{AsyncCommands, Client as RedisClient};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Sha256;
 use sqlx::any::AnyQueryResult;
 use sqlx::{PgPool, SqlitePool};
 use std::collections::HashMap;
@@ -29,6 +31,16 @@ use std::time::Duration;
 use tokio::time::interval;
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+type HmacSha256 = Hmac<Sha256>;
+const WEBHOOK_SIGNATURE_HEADER: &str = "X-SMS-Signature";
+
+fn sign_webhook_payload(secret: &str, body: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts signing keys of any size");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
 
 /// Database pool type - supports both PostgreSQL and SQLite
 #[derive(Clone)]
@@ -1495,6 +1507,7 @@ impl JobWorker {
             "result": result,
             "timestamp": Utc::now().to_rfc3339(),
         });
+        let body = serde_json::to_vec(&payload).expect("webhook payload is serializable");
 
         let timeout = Duration::from_secs(timeout_secs);
         let mut last_error = None;
@@ -1502,7 +1515,7 @@ impl JobWorker {
         for attempt in 1..=max_retries {
             let mut request = client
                 .post(&config.callback_url)
-                .json(&payload)
+                .header("content-type", "application/json")
                 .timeout(timeout);
 
             // Add custom headers if provided
@@ -1512,7 +1525,11 @@ impl JobWorker {
                 }
             }
 
-            match request.send().await {
+            if let Some(secret) = &config.secret {
+                request = request.header(WEBHOOK_SIGNATURE_HEADER, sign_webhook_payload(secret, &body));
+            }
+
+            match request.body(body.clone()).send().await {
                 Ok(response) => {
                     if response.status().is_success() {
                         tracing::info!(job_id = %job_id, attempt, "Webhook delivered");
@@ -1538,6 +1555,17 @@ impl JobWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_signature_is_hmac_sha256_of_payload() {
+        let secret = "endpoint-secret";
+        let body = br#"{"status":"completed"}"#;
+
+        assert_eq!(
+            sign_webhook_payload(secret, body),
+            "sha256=b5648e007f49275a4e2b3340b06eb2fc97726fdb34b007cd3c3ffabeb4e89adf"
+        );
+    }
 
     // `JobQueue::new` runs the checked-in Postgres-dialect migration SQL
     // (`CREATE OR REPLACE FUNCTION ... plpgsql`), which SQLite cannot parse.
