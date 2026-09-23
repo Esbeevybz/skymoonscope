@@ -16,12 +16,14 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use redis::{AsyncCommands, Client as RedisClient};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::any::AnyQueryResult;
 use sqlx::{PgPool, SqlitePool};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -29,6 +31,9 @@ use std::time::Duration;
 use tokio::time::interval;
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+type HmacSha256 = Hmac<Sha256>;
+const WEBHOOK_SIGNATURE_HEADER: &str = "X-SMS-Signature";
 
 /// Database pool type - supports both PostgreSQL and SQLite
 #[derive(Clone)]
@@ -1495,6 +1500,13 @@ impl JobWorker {
             "result": result,
             "timestamp": Utc::now().to_rfc3339(),
         });
+        let body = match serde_json::to_vec(&payload) {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::error!(job_id = %job_id, %error, "Failed to serialize webhook payload");
+                return;
+            }
+        };
 
         let timeout = Duration::from_secs(timeout_secs);
         let mut last_error = None;
@@ -1502,7 +1514,8 @@ impl JobWorker {
         for attempt in 1..=max_retries {
             let mut request = client
                 .post(&config.callback_url)
-                .json(&payload)
+                .body(body.clone())
+                .header("content-type", "application/json")
                 .timeout(timeout);
 
             // Add custom headers if provided
@@ -1510,6 +1523,13 @@ impl JobWorker {
                 for (key, value) in headers {
                     request = request.header(key, value);
                 }
+            }
+
+            if let Some(secret) = &config.secret {
+                request = request.header(
+                    WEBHOOK_SIGNATURE_HEADER,
+                    sign_webhook_payload(secret, &body),
+                );
             }
 
             match request.send().await {
@@ -1533,6 +1553,13 @@ impl JobWorker {
 
         tracing::error!(job_id = %job_id, error = ?last_error, "Webhook failed");
     }
+}
+
+fn sign_webhook_payload(secret: &str, body: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts keys of any size");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
 #[cfg(test)]
@@ -1746,6 +1773,14 @@ mod tests {
             args: vec![],
         };
         assert_eq!(compare_local.contract_id(), None);
+    }
+
+    #[test]
+    fn webhook_signature_uses_raw_payload_bytes() {
+        assert_eq!(
+            sign_webhook_payload("secret", b"{\"status\":\"completed\"}"),
+            "sha256=f221b3e5be7a7967fb814487442ac97c879375c1cd8fec3fec9c4476bed3589a"
+        );
     }
 
     #[tokio::test]
