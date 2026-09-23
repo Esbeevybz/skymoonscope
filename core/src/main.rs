@@ -2776,8 +2776,7 @@ async fn main() {
         .route("/fees/recommend", get(fee_recommend))
         .route("/fees/history", get(fee_history))
         .route("/fees/analytics", get(fee_analytics))
-        // WebSocket streaming (Issue #105) — no auth required on the upgrade;
-        // the client passes the job_id in the path.
+        // WebSocket streaming (Issue #105) authenticates during the upgrade.
         .route("/ws/jobs/:job_id", get(ws::ws_handler))
         // Inbound webhooks signature validation (Issue #582)
         .route("/api/v1/webhooks/incoming", post(incoming_webhook))

@@ -36,8 +36,9 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Extension, Path, Query, State,
     },
+    http::{header, HeaderMap},
     response::IntoResponse,
 };
 use chrono::{DateTime, Utc};
@@ -280,6 +281,11 @@ pub struct WsState {
     pub bus: Arc<SimulationBus>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WsAuthQuery {
+    token: Option<String>,
+}
+
 // ── WebSocket handler ─────────────────────────────────────────────────────────
 
 /// Upgrade handler for `GET /ws/jobs/:job_id`.
@@ -289,10 +295,22 @@ pub struct WsState {
 /// or the client disconnects.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    Query(query): Query<WsAuthQuery>,
     Path(job_id): Path<String>,
     State(state): State<Arc<crate::AppState>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, job_id, state))
+    Extension(auth_state): Extension<Arc<crate::auth::AuthState>>,
+) -> Result<impl IntoResponse, crate::errors::AppError> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .or(query.token.as_deref())
+        .ok_or_else(|| crate::errors::AppError::Unauthorized("Missing session token".into()))?;
+
+    auth_state.validate_token(token)?;
+
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, job_id, state)))
 }
 
 async fn handle_socket(mut socket: WebSocket, job_id: String, state: Arc<crate::AppState>) {
