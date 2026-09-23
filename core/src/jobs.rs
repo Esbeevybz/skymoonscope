@@ -24,6 +24,7 @@ use serde_json::Value;
 use sqlx::any::AnyQueryResult;
 use sqlx::{PgPool, SqlitePool};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use utoipa::ToSchema;
 use uuid::Uuid;
+use rand::RngCore;
 
 type HmacSha256 = Hmac<Sha256>;
 const WEBHOOK_SIGNATURE_HEADER: &str = "X-SMS-Signature";
@@ -222,7 +224,8 @@ pub struct Job {
     pub progress_message: String,
     pub webhook_url: Option<String>,
     pub webhook_headers: Option<Value>,
-    pub webhook_secret: Option<String>,
+    pub webhook_secret_hash: Option<String>,
+    pub webhook_secret_salt: Option<String>,
     pub error_message: Option<String>,
     pub error_type: Option<String>,
     pub timeout_secs: i32,
@@ -252,6 +255,15 @@ impl Job {
         serde_json::from_value(self.payload.clone()).ok()
     }
 
+    pub fn authenticate_webhook_secret(&self, secret: &str) -> bool {
+        match (&self.webhook_secret_hash, &self.webhook_secret_salt) {
+            (Some(expected_hash), Some(salt)) => {
+                verify_webhook_secret(secret, expected_hash, salt)
+            }
+            _ => false,
+        }
+    }
+
     pub fn get_webhook_config(&self) -> Option<WebhookConfig> {
         self.webhook_url.as_ref().map(|url| WebhookConfig {
             callback_url: url.clone(),
@@ -259,7 +271,7 @@ impl Job {
                 .webhook_headers
                 .as_ref()
                 .and_then(|h| serde_json::from_value(h.clone()).ok()),
-            secret: self.webhook_secret.clone(),
+            secret: self.webhook_secret_hash.clone(),
         })
     }
 }
@@ -377,22 +389,31 @@ impl JobQueue {
             JobError::ProcessingFailed(format!("Failed to serialize payload: {}", e))
         })?;
 
-        let (webhook_url, webhook_headers, webhook_secret) = match webhook {
-            Some(w) => (
-                Some(w.callback_url),
-                w.headers
-                    .map(|h| serde_json::to_value(h).unwrap_or_default()),
-                w.secret,
-            ),
-            None => (None, None, None),
+        let (webhook_url, webhook_headers, webhook_secret_hash, webhook_secret_salt) =
+            match webhook {
+                Some(w) => {
+                    let (secret_hash, secret_salt) = w
+                        .secret
+                        .as_deref()
+                        .map(hash_webhook_secret)
+                        .unzip();
+                    (
+                        Some(w.callback_url),
+                        w.headers
+                            .map(|h| serde_json::to_value(h).unwrap_or_default()),
+                        secret_hash,
+                        secret_salt,
+                    )
+                }
+                None => (None, None, None, None),
         };
 
         match &self.pool {
             DbPool::Postgres(pool) => {
                 sqlx::query(
                     r#"
-                    INSERT INTO jobs (id, job_type, status, payload, webhook_url, webhook_headers, webhook_secret, timeout_secs)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    INSERT INTO jobs (id, job_type, status, payload, webhook_url, webhook_headers, webhook_secret_hash, webhook_secret_salt, timeout_secs)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     "#
                 )
                 .bind(&id)
@@ -401,7 +422,8 @@ impl JobQueue {
                 .bind(&payload_json)
                 .bind(&webhook_url)
                 .bind(&webhook_headers)
-                .bind(&webhook_secret)
+                .bind(&webhook_secret_hash)
+                .bind(&webhook_secret_salt)
                 .bind(self.config.job_timeout_secs as i32)
                 .execute(pool)
                 .await?;
@@ -409,8 +431,8 @@ impl JobQueue {
             DbPool::Sqlite(pool) => {
                 sqlx::query(
                     r#"
-                    INSERT INTO jobs (id, job_type, status, payload, webhook_url, webhook_headers, webhook_secret, timeout_secs)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    INSERT INTO jobs (id, job_type, status, payload, webhook_url, webhook_headers, webhook_secret_hash, webhook_secret_salt, timeout_secs)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                     "#
                 )
                 .bind(&id.0.to_string())
@@ -419,7 +441,8 @@ impl JobQueue {
                 .bind(&payload_json)
                 .bind(&webhook_url)
                 .bind(&webhook_headers)
-                .bind(&webhook_secret)
+                .bind(&webhook_secret_hash)
+                .bind(&webhook_secret_salt)
                 .bind(self.config.job_timeout_secs as i32)
                 .execute(pool)
                 .await?;
@@ -959,7 +982,8 @@ impl JobQueue {
             progress_message: row.try_get("progress_message")?,
             webhook_url: row.try_get("webhook_url")?,
             webhook_headers: row.try_get("webhook_headers")?,
-            webhook_secret: row.try_get("webhook_secret")?,
+            webhook_secret_hash: row.try_get("webhook_secret_hash")?,
+            webhook_secret_salt: row.try_get("webhook_secret_salt")?,
             error_message: row.try_get("error_message")?,
             error_type: row.try_get("error_type")?,
             timeout_secs: row.try_get("timeout_secs")?,
@@ -1562,6 +1586,29 @@ fn sign_webhook_payload(secret: &str, body: &[u8]) -> String {
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
+fn hash_webhook_secret(secret: &str) -> (String, String) {
+    let mut salt = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut salt);
+    (hash_secret_with_salt(secret, &salt), hex::encode(salt))
+}
+
+fn hash_secret_with_salt(secret: &str, salt: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(salt);
+    digest.update(secret.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn verify_webhook_secret(secret: &str, expected_hash: &str, salt_hex: &str) -> bool {
+    let Ok(salt) = hex::decode(salt_hex) else {
+        return false;
+    };
+    hash_secret_with_salt(secret, &salt)
+        .as_bytes()
+        .ct_eq(expected_hash.as_bytes())
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1588,7 +1635,8 @@ mod tests {
                 progress_message TEXT NOT NULL DEFAULT 'Queued',
                 webhook_url TEXT,
                 webhook_headers TEXT,
-                webhook_secret TEXT,
+                webhook_secret_hash TEXT,
+                webhook_secret_salt TEXT,
                 error_message TEXT,
                 error_type TEXT,
                 timeout_secs INTEGER NOT NULL DEFAULT 300,
@@ -1781,6 +1829,15 @@ mod tests {
             sign_webhook_payload("secret", b"{\"status\":\"completed\"}"),
             "sha256=f221b3e5be7a7967fb814487442ac97c879375c1cd8fec3fec9c4476bed3589a"
         );
+    }
+
+    #[test]
+    fn webhook_secret_hash_is_salted_and_verifiable() {
+        let (hash, salt) = hash_webhook_secret("secret");
+
+        assert_ne!(hash, hash_webhook_secret("secret").0);
+        assert!(verify_webhook_secret("secret", &hash, &salt));
+        assert!(!verify_webhook_secret("wrong-secret", &hash, &salt));
     }
 
     #[tokio::test]
