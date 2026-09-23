@@ -2740,6 +2740,7 @@ async fn main() {
         .layer(Extension(webhook_validation::InboundWebhookSecret(Arc::new(
             config.inbound_webhook_secret.clone(),
         ))))
+        .layer(Extension(webhook_validation::InboundWebhookNonceCache::default()))
         // GraphQL contract execution history + token metadata query layer.
         .route(
             "/graphql",
@@ -3058,6 +3059,7 @@ mod tests {
             .merge(protected)
             .layer(Extension(auth_state))
             .layer(Extension(webhook_validation::InboundWebhookSecret(webhook_secret)))
+            .layer(Extension(webhook_validation::InboundWebhookNonceCache::default()))
             .with_state(app_state)
     }
 
