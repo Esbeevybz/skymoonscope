@@ -1323,9 +1323,19 @@ async fn analyze_wasm_profile(
 
     let result = tokio::time::timeout(
         state.simulation_timeout,
-        tokio::task::spawn_blocking(move || {
-            simulation::profile_contract_with_flamegraph(wasm_bytes, function_name, args)
-        }),
+        state
+            .event_worker_pool
+            .spawn_blocking(move || {
+                simulation::profile_contract_with_flamegraph(wasm_bytes, function_name, args)
+            })
+            .map_err(|error| match error {
+                crate::worker_pool::TaskQueueError::Full => AppError::TooManyRequests(
+                    "The event worker queue is full; please retry later".to_string(),
+                ),
+                crate::worker_pool::TaskQueueError::Closed => {
+                    AppError::Internal("The event worker queue is closed".to_string())
+                }
+            })?,
     )
     .await
     .map_err(|_| {
