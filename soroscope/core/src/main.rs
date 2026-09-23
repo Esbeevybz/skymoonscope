@@ -148,6 +148,9 @@ struct AppConfig {
     /// L2 treats it as stale. Default 100 ≈ 8 minutes at 5 s/ledger.
     #[serde(default = "default_max_ledger_age")]
     max_ledger_age: u32,
+    /// Maximum on-disk simulation cache size in megabytes (default 100).
+    #[serde(default = "default_max_cache_size_mb")]
+    max_cache_size_mb: u64,
 }
 
 fn default_health_check_interval() -> u64 {
@@ -203,6 +206,10 @@ fn default_max_ledger_age() -> u32 {
     100
 }
 
+fn default_max_cache_size_mb() -> u64 {
+    100
+}
+
 fn load_config() -> Result<AppConfig, ConfigError> {
     dotenvy::dotenv().ok();
 
@@ -231,6 +238,7 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .build()?
         .set_default("disk_cache_path", "")?
         .set_default("max_ledger_age", 100)?
+        .set_default("max_cache_size_mb", 100)?
         .build()?;
 
     settings.try_deserialize()
@@ -2087,7 +2095,8 @@ async fn main() {
 
     // ── Persistent Cache Setup (L2) ─────────────────────────────────────
     let sled_db = sled::open("soroscope_cache").expect("Failed to open sled database");
-    let simulation_cache = SimulationCache::new(&sled_db);
+    let simulation_cache =
+        SimulationCache::new_with_max_cache_size_mb(&sled_db, config.max_cache_size_mb);
     let contract_cache = Arc::new(ContractCache::new(&sled_db));
 
     let app_state = Arc::new(AppState {
