@@ -6,13 +6,20 @@
 //! a Redis connection, or a scheduler.
 
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Sha256;
 use std::collections::HashMap;
+use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::simulation::{SimulationResult, SorobanResources};
+
+type HmacSha256 = Hmac<Sha256>;
+pub(super) const WEBHOOK_SIGNATURE_HEADER: &str = "X-SMS-Signature";
 
 // ── Identifier ───────────────────────────────────────────────────────────────
 
@@ -217,7 +224,10 @@ pub struct Job {
     pub progress_message: String,
     pub webhook_url: Option<String>,
     pub webhook_headers: Option<Value>,
-    pub webhook_secret: Option<String>,
+    /// Salted HMAC-SHA256 hash of the webhook secret (stored; never the raw secret).
+    pub webhook_secret_hash: Option<String>,
+    /// Hex-encoded random salt used when hashing the webhook secret.
+    pub webhook_secret_salt: Option<String>,
     pub error_message: Option<String>,
     pub error_type: Option<String>,
     pub timeout_secs: i32,
@@ -250,6 +260,16 @@ impl Job {
         serde_json::from_value(self.payload.clone()).ok()
     }
 
+    /// Verify that `secret` matches the stored salted hash.
+    pub fn authenticate_webhook_secret(&self, secret: &str) -> bool {
+        match (&self.webhook_secret_hash, &self.webhook_secret_salt) {
+            (Some(expected_hash), Some(salt)) => {
+                verify_webhook_secret(secret, expected_hash, salt)
+            }
+            _ => false,
+        }
+    }
+
     /// Reconstruct the webhook configuration from the denormalised columns.
     pub fn get_webhook_config(&self) -> Option<WebhookConfig> {
         self.webhook_url.as_ref().map(|url| WebhookConfig {
@@ -258,9 +278,47 @@ impl Job {
                 .webhook_headers
                 .as_ref()
                 .and_then(|h| serde_json::from_value(h.clone()).ok()),
-            secret: self.webhook_secret.clone(),
+            // Expose the hash (not the raw secret) so callers can compare.
+            secret: self.webhook_secret_hash.clone(),
         })
     }
+}
+
+// ── Webhook secret helpers ────────────────────────────────────────────────────
+
+/// Produce the `X-SMS-Signature` header value for a webhook payload.
+pub fn sign_webhook_payload(secret: &str, body: &[u8]) -> String {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts keys of any size");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Hash a raw webhook secret with a fresh random salt.
+/// Returns `(hash_hex, salt_hex)`.
+pub fn hash_webhook_secret(secret: &str) -> (String, String) {
+    let mut salt = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut salt);
+    (hash_secret_with_salt(secret, &salt), hex::encode(salt))
+}
+
+fn hash_secret_with_salt(secret: &str, salt: &[u8]) -> String {
+    use sha2::Digest;
+    let mut digest = sha2::Sha256::new();
+    digest.update(salt);
+    digest.update(secret.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+/// Constant-time comparison of a candidate secret against the stored hash.
+pub fn verify_webhook_secret(secret: &str, expected_hash: &str, salt_hex: &str) -> bool {
+    let Ok(salt) = hex::decode(salt_hex) else {
+        return false;
+    };
+    hash_secret_with_salt(secret, &salt)
+        .as_bytes()
+        .ct_eq(expected_hash.as_bytes())
+        .into()
 }
 
 // ── Error ────────────────────────────────────────────────────────────────────

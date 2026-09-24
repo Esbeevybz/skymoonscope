@@ -25,8 +25,8 @@ use crate::task_queue::BoundedTaskDispatcher;
 use crate::AppError;
 
 use super::domain::{
-    Job, JobError, JobId, JobListFilter, JobPayload, JobQueueConfig, JobResult, JobStatus,
-    JobType, WebhookConfig,
+    hash_webhook_secret, sign_webhook_payload, Job, JobError, JobId, JobListFilter, JobPayload,
+    JobQueueConfig, JobResult, JobStatus, JobType, WebhookConfig, WEBHOOK_SIGNATURE_HEADER,
 };
 
 // ── DbPool ────────────────────────────────────────────────────────────────────
@@ -128,22 +128,26 @@ impl JobQueue {
             JobError::ProcessingFailed(format!("Failed to serialize payload: {}", e))
         })?;
 
-        let (webhook_url, webhook_headers, webhook_secret) = match webhook {
-            Some(w) => (
-                Some(w.callback_url),
-                w.headers
-                    .map(|h| serde_json::to_value(h).unwrap_or_default()),
-                w.secret,
-            ),
-            None => (None, None, None),
+        let (webhook_url, webhook_headers, webhook_secret_hash, webhook_secret_salt) = match webhook {
+            Some(w) => {
+                let (hash, salt) = w.secret.as_deref().map(hash_webhook_secret).unzip();
+                (
+                    Some(w.callback_url),
+                    w.headers
+                        .map(|h| serde_json::to_value(h).unwrap_or_default()),
+                    hash.flatten(),
+                    salt,
+                )
+            }
+            None => (None, None, None, None),
         };
 
         match &self.pool {
             DbPool::Postgres(pool) => {
                 sqlx::query(
                     r#"
-                    INSERT INTO jobs (id, job_type, status, payload, webhook_url, webhook_headers, webhook_secret, timeout_secs)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    INSERT INTO jobs (id, job_type, status, payload, webhook_url, webhook_headers, webhook_secret_hash, webhook_secret_salt, timeout_secs)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     "#,
                 )
                 .bind(&id)
@@ -152,7 +156,8 @@ impl JobQueue {
                 .bind(&payload_json)
                 .bind(&webhook_url)
                 .bind(&webhook_headers)
-                .bind(&webhook_secret)
+                .bind(&webhook_secret_hash)
+                .bind(&webhook_secret_salt)
                 .bind(self.config.job_timeout_secs as i32)
                 .execute(pool)
                 .await?;
@@ -160,8 +165,8 @@ impl JobQueue {
             DbPool::Sqlite(pool) => {
                 sqlx::query(
                     r#"
-                    INSERT INTO jobs (id, job_type, status, payload, webhook_url, webhook_headers, webhook_secret, timeout_secs)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    INSERT INTO jobs (id, job_type, status, payload, webhook_url, webhook_headers, webhook_secret_hash, webhook_secret_salt, timeout_secs)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                     "#,
                 )
                 .bind(&id.0.to_string())
@@ -170,7 +175,8 @@ impl JobQueue {
                 .bind(&payload_json)
                 .bind(&webhook_url)
                 .bind(&webhook_headers)
-                .bind(&webhook_secret)
+                .bind(&webhook_secret_hash)
+                .bind(&webhook_secret_salt)
                 .bind(self.config.job_timeout_secs as i32)
                 .execute(pool)
                 .await?;
@@ -647,7 +653,8 @@ impl JobQueue {
             progress_message: row.try_get("progress_message")?,
             webhook_url: row.try_get("webhook_url")?,
             webhook_headers: row.try_get("webhook_headers")?,
-            webhook_secret: row.try_get("webhook_secret")?,
+            webhook_secret_hash: row.try_get("webhook_secret_hash")?,
+            webhook_secret_salt: row.try_get("webhook_secret_salt")?,
             error_message: row.try_get("error_message")?,
             error_type: row.try_get("error_type")?,
             timeout_secs: row.try_get("timeout_secs")?,
@@ -808,7 +815,8 @@ mod tests {
                 progress_message TEXT NOT NULL DEFAULT 'Queued',
                 webhook_url TEXT,
                 webhook_headers TEXT,
-                webhook_secret TEXT,
+                webhook_secret_hash TEXT,
+                webhook_secret_salt TEXT,
                 error_message TEXT,
                 error_type TEXT,
                 timeout_secs INTEGER NOT NULL DEFAULT 300,

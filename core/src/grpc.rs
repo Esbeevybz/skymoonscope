@@ -201,6 +201,8 @@ fn translate_event(
 
 // ── Server startup helper ─────────────────────────────────────────────────────
 
+const MAX_GRPC_DECODING_MESSAGE_SIZE: usize = 5 * 1024 * 1024;
+
 /// Bind and serve the gRPC endpoint on `addr` over plaintext (no TLS).
 ///
 /// This is called from `main` and runs in a separate Tokio task alongside the
@@ -211,6 +213,7 @@ pub async fn serve(addr: std::net::SocketAddr, bus: Arc<SimulationBus>) {
     tracing::info!(grpc_addr = %addr, tls = false, "gRPC EventStreamService listening");
 
     if let Err(e) = tonic::transport::Server::builder()
+        .max_decoding_message_size(MAX_GRPC_DECODING_MESSAGE_SIZE)
         .add_service(svc)
         .serve(addr)
         .await
@@ -376,7 +379,10 @@ pub async fn serve_tls(addr: std::net::SocketAddr, bus: Arc<SimulationBus>, tls:
         "gRPC EventStreamService listening with TLS"
     );
 
-    let builder = match tonic::transport::Server::builder().tls_config(server_tls) {
+    let builder = match tonic::transport::Server::builder()
+        .max_decoding_message_size(MAX_GRPC_DECODING_MESSAGE_SIZE)
+        .tls_config(server_tls)
+    {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, "invalid gRPC TLS server configuration");

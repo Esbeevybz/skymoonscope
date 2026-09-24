@@ -23,6 +23,9 @@ pub enum AppError {
 
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+
+    #[error("Too many requests: {0}")]
+    TooManyRequests(String),
 }
 
 /// RFC 7807 "Problem Details for HTTP APIs" response body.
@@ -51,6 +54,7 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -60,6 +64,7 @@ impl AppError {
             Self::NotFound(_) => "not-found",
             Self::BadRequest(_) => "bad-request",
             Self::Unauthorized(_) => "unauthorized",
+            Self::TooManyRequests(_) => "too-many-requests",
         }
     }
 
@@ -69,6 +74,7 @@ impl AppError {
             Self::NotFound(_) => "Not Found",
             Self::BadRequest(_) => "Bad Request",
             Self::Unauthorized(_) => "Unauthorized",
+            Self::TooManyRequests(_) => "Too Many Requests",
         }
     }
 }

@@ -18,7 +18,8 @@ use crate::task_queue::TaskPriority;
 use crate::ws::SimulationBus;
 
 use super::domain::{
-    Job, JobError, JobId, JobPayload, JobQueueConfig, JobResult, JobStatus, WebhookConfig,
+    sign_webhook_payload, Job, JobError, JobId, JobPayload, JobQueueConfig, JobResult, JobStatus,
+    WebhookConfig, WEBHOOK_SIGNATURE_HEADER,
 };
 use super::store::JobQueue;
 
@@ -556,14 +557,22 @@ impl JobWorker {
             "timestamp": Utc::now().to_rfc3339(),
         });
 
+        let body = serde_json::to_vec(&payload).unwrap_or_default();
         let timeout = Duration::from_secs(timeout_secs);
         let mut last_error = None;
 
         for attempt in 1..=max_retries {
             let mut request = client
                 .post(&config.callback_url)
-                .json(&payload)
+                .header("Content-Type", "application/json")
+                .body(body.clone())
                 .timeout(timeout);
+
+            // Sign the payload if a secret is configured.
+            if let Some(ref secret) = config.secret {
+                let sig = sign_webhook_payload(secret, &body);
+                request = request.header(WEBHOOK_SIGNATURE_HEADER, sig);
+            }
 
             if let Some(headers) = &config.headers {
                 for (key, value) in headers {

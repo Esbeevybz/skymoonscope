@@ -57,6 +57,7 @@ use axum::{
 use config::{Config, ConfigError};
 use prometheus::{Encoder, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use simulation_service::{AnalysisResult, SimulationMetric, SimulationService};
 use std::collections::HashMap;
 use std::env;
@@ -68,7 +69,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 struct AppConfig {
     /// Port for the HTTP server
@@ -148,6 +149,9 @@ struct AppConfig {
     /// L2 treats it as stale. Default 100 ≈ 8 minutes at 5 s/ledger.
     #[serde(default = "default_max_ledger_age")]
     max_ledger_age: u32,
+    /// Maximum on-disk simulation cache size in megabytes (default 100).
+    #[serde(default = "default_max_cache_size_mb")]
+    max_cache_size_mb: u64,
 }
 
 fn default_health_check_interval() -> u64 {
@@ -203,6 +207,31 @@ fn default_max_ledger_age() -> u32 {
     100
 }
 
+fn default_max_cache_size_mb() -> u64 {
+    100
+}
+
+fn redacted_config(config: &AppConfig) -> Value {
+    let mut value = serde_json::to_value(config).expect("AppConfig should serialize");
+    redact_sensitive_values(&mut value);
+    value
+}
+
+fn redact_sensitive_values(value: &mut Value) {
+    if let Value::Object(fields) = value {
+        for (name, value) in fields.iter_mut() {
+            if ["_KEY", "_SECRET", "_PASSWORD", "_URL"]
+                .iter()
+                .any(|suffix| name.to_ascii_uppercase().ends_with(suffix))
+            {
+                *value = Value::String("[REDACTED]".to_string());
+            } else {
+                redact_sensitive_values(value);
+            }
+        }
+    }
+}
+
 fn load_config() -> Result<AppConfig, ConfigError> {
     dotenvy::dotenv().ok();
 
@@ -231,6 +260,7 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .build()?
         .set_default("disk_cache_path", "")?
         .set_default("max_ledger_age", 100)?
+        .set_default("max_cache_size_mb", 100)?
         .build()?;
 
     settings.try_deserialize()
@@ -1610,11 +1640,8 @@ async fn main() {
     tracing::info!("SoroScope Starting...");
 
     let config = load_config().expect("Failed to load configuration");
-    tracing::info!("SoroScope initialized with config: {:?}", config);
-    tracing::info!(
-        redis_url = %config.redis_url,
-        "Cache config: using in-memory (moka) MVP; Redis URL reserved for future migration"
-    );
+    tracing::info!("SoroScope initialized with config: {:?}", redacted_config(&config));
+    tracing::info!("Cache config: using in-memory (moka) MVP; Redis URL reserved for future migration");
 
     let args: Vec<String> = env::args().collect();
 
@@ -2087,7 +2114,8 @@ async fn main() {
 
     // ── Persistent Cache Setup (L2) ─────────────────────────────────────
     let sled_db = sled::open("soroscope_cache").expect("Failed to open sled database");
-    let simulation_cache = SimulationCache::new(&sled_db);
+    let simulation_cache =
+        SimulationCache::new_with_max_cache_size_mb(&sled_db, config.max_cache_size_mb);
     let contract_cache = Arc::new(ContractCache::new(&sled_db));
 
     let app_state = Arc::new(AppState {
@@ -2136,8 +2164,7 @@ async fn main() {
         .route("/fees/recommend", get(fee_recommend))
         .route("/fees/history", get(fee_history))
         .route("/fees/analytics", get(fee_analytics))
-        // WebSocket streaming (Issue #105) — no auth required on the upgrade;
-        // the client passes the job_id in the path.
+        // WebSocket streaming (Issue #105) authenticates during the upgrade.
         .route("/ws/jobs/:job_id", get(ws::ws_handler))
         .merge(protected)
         .layer(Extension(auth_state))

@@ -22,8 +22,9 @@ pub mod store;
 
 // Re-export everything that was previously at the top level of `jobs.rs`.
 pub use domain::{
-    Job, JobError, JobId, JobListFilter, JobPayload, JobProgress, JobQueueConfig, JobResult,
-    JobStatus, JobType, WebhookConfig,
+    hash_webhook_secret, sign_webhook_payload, verify_webhook_secret, Job, JobError, JobId,
+    JobListFilter, JobPayload, JobProgress, JobQueueConfig, JobResult, JobStatus, JobType,
+    WebhookConfig, WEBHOOK_SIGNATURE_HEADER,
 };
 pub use scheduler::{JobWorker, SchedulerExt};
 pub use store::{
