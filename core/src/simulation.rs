@@ -1089,6 +1089,8 @@ pub struct SimulationEngine {
     mode: SimulationMode,
     local_runner: Option<Arc<crate::runner::LocalRunner>>,
     rpc_throttle: crate::rpc_throttle::RpcThrottle,
+    /// Maximum total duration (seconds) for retry attempts to prevent indefinite hangs.
+    max_total_retry_duration_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1132,6 +1134,7 @@ impl SimulationEngine {
             mode: SimulationMode::Failover,
             local_runner: None,
             rpc_throttle: Default::default(),
+            max_total_retry_duration_secs: 300,
         }
     }
 
@@ -1151,6 +1154,7 @@ impl SimulationEngine {
             mode,
             local_runner: None,
             rpc_throttle: Default::default(),
+            max_total_retry_duration_secs: 300,
         }
     }
 
@@ -1168,6 +1172,7 @@ impl SimulationEngine {
             mode: SimulationMode::Failover,
             local_runner: None,
             rpc_throttle: Default::default(),
+            max_total_retry_duration_secs: 300,
         }
     }
 
@@ -1194,6 +1199,7 @@ impl SimulationEngine {
             mode,
             local_runner: None,
             rpc_throttle: Default::default(),
+            max_total_retry_duration_secs: 300,
         }
     }
 
@@ -1221,6 +1227,18 @@ impl SimulationEngine {
     /// Get the current request timeout.
     pub fn timeout(&self) -> std::time::Duration {
         self.request_timeout
+    }
+
+    /// Set the maximum total retry duration (in seconds).
+    /// When all retry attempts exceed this duration, the operation fails immediately.
+    pub fn with_max_retry_duration(mut self, secs: u64) -> Self {
+        self.max_total_retry_duration_secs = secs;
+        self
+    }
+
+    /// Get the configured maximum total retry duration in seconds.
+    pub fn max_retry_duration_secs(&self) -> u64 {
+        self.max_total_retry_duration_secs
     }
 
     /// Get the WASM bytes for a contract, checking the cache first.
@@ -1996,6 +2014,9 @@ impl SimulationEngine {
     /// providers aren't starved during warmup. The fallback loop itself
     /// still visits every healthy provider — ordering only controls which
     /// one is attempted first.
+    ///
+    /// The loop enforces a maximum total duration (max_total_retry_duration_secs)
+    /// to prevent indefinite hangs on degraded RPC nodes.
     async fn simulate_transaction_with_failover(
         &self,
         registry: &Arc<ProviderRegistry>,
@@ -2010,8 +2031,21 @@ impl SimulationEngine {
         }
 
         let mut last_error: Option<SimulationError> = None;
+        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(self.max_total_retry_duration_secs);
 
         for provider in &providers {
+            // Check if we've exceeded the maximum total retry duration
+            if std::time::Instant::now() > retry_deadline {
+                tracing::warn!(
+                    max_duration_secs = self.max_total_retry_duration_secs,
+                    "Maximum total retry duration exceeded, failing fast"
+                );
+                return Err(SimulationError::RpcRequestFailed(format!(
+                    "Exceeded maximum retry duration of {} seconds",
+                    self.max_total_retry_duration_secs
+                )));
+            }
+
             tracing::debug!(
                 provider = %provider.name,
                 url = %provider.url,
