@@ -95,13 +95,76 @@ export function SchemaVisualizer({
     [report, includeStorage],
   );
 
-  if (nodes.length === 0) {
+  const isEmpty = nodes.length === 0;
+  const isNoReport = !report;
+
+  if (isEmpty) {
     return (
-      <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-6 text-center">
-        <p className="text-sm text-slate-500">
-          No call graph in this analysis — run a simulation against a contract that makes
-          cross-contract calls to see its schema.
-        </p>
+      <div className="rounded-2xl border border-slate-800 bg-slate-900/60">
+        <div
+          style={{ height }}
+          className="flex flex-col items-center justify-center overflow-hidden rounded-xl border border-slate-800 bg-slate-950"
+          data-testid="schema-visualizer-empty-state"
+        >
+          {isNoReport ? (
+            <div className="flex flex-col items-center gap-4 px-6 text-center">
+              {/* Centered Illustration */}
+              <div className="flex h-20 w-20 items-center justify-center rounded-full bg-slate-800/50">
+                <svg
+                  className="h-10 w-10 text-slate-500"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  xmlns="http://www.w3.org/2000/svg"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={1.5}
+                    d="M13 10V3L4 14h7v7l9-11h-7z"
+                  />
+                </svg>
+              </div>
+
+              {/* CTA Message */}
+              <div>
+                <h3 className="text-sm font-semibold text-slate-300">No Schema Yet</h3>
+                <p className="mt-2 max-w-xs text-xs text-slate-500">
+                  Upload a contract and run a simulation to view its cross-contract calls and
+                  ledger key interactions.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center gap-3 px-6 text-center">
+              {/* Alternative icon for analyses without cross-contract calls */}
+              <div className="flex h-16 w-16 items-center justify-center rounded-full bg-slate-800/50">
+                <svg
+                  className="h-8 w-8 text-slate-500"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                  xmlns="http://www.w3.org/2000/svg"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={1.5}
+                    d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.5a1 1 0 00-.8.4l-4.5 5.25a1 1 0 01-1.6-.2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"
+                  />
+                </svg>
+              </div>
+
+              <div>
+                <h3 className="text-sm font-semibold text-slate-300">No Call Graph</h3>
+                <p className="mt-2 max-w-xs text-xs text-slate-500">
+                  This contract doesn't make cross-contract calls. Run a simulation against a
+                  contract with external calls to see its schema.
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     );
   }
