@@ -3,6 +3,7 @@
 import React, { useEffect, useRef } from 'react';
 import mermaid from 'mermaid';
 import { sanitizeMermaidDefinition } from '../lib/security';
+import { debugError } from '../lib/debugUtils';
 
 interface CallGraphVisualizerProps {
   /** Structured call graph from the `/analyze` response. */
@@ -53,7 +54,7 @@ const LEGEND = [
         container.innerHTML = '';
         container.innerHTML = svg;
       } catch (error) {
-        console.error('Mermaid rendering failed:', error);
+        debugError('Mermaid rendering failed:', error);
         if (cancelled || !containerRef.current) return;
 
         // Build the error node with the DOM APIs so the error text can never

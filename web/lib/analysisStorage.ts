@@ -8,6 +8,7 @@
 
 import type { InvocationResult } from './sorobantypes';
 import { getEncryptedLocalStorage } from './encryptedStorage';
+import { debugWarn } from './debugUtils';
 import {
   sanitizePlainText,
   sanitizeMermaidDefinition,
@@ -87,7 +88,7 @@ export async function saveLatestAnalysis(result: InvocationResult): Promise<void
     await storage.setItem(LATEST_ANALYSIS_KEY, serialized);
   } catch (error) {
     // Silently fail if storage is full or unavailable
-    console.warn('Failed to save latest analysis to local storage:', error);
+    debugWarn('Failed to save latest analysis to local storage:', error);
   }
 }
 
@@ -115,14 +116,14 @@ export async function loadLatestAnalysis(): Promise<InvocationResult | null> {
     // restored content is treated as untrusted before it is re-rendered.
     const sanitized = sanitizeRestoredResult(parsed);
     if (!sanitized) {
-      console.warn('Invalid analysis result in storage, ignoring');
+      debugWarn('Invalid analysis result in storage, ignoring');
       return null;
     }
 
     return sanitized;
   } catch (error) {
     // Handle malformed JSON or other parsing errors gracefully
-    console.warn('Failed to load latest analysis from local storage:', error);
+    debugWarn('Failed to load latest analysis from local storage:', error);
     return null;
   }
 }
@@ -140,6 +141,6 @@ export function clearLatestAnalysis(): void {
   try {
     storage.removeItem(LATEST_ANALYSIS_KEY);
   } catch (error) {
-    console.warn('Failed to clear latest analysis from local storage:', error);
+    debugWarn('Failed to clear latest analysis from local storage:', error);
   }
 }

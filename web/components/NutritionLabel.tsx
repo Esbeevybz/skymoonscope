@@ -2,6 +2,7 @@
 
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { ChevronDown, Download, Loader2 } from 'lucide-react';
+import { debugError } from '../lib/debugUtils';
 import {
   buildMetrics,
   overallPercent,
@@ -126,7 +127,7 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
       document.body.removeChild(link);
     } catch (error) {
       // A failed export must never take the label down with it.
-      console.error('Nutrition label PNG export failed:', error);
+      debugError('Nutrition label PNG export failed:', error);
       setExportError('Could not export the label as a PNG.');
     } finally {
       setExporting(false);

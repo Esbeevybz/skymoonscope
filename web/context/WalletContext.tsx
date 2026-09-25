@@ -10,6 +10,7 @@ import React, {
 } from "react";
 import { useNetwork } from "./NetworkContext";
 import { fetchAccountBalances, AssetBalance } from "../lib/stellarBalances";
+import { debugError } from "../lib/debugUtils";
 
 interface WalletContextType {
   connect: (moduleId: string) => Promise<void>;
@@ -92,7 +93,7 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
           setSelectedWalletId(savedWalletId);
         }
       } catch (err) {
-        console.error("Failed to initialize wallet kit:", err);
+        debugError("Failed to initialize wallet kit:", err);
         setError("Failed to load wallet kit");
       }
     };
@@ -179,7 +180,7 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
     } catch (err: any) {
       const errorMessage = err?.message || "Connection failed";
       setError(errorMessage);
-      console.error("Wallet connection failed:", err);
+      debugError("Wallet connection failed:", err);
     } finally {
       setIsConnecting(false);
     }
@@ -192,7 +193,7 @@ export const WalletProvider = ({ children }: { children: React.ReactNode }) => {
       try {
         await kit.disconnect();
       } catch (err) {
-        console.error("Disconnect error:", err);
+        debugError("Disconnect error:", err);
       }
     }
   };

@@ -20,6 +20,7 @@ import { createUserFriendlyMessage, formatError } from "../lib/errorHandling";
 import { arrayBufferToBase64 } from "../lib/utils";
 import { useWasmValidationWorker } from "../hooks/useWasmValidationWorker";
 import { extractContractFunctions } from "../lib/wasmValidation";
+import { debugLog } from "../lib/debugUtils";
 import type { WasmValidationReport } from "../lib/wasmValidation";
 
 // Utility for cleaner tailwind classes
@@ -568,7 +569,7 @@ export default function WasmUpload({
                     {wasmFile.status === "success" && (
                       <button
                         onClick={() => {
-                          console.log("Analyze WASM:", wasmFile.hash);
+                          debugLog("Analyze WASM:", wasmFile.hash);
                         }}
                         className="p-1.5 text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"
                         title="Analyze contract"
