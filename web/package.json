@@ -23,6 +23,7 @@
     "react-dropzone": "^15.0.0",
     "reactflow": "^11.11.4",
     "recharts": "^2.15.1",
+    "swr": "^2.5.1",
     "tailwind-merge": "^3.4.0",
     "zod": "^4.4.3"
   },
