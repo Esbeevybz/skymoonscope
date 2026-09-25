@@ -16,8 +16,20 @@ pub struct MetaTx {
     pub token: Address,
     /// Amount to transfer.
     pub amount: i128,
-    /// Nonce to prevent replay attacks.
+    /// Nonce to prevent replay attacks within the current epoch.
+    ///
+    /// The nonce is only valid when paired with the matching `epoch`. A nonce
+    /// signed under epoch N cannot be replayed once the account's epoch is
+    /// incremented to N+1 because the epoch field of the `MetaTx` will no
+    /// longer match the stored epoch.
     pub nonce: u64,
+    /// Epoch number. Must match the account's current stored epoch.
+    ///
+    /// Rotating the epoch (via `rotate_epoch`) increments this counter *and*
+    /// resets the nonce to 0, which invalidates every outstanding signature
+    /// from the previous epoch without requiring the relayer to enumerate
+    /// individual nonces.
+    pub epoch: u64,
     /// Deadline (unix timestamp) after which this meta-tx is invalid.
     pub deadline: u64,
 }
@@ -30,12 +42,19 @@ enum DataKey {
     /// per account — see `read_nonce` for why this must not be instance or
     /// temporary storage.
     Nonce(Address),
+    /// Per-user epoch counter. Lives in persistent storage alongside the nonce.
+    ///
+    /// When a user rotates their epoch, both the epoch entry is incremented and
+    /// the nonce entry is reset to 0. Any `MetaTx` carrying the old epoch value
+    /// is then rejected by the `epoch` check in `execute`, making cross-epoch
+    /// replay impossible even if the nonce range overlaps.
+    Epoch(Address),
 }
 
-/// Extend a nonce entry's TTL to this many ledgers on every write
+/// Extend a nonce/epoch entry's TTL to this many ledgers on every write
 /// (~60 days at a 5s close time).
 pub const NONCE_TTL_EXTEND_TO: u32 = 1_036_800;
-/// Extend a nonce entry's TTL when it drops below this many ledgers
+/// Extend a nonce/epoch entry's TTL when it drops below this many ledgers
 /// (~30 days at a 5s close time).
 pub const NONCE_TTL_THRESHOLD: u32 = 518_400;
 /// Largest number of nonces a single `invalidate_nonces` call may burn.
@@ -48,15 +67,17 @@ pub const MAX_NONCE_ADVANCE: u64 = 10_000;
 /// A gasless transaction (meta-transaction) contract.
 ///
 /// A user signs a `MetaTx` off-chain. A trusted relayer submits it on-chain,
-/// paying the network fee. The contract verifies the nonce and deadline, then
-/// executes the token transfer on behalf of the user.
+/// paying the network fee. The contract verifies the epoch, nonce, and
+/// deadline, then executes the token transfer on behalf of the user.
 ///
 /// In Soroban, "signing" is handled by `require_auth` — the user's auth entry
 /// is attached to the transaction by the relayer. This contract enforces:
-/// - Nonce uniqueness (replay protection).
+/// - Epoch binding (cross-epoch replay protection).
+/// - Nonce uniqueness within an epoch (same-epoch replay protection).
 /// - Deadline enforcement (expiry protection).
 /// - Relayer-only submission.
 /// - User-driven batch invalidation of pending nonces.
+/// - User-driven epoch rotation to mass-cancel all outstanding signatures.
 #[contract]
 #[derive(Default)]
 pub struct Gasless;
@@ -98,6 +119,25 @@ impl Gasless {
             .persistent()
             .extend_ttl(&key, NONCE_TTL_THRESHOLD, NONCE_TTL_EXTEND_TO);
     }
+
+    /// Read `user`'s current epoch.
+    ///
+    /// A fresh account has epoch 0. Epochs only increase, via `rotate_epoch`.
+    fn read_epoch(env: &Env, user: &Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Epoch(user.clone()))
+            .unwrap_or(0u64)
+    }
+
+    /// Write `user`'s epoch and refresh the entry's TTL.
+    fn write_epoch(env: &Env, user: &Address, value: u64) {
+        let key = DataKey::Epoch(user.clone());
+        env.storage().persistent().set(&key, &value);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, NONCE_TTL_THRESHOLD, NONCE_TTL_EXTEND_TO);
+    }
 }
 
 #[contractimpl]
@@ -118,6 +158,11 @@ impl Gasless {
     ///
     /// Must be called by the registered relayer (admin).
     /// The user's authorization is verified via `meta_tx.from.require_auth()`.
+    ///
+    /// The `meta_tx.epoch` field must equal the user's current stored epoch.
+    /// This binding ensures that a signature minted under epoch N is rejected
+    /// after `rotate_epoch` advances the account to epoch N+1, preventing
+    /// cross-epoch replay even when nonce ranges overlap between epochs.
     pub fn execute(env: Env, relayer: Address, meta_tx: MetaTx) {
         // Only the registered relayer may submit.
         let admin: Address = env
@@ -134,6 +179,14 @@ impl Gasless {
         let now = env.ledger().timestamp();
         if now > meta_tx.deadline {
             panic!("meta-tx expired");
+        }
+
+        // Epoch check — the meta-tx must carry the account's *current* epoch.
+        // A signature produced under a previous epoch is rejected here, making
+        // cross-epoch replay impossible.
+        let stored_epoch = Self::read_epoch(&env, &meta_tx.from);
+        if meta_tx.epoch != stored_epoch {
+            panic!("invalid epoch");
         }
 
         // Nonce check — must match the stored next-nonce for this user. An
@@ -212,9 +265,53 @@ impl Gasless {
         new_nonce
     }
 
+    /// Rotate the epoch for `user`, atomically resetting the nonce to 0.
+    ///
+    /// Every `MetaTx` the user has previously signed carries the old epoch
+    /// number. After rotation, the epoch check in `execute` rejects all of
+    /// those signatures, so the user can instantly revoke their entire pending
+    /// queue — including nonces that `invalidate_nonces` cannot reach because
+    /// the range cap of [`MAX_NONCE_ADVANCE`] would be exceeded.
+    ///
+    /// New meta-txs must be signed with the updated epoch returned by this
+    /// function and must restart their nonce at 0.
+    ///
+    /// Requires `user`'s authorization, so a relayer can submit this gaslessly.
+    /// Returns `(new_epoch, new_nonce)` where `new_nonce` is always 0.
+    ///
+    /// Panics on epoch overflow (u64 exhaustion, practically unreachable).
+    pub fn rotate_epoch(env: Env, user: Address) -> (u64, u64) {
+        user.require_auth();
+
+        let current_epoch = Self::read_epoch(&env, &user);
+        let new_epoch = current_epoch.checked_add(1).expect("epoch overflow");
+
+        // Atomically advance the epoch and reset the nonce. Both writes happen
+        // in the same transaction, so there is no window where a relayer could
+        // submit an old-epoch meta-tx between the two writes.
+        Self::write_epoch(&env, &user, new_epoch);
+        Self::write_nonce(&env, &user, 0);
+
+        env.storage()
+            .instance()
+            .extend_ttl(NONCE_TTL_THRESHOLD, NONCE_TTL_EXTEND_TO);
+
+        env.events().publish(
+            (Symbol::new(&env, "epoch_rotated"), user),
+            (current_epoch, new_epoch),
+        );
+
+        (new_epoch, 0)
+    }
+
     /// Return the current nonce for `user` (the next expected nonce).
     pub fn nonce(env: Env, user: Address) -> u64 {
         Self::read_nonce(&env, &user)
+    }
+
+    /// Return the current epoch for `user`.
+    pub fn epoch(env: Env, user: Address) -> u64 {
+        Self::read_epoch(&env, &user)
     }
 
     /// Return the relayer address.
@@ -226,14 +323,15 @@ impl Gasless {
     }
 }
 
-/// Helper to build a `MetaTx` value (used in tests).
-pub fn make_meta_tx(
+/// Helper to build a `MetaTx` with an explicit epoch (used in tests).
+pub fn make_meta_tx_with_epoch(
     _env: &Env,
     from: Address,
     to: Address,
     token: Address,
     amount: i128,
     nonce: u64,
+    epoch: u64,
     deadline: u64,
 ) -> MetaTx {
     MetaTx {
@@ -242,8 +340,23 @@ pub fn make_meta_tx(
         token,
         amount,
         nonce,
+        epoch,
         deadline,
     }
+}
+
+/// Helper to build a `MetaTx` at epoch 0 (backwards-compatible, used in
+/// existing tests where the epoch has never been rotated).
+pub fn make_meta_tx(
+    env: &Env,
+    from: Address,
+    to: Address,
+    token: Address,
+    amount: i128,
+    nonce: u64,
+    deadline: u64,
+) -> MetaTx {
+    make_meta_tx_with_epoch(env, from, to, token, amount, nonce, 0, deadline)
 }
 
 #[cfg(test)]
