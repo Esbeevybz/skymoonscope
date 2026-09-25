@@ -112,6 +112,10 @@ fn default_simulation_timeout_secs() -> u64 {
     30
 }
 
+fn default_max_total_retry_duration_secs() -> u64 {
+    300
+}
+
 fn default_job_timeout_secs() -> u64 {
     300
 }
@@ -282,6 +286,13 @@ pub struct AppConfig {
     /// Env: `SIMULATION_TIMEOUT_SECS` · Default: `30`
     #[serde(default = "default_simulation_timeout_secs")]
     pub simulation_timeout_secs: u64,
+
+    /// Maximum total duration (seconds) for all retry attempts across failover + job retries.
+    /// When elapsed, the job fails fast instead of continuing to retry.
+    /// Prevents indefinite hangs on degraded RPC nodes.
+    /// Env: `MAX_TOTAL_RETRY_DURATION_SECS` · Default: `300`
+    #[serde(default = "default_max_total_retry_duration_secs")]
+    pub max_total_retry_duration_secs: u64,
 
     /// Execution mode: `"failover"` or `"consensus"`.
     /// Env: `SIMULATION_MODE` · Default: `"failover"`
@@ -514,6 +525,7 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         .set_default("health_check_interval_secs", default_health_check_interval_secs())?
         .set_default("gossip_interval_secs", default_gossip_interval_secs())?
         .set_default("simulation_timeout_secs", default_simulation_timeout_secs())?
+        .set_default("max_total_retry_duration_secs", default_max_total_retry_duration_secs())?
         .set_default("job_timeout_secs", default_job_timeout_secs())?
         .set_default("max_concurrent_jobs", default_max_concurrent_jobs())?
         .set_default("event_worker_threads", default_event_worker_threads())?
@@ -681,6 +693,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            max_total_retry_duration_secs: 300,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,
@@ -720,6 +733,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            max_total_retry_duration_secs: 300,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,
@@ -772,6 +786,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            max_total_retry_duration_secs: 300,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,
