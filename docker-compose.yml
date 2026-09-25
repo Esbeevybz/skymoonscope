@@ -1,6 +1,24 @@
 version: '3.8'
 
 services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: sky-moon-scope-postgres
+    environment:
+      POSTGRES_DB: skymoonscope
+      POSTGRES_USER: skymoonscope
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U skymoonscope"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
   redis:
     image: redis:7-alpine
     container_name: sky-moon-scope-redis
@@ -29,11 +47,14 @@ services:
     ports:
       - "8080:8080"
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
       soroban-rpc:
         condition: service_started
     environment:
+      - DATABASE_URL=postgres://skymoonscope:${POSTGRES_PASSWORD}@postgres:5432/skymoonscope
       - REDIS_URL=redis://redis:6379
       - SOROBAN_RPC_URL=http://soroban-rpc:8000
     healthcheck:
@@ -54,3 +75,6 @@ services:
       core-server:
         condition: service_healthy
     restart: always
+
+volumes:
+  postgres_data:
