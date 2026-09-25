@@ -19,6 +19,13 @@ const DEFAULT_SETTINGS = {
 const MIN_TIMEOUT_MS = 1000;
 const MAX_TIMEOUT_MS = 120000;
 
+// Debug warning gate for development only
+const debugWarn = (...args) => {
+  if (typeof window !== 'undefined' && process.env.NODE_ENV === 'development') {
+    console.warn(...args);
+  }
+};
+
 /**
  * Validate a user supplied endpoint.
  *
@@ -129,7 +136,7 @@ function saveSettings(settings, storage) {
   try {
     store.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(normalized));
   } catch (error) {
-    console.warn('Failed to persist Sky Moon Scope settings:', error);
+    debugWarn('Failed to persist Sky Moon Scope settings:', error);
   }
 
   return normalized;
@@ -141,7 +148,7 @@ function clearSettings(storage) {
     try {
       store.removeItem(SETTINGS_STORAGE_KEY);
     } catch (error) {
-      console.warn('Failed to clear Sky Moon Scope settings:', error);
+      debugWarn('Failed to clear Sky Moon Scope settings:', error);
     }
   }
   return { ...DEFAULT_SETTINGS };
