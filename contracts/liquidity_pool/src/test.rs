@@ -2323,7 +2323,10 @@ fn test_swap_exact_in_prevents_1_stroop_micro_swap_exploit() {
 
     assert_eq!(client.get_amount_out(&false, &1), 0);
     let input_for_one = client.get_amount_in(&false, &1);
-    assert!(input_for_one > 1, "1 stroop must require a positive pool-favoring input: {input_for_one}");
+    assert!(
+        input_for_one > 1,
+        "1 stroop must require a positive pool-favoring input: {input_for_one}"
+    );
     assert_eq!(
         client.try_swap_exact_in(&trader, &false, &1, &0),
         Err(Ok(Error::InsufficientLiquidity))
@@ -2400,4 +2403,78 @@ fn test_amount_in_quote_round_trips_against_amount_out() {
         quoted_in >= 100,
         "round trip under-charged: {quoted_in} for {quoted_out} out"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic overflow is reported distinctly (issue #66)
+// ---------------------------------------------------------------------------
+
+/// `amount_out_for_in` surfaces an `i128` overflow as `ArithmeticOverflow`
+/// rather than `InsufficientLiquidity` (issue #66). The two are different
+/// problems: an overflow means the input or token precision is out of range,
+/// not that the pool is short of liquidity.
+#[test]
+fn test_swap_fee_overflow_reports_arithmetic_overflow() {
+    // amount_in * (10_000 - fee_bps) overflows i128.
+    assert_eq!(
+        amount_out_for_in(i128::MAX, 1, 1, 0),
+        Err(Error::ArithmeticOverflow)
+    );
+    // amount_in * (10_000 - fee_bps) * reserve_out overflows.
+    assert_eq!(
+        amount_out_for_in(i128::MAX / 2, 1, i128::MAX, 0),
+        Err(Error::ArithmeticOverflow)
+    );
+    // reserve_in * 10_000 overflows.
+    assert_eq!(
+        amount_out_for_in(1, i128::MAX, 1, 0),
+        Err(Error::ArithmeticOverflow)
+    );
+}
+
+/// Genuine liquidity problems keep their own error, so the two are not merged.
+#[test]
+fn test_real_liquidity_problems_are_still_insufficient_liquidity() {
+    assert_eq!(
+        amount_out_for_in(0, 1, 1, 0),
+        Err(Error::InsufficientLiquidity)
+    );
+    assert_eq!(
+        amount_out_for_in(1, 0, 1, 0),
+        Err(Error::InsufficientLiquidity)
+    );
+    assert_eq!(
+        amount_out_for_in(1, 1, 0, 0),
+        Err(Error::InsufficientLiquidity)
+    );
+    assert_eq!(
+        amount_in_for_out(0, 1, 1, 0),
+        Err(Error::InsufficientLiquidity)
+    );
+    // amount_out >= reserve_out is a liquidity bound, not an overflow.
+    assert_eq!(
+        amount_in_for_out(10, 1, 10, 0),
+        Err(Error::InsufficientLiquidity)
+    );
+}
+
+/// `amount_in_for_out` also reports overflow distinctly.
+#[test]
+fn test_amount_in_for_out_overflow_reports_arithmetic_overflow() {
+    assert_eq!(
+        amount_in_for_out(i128::MAX / 2, i128::MAX, i128::MAX, 0),
+        Err(Error::ArithmeticOverflow)
+    );
+}
+
+/// A normal swap still prices correctly, so the new error path is not
+/// over-broad.
+#[test]
+fn test_normal_swap_still_succeeds() {
+    // amount_out_for_in: 1000 * 9970 * 1000 / (1000 * 10000 + 1000*9970)
+    let out = amount_out_for_in(1_000, 1_000, 1_000, 30).unwrap();
+    assert!(out > 0 && out < 1_000);
+
+    let required = amount_in_for_out(500, 1_000, 1_000, 30).unwrap();
+    assert!(required > 500);
 }

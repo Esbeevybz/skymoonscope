@@ -31,6 +31,15 @@ pub enum Error {
     NoPendingFeeUpdate = 13,
     Paused = 14,
     InvalidAmount = 15,
+    /// A fee or share calculation exceeded the `i128` range (issue #66).
+    ///
+    /// Reported separately from `InsufficientLiquidity` on purpose. Both are
+    /// arithmetic guards, but they mean different things operationally: an
+    /// overflow points at an oversized input or a precision mismatch in the
+    /// token, whereas insufficient liquidity points at the pool's reserves.
+    /// Collapsing them into one code makes on-chain monitoring blind to the
+    /// former, which is the case that actually needs investigating.
+    ArithmeticOverflow = 16,
 }
 
 // Events
@@ -306,15 +315,15 @@ fn amount_out_for_in(
     }
     let in_after_fee = amount_in
         .checked_mul(10_000 - fee_bps)
-        .ok_or(Error::InsufficientLiquidity)?;
+        .ok_or(Error::ArithmeticOverflow)?;
     let numerator = in_after_fee
         .checked_mul(reserve_out)
-        .ok_or(Error::InsufficientLiquidity)?;
+        .ok_or(Error::ArithmeticOverflow)?;
     let denominator = reserve_in
         .checked_mul(10_000)
-        .ok_or(Error::InsufficientLiquidity)?
+        .ok_or(Error::ArithmeticOverflow)?
         .checked_add(in_after_fee)
-        .ok_or(Error::InsufficientLiquidity)?;
+        .ok_or(Error::ArithmeticOverflow)?;
     Ok(numerator / denominator)
 }
 
@@ -331,12 +340,12 @@ fn amount_in_for_out(
     }
     let numerator = reserve_in
         .checked_mul(amount_out)
-        .ok_or(Error::InsufficientLiquidity)?
+        .ok_or(Error::ArithmeticOverflow)?
         .checked_mul(10_000)
-        .ok_or(Error::InsufficientLiquidity)?;
+        .ok_or(Error::ArithmeticOverflow)?;
     let denominator = (reserve_out - amount_out)
         .checked_mul(10_000 - fee_bps)
-        .ok_or(Error::InsufficientLiquidity)?;
+        .ok_or(Error::ArithmeticOverflow)?;
     let quotient = numerator / denominator;
     Ok(if numerator % denominator == 0 {
         quotient
@@ -633,7 +642,7 @@ impl LiquidityPool {
         };
         let volatility_bps = price_delta
             .checked_mul(10_000)
-            .ok_or(Error::InvalidOraclePrice)?
+            .ok_or(Error::ArithmeticOverflow)?
             / previous_price;
         cfg.last_volatility_bps = volatility_bps;
         e.storage().instance().set(&DataKey::Oracle, &cfg);
@@ -901,16 +910,16 @@ impl LiquidityPool {
         let gross_shares = if pool.total_shares == 0 {
             let product = amount_a
                 .checked_mul(amount_b)
-                .ok_or(Error::InsufficientLiquidity)?;
+                .ok_or(Error::ArithmeticOverflow)?;
             sqrt(product)
         } else {
             let share_a = amount_a
                 .checked_mul(pool.total_shares)
-                .ok_or(Error::InsufficientLiquidity)?
+                .ok_or(Error::ArithmeticOverflow)?
                 / pool.reserve_a;
             let share_b = amount_b
                 .checked_mul(pool.total_shares)
-                .ok_or(Error::InsufficientLiquidity)?
+                .ok_or(Error::ArithmeticOverflow)?
                 / pool.reserve_b;
             if share_a < share_b {
                 share_a
@@ -933,14 +942,18 @@ impl LiquidityPool {
             .persistent()
             .get::<_, i128>(&user_key)
             .unwrap_or(0);
-        e.storage().persistent().set(&user_key, &(current + net_shares));
+        e.storage()
+            .persistent()
+            .set(&user_key, &(current + net_shares));
         e.storage().persistent().extend_ttl(&user_key, 100, 100);
 
         let dep_ledger_key = DataKey::DepositLedger(to.clone());
         e.storage()
             .persistent()
             .set(&dep_ledger_key, &e.ledger().sequence());
-        e.storage().persistent().extend_ttl(&dep_ledger_key, 100, 100);
+        e.storage()
+            .persistent()
+            .extend_ttl(&dep_ledger_key, 100, 100);
 
         pool.total_shares += net_shares;
         pool.reserve_a += amount_a;
@@ -1115,14 +1128,15 @@ impl LiquidityPool {
             .get(&DataKey::DepositLedger(to.clone()))
             .unwrap_or(0);
         let current_ledger = e.ledger().sequence();
-        let (penalty_a, penalty_b) = if deposit_ledger > 0 && current_ledger < deposit_ledger + MIN_HOLDING_PERIOD {
-            (
-                (gross_amount_a * EARLY_WITHDRAWAL_PENALTY_BPS) / 10_000,
-                (gross_amount_b * EARLY_WITHDRAWAL_PENALTY_BPS) / 10_000,
-            )
-        } else {
-            (0, 0)
-        };
+        let (penalty_a, penalty_b) =
+            if deposit_ledger > 0 && current_ledger < deposit_ledger + MIN_HOLDING_PERIOD {
+                (
+                    (gross_amount_a * EARLY_WITHDRAWAL_PENALTY_BPS) / 10_000,
+                    (gross_amount_b * EARLY_WITHDRAWAL_PENALTY_BPS) / 10_000,
+                )
+            } else {
+                (0, 0)
+            };
 
         let net_amount_a = gross_amount_a - fee_a - penalty_a;
         let net_amount_b = gross_amount_b - fee_b - penalty_b;
@@ -1166,10 +1180,7 @@ impl LiquidityPool {
 
         if penalty_a > 0 || penalty_b > 0 {
             e.events().publish(
-                (
-                    String::from_str(&e, "jit_penalty"),
-                    to.clone(),
-                ),
+                (String::from_str(&e, "jit_penalty"), to.clone()),
                 JitPenaltyEvent {
                     user: to.clone(),
                     penalty_a,
