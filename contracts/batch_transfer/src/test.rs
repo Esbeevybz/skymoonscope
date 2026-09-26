@@ -173,6 +173,178 @@ fn rejects_batch_over_max_recipient_limit() {
 }
 
 #[test]
+fn all_or_nothing_failure_leaves_no_partial_settlement() {
+    // A batch whose *last* entry is invalid: the earlier entries are valid and
+    // would settle under a plan-then-execute implementation that transfers as it
+    // scans.  The whole call must abort with nothing moved.
+    let (env, batch_id, token_id, sender, recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = TokenClient::new(&env, &token_id);
+    let recipient_b = Address::generate(&env);
+
+    let recipients = vec![&env, recipient_a.clone(), recipient_b.clone()];
+    let amounts = vec![&env, 100i128, 900i128];
+
+    let err = batch.try_execute(
+        &token_id,
+        &sender,
+        &recipients,
+        &amounts,
+        &ExecutionMode::AllOrNothing,
+    );
+
+    assert_eq!(err, Err(Ok(Error::InsufficientBalance)));
+    // The first, perfectly valid entry must not have settled.
+    assert_eq!(token.balance(&sender), 1_000);
+    assert_eq!(token.balance(&recipient_a), 0);
+    assert_eq!(token.balance(&recipient_b), 0);
+}
+
+#[test]
+fn all_or_nothing_insufficient_in_middle_settles_nothing() {
+    let (env, batch_id, token_id, sender, recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = TokenClient::new(&env, &token_id);
+    let recipient_b = Address::generate(&env);
+    let recipient_c = Address::generate(&env);
+
+    let recipients = vec![
+        &env,
+        recipient_a.clone(),
+        recipient_b.clone(),
+        recipient_c.clone(),
+    ];
+    // The middle entry alone exceeds the whole balance.
+    let amounts = vec![&env, 200i128, 5_000i128, 100i128];
+
+    let err = batch.try_execute(
+        &token_id,
+        &sender,
+        &recipients,
+        &amounts,
+        &ExecutionMode::AllOrNothing,
+    );
+
+    assert_eq!(err, Err(Ok(Error::InsufficientBalance)));
+    assert_eq!(token.balance(&sender), 1_000);
+    assert_eq!(token.balance(&recipient_a), 0);
+    assert_eq!(token.balance(&recipient_b), 0);
+    assert_eq!(token.balance(&recipient_c), 0);
+}
+
+#[test]
+fn execute_batch_returns_structured_aggregate() {
+    let (env, batch_id, token_id, sender, recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = TokenClient::new(&env, &token_id);
+    let recipient_b = Address::generate(&env);
+
+    let recipients = vec![&env, recipient_a.clone(), recipient_b.clone()];
+    let amounts = vec![&env, 300i128, -1i128];
+
+    let summary = batch.execute_batch(
+        &token_id,
+        &sender,
+        &recipients,
+        &amounts,
+        &ExecutionMode::Partial,
+    );
+
+    assert_eq!(summary.total, 2);
+    assert_eq!(summary.succeeded, 1);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.total_transferred, 300);
+    assert_eq!(summary.results.len(), 2);
+    assert_eq!(
+        summary.results.get(1).unwrap().failure,
+        TransferFailure::InvalidAmount
+    );
+    assert_eq!(token.balance(&recipient_a), 300);
+    assert_eq!(token.balance(&sender), 700);
+}
+
+#[test]
+fn execute_batch_reports_overspend_as_failure_not_success() {
+    let (env, batch_id, token_id, sender, recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = TokenClient::new(&env, &token_id);
+    let recipient_b = Address::generate(&env);
+
+    let recipients = vec![&env, recipient_a.clone(), recipient_b.clone()];
+    // Only the first fits within the 1_000 balance.
+    let amounts = vec![&env, 600i128, 600i128];
+
+    let summary = batch.execute_batch(
+        &token_id,
+        &sender,
+        &recipients,
+        &amounts,
+        &ExecutionMode::Partial,
+    );
+
+    assert_eq!(summary.total, 2);
+    assert_eq!(summary.succeeded, 1);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.total_transferred, 600);
+    assert_eq!(
+        summary.results.get(1).unwrap().failure,
+        TransferFailure::InsufficientBalance
+    );
+    assert_eq!(token.balance(&recipient_a), 600);
+    assert_eq!(token.balance(&recipient_b), 0);
+    assert_eq!(token.balance(&sender), 400);
+}
+
+#[test]
+fn execute_batch_aborts_whole_batch_in_all_or_nothing() {
+    let (env, batch_id, token_id, sender, recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = TokenClient::new(&env, &token_id);
+    let recipient_b = Address::generate(&env);
+
+    let recipients = vec![&env, recipient_a.clone(), recipient_b.clone()];
+    let amounts = vec![&env, 300i128, 900i128];
+
+    let err = batch.try_execute_batch(
+        &token_id,
+        &sender,
+        &recipients,
+        &amounts,
+        &ExecutionMode::AllOrNothing,
+    );
+
+    assert_eq!(err, Err(Ok(Error::InsufficientBalance)));
+    assert_eq!(token.balance(&sender), 1_000);
+    assert_eq!(token.balance(&recipient_a), 0);
+}
+
+#[test]
+fn quote_batch_moves_no_tokens() {
+    let (env, batch_id, token_id, sender, recipient_a) = setup();
+    let batch = BatchTransferClient::new(&env, &batch_id);
+    let token = TokenClient::new(&env, &token_id);
+    let recipient_b = Address::generate(&env);
+
+    let recipients = vec![&env, recipient_a.clone(), recipient_b.clone()];
+    let amounts = vec![&env, 400i128, 700i128];
+
+    let summary = batch.quote_batch(
+        &token_id,
+        &sender,
+        &recipients,
+        &amounts,
+        &ExecutionMode::Partial,
+    );
+
+    assert_eq!(summary.succeeded, 1);
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.total_transferred, 400);
+    // Quoting is a dry run: the ledger is untouched.
+    assert_eq!(token.balance(&sender), 1_000);
+    assert_eq!(token.balance(&recipient_a), 0);
+}
+
+#[test]
 fn quote_matches_partial_execution_plan() {
     let (env, batch_id, token_id, sender, recipient_a) = setup();
     let batch = BatchTransferClient::new(&env, &batch_id);

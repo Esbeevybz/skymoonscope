@@ -68,6 +68,11 @@ pub struct DIDUpdated {
 pub const DID_DOCUMENT: Symbol = Symbol::short("DID_DOC");
 pub const DID_METADATA: Symbol = Symbol::short("DID_META");
 pub const DID_INDEX: Symbol = Symbol::short("DID_IDX");
+/// Storage key for a DID's controlling address, combined with the DID string
+/// as `(DID_OWNER, did)`.  Recorded at registration and required to authorize
+/// every mutation of that document (#079), so a document cannot be rewritten
+/// by an unrelated caller.
+pub const DID_OWNER: Symbol = Symbol::short("DID_OWN");
 pub const CLAIMS: Symbol = Symbol::short("CLAIMS");
 pub const ATTESTATIONS: Symbol = Symbol::short("ATTEST");
 pub const OWNER: Symbol = Symbol::short("OWNER");
