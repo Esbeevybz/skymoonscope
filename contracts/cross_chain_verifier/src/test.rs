@@ -1,6 +1,10 @@
 #![cfg(test)]
 
-use crate::{CrossChainVerifier, CrossChainVerifierClient, Payload};
+use crate::{
+    CrossChainMessage, CrossChainVerifier, CrossChainVerifierClient, Payload, SignatureAlgorithm,
+    SignedMessage, LEAF_PREFIX, MAX_PROOF_LENGTH, NODE_PREFIX,
+};
+use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, Vec};
 
 fn make_payload(env: &Env, nonce: u64) -> Payload {
@@ -18,17 +22,36 @@ fn make_payload(env: &Env, nonce: u64) -> Payload {
 fn compute_leaf(env: &Env, payload: &Payload) -> BytesN<32> {
     CrossChainVerifier::compute_payload_hash(env, payload)
 }
-use crate::{
-    CrossChainMessage, CrossChainVerifier, CrossChainVerifierClient, SignatureAlgorithm,
-    SignedMessage,
-};
-use crate::{
-    CrossChainMessage, CrossChainVerifier, CrossChainVerifierClient, SignatureAlgorithm,
-    SignedMessage,
-};
-use crate::{CrossChainVerifier, CrossChainVerifierClient};
-use ed25519_dalek::{Signer, SigningKey};
-use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, Vec};
+
+/// `SHA256(0x00 || data)` — the RFC 6962 leaf hash (issue #076).
+fn hash_leaf(env: &Env, data: &[u8; 32]) -> [u8; 32] {
+    let mut buf = Bytes::new(env);
+    buf.extend_from_slice(&[LEAF_PREFIX]);
+    buf.extend_from_slice(data);
+    env.crypto()
+        .sha256(&Bytes::from_slice(env, &buf.to_array()))
+        .to_array()
+}
+
+/// `SHA256(0x01 || left || right)` — the RFC 6962 internal node hash (#076).
+fn hash_node(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut buf = Bytes::new(env);
+    buf.extend_from_slice(&[NODE_PREFIX]);
+    buf.extend_from_slice(left);
+    buf.extend_from_slice(right);
+    env.crypto()
+        .sha256(&Bytes::from_slice(env, &buf.to_array()))
+        .to_array()
+}
+
+/// Canonical sorted-pair node hash, matching the verifier's sibling ordering.
+fn merkle_hash_pair(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    if left <= right {
+        hash_node(env, left, right)
+    } else {
+        hash_node(env, right, left)
+    }
+}
 
 #[test]
 fn test_initialization() {
@@ -89,8 +112,12 @@ fn test_verify_message_success() {
     let sibling1 = BytesN::from_array(&env, &[3; 32]);
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
-    // Manually construct the root
-    let hash_1 = merkle_hash_pair(&env, &sibling1.to_array(), &leaf.to_array());
+    // Manually construct the root with RFC 6962 domain separation (#076).
+    let hash_1 = merkle_hash_pair(
+        &env,
+        &sibling1.to_array(),
+        &hash_leaf(&env, &leaf.to_array()),
+    );
     let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
 
     let expected_root_bytes = BytesN::from_array(&env, &final_root);
@@ -127,21 +154,12 @@ fn test_verify_message_and_consume_nonce() {
     let sibling1 = BytesN::from_array(&env, &[3; 32]);
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
-    let mut combined_1 = [0u8; 64];
-    combined_1[0..32].copy_from_slice(&sibling1.to_array());
-    combined_1[32..64].copy_from_slice(&leaf.to_array());
-    let hash_1 = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_1))
-        .to_array();
-
-    let mut combined_2 = [0u8; 64];
-    combined_2[0..32].copy_from_slice(&hash_1);
-    combined_2[32..64].copy_from_slice(&sibling2.to_array());
-    let final_root = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_2))
-        .to_array();
+    let hash_1 = merkle_hash_pair(
+        &env,
+        &sibling1.to_array(),
+        &hash_leaf(&env, &leaf.to_array()),
+    );
+    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
 
     let expected_root_bytes = BytesN::from_array(&env, &final_root);
     let block_height = 100;
@@ -175,21 +193,12 @@ fn test_replay_nonce_panics() {
     let sibling1 = BytesN::from_array(&env, &[3; 32]);
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
-    let mut combined_1 = [0u8; 64];
-    combined_1[0..32].copy_from_slice(&sibling1.to_array());
-    combined_1[32..64].copy_from_slice(&leaf.to_array());
-    let hash_1 = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_1))
-        .to_array();
-
-    let mut combined_2 = [0u8; 64];
-    combined_2[0..32].copy_from_slice(&hash_1);
-    combined_2[32..64].copy_from_slice(&sibling2.to_array());
-    let final_root = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_2))
-        .to_array();
+    let hash_1 = merkle_hash_pair(
+        &env,
+        &sibling1.to_array(),
+        &hash_leaf(&env, &leaf.to_array()),
+    );
+    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
 
     let expected_root_bytes = BytesN::from_array(&env, &final_root);
     let block_height = 100;
@@ -220,7 +229,8 @@ fn test_verify_message_no_root() {
     let proof = Vec::new(&env);
     let proof_flags = Vec::new(&env);
 
-    client.verify_message(&100, &payload, &proof, &proof_flags);
+    // No root is registered for this height, so the proof cannot be checked.
+    assert!(!client.verify_message(&100, &payload, &proof, &proof_flags));
 }
 
 #[test]
@@ -230,7 +240,26 @@ fn test_verify_message_replay_rejected() {
     env.mock_all_auths();
 
     let contract_id = env.register_contract(None, CrossChainVerifier);
-    assert!(!client.verify_message(&100, &leaf, &proof, &proof_flags));
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin);
+
+    // Single-node tree: the root is the leaf hash, prefix included.
+    let payload = make_payload(&env, 1);
+    let leaf = compute_leaf(&env, &payload);
+    let root = BytesN::from_array(&env, &hash_leaf(&env, &leaf.to_array()));
+    client.update_root(&100, &root);
+
+    let proof = Vec::new(&env);
+    let proof_flags = Vec::new(&env);
+
+    // The first use is accepted.
+    assert!(client.verify_message(&100, &payload, &proof, &proof_flags));
+
+    // Replaying the same payload hits the consumed nonce.
+    let replay = client.try_verify_message(&100, &payload, &proof, &proof_flags);
+    assert!(replay.is_err());
 }
 
 // ============================================================================
@@ -238,6 +267,7 @@ fn test_verify_message_replay_rejected() {
 // ============================================================================
 
 #[test]
+#[should_panic(expected = "Nonce already used")]
 fn test_add_authorized_signer_ed25519() {
     let env = Env::default();
     env.mock_all_auths();
@@ -251,9 +281,10 @@ fn test_add_authorized_signer_ed25519() {
     let payload = make_payload(&env, 1);
     let leaf = compute_leaf(&env, &payload);
 
-    // Single-node tree: leaf == root
+    // Single-node tree: the root is the leaf hash, prefix included (#076).
     let block_height = 100;
-    client.update_root(&block_height, &leaf);
+    let root = BytesN::from_array(&env, &hash_leaf(&env, &leaf.to_array()));
+    client.update_root(&block_height, &root);
 
     let proof = Vec::new(&env);
     let proof_flags = Vec::new(&env);
@@ -271,14 +302,38 @@ fn test_verify_message_different_nonce_allowed() {
     env.mock_all_auths();
 
     let contract_id = env.register_contract(None, CrossChainVerifier);
-    // Create a test Ed25519 public key (32 bytes)
-    let public_key = Bytes::from_slice(&env, &[1; 32]);
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
 
-    client.add_authorized_signer(&public_key, &SignatureAlgorithm::Ed25519);
+    client.initialize(&admin);
 
-    // Verify signer count increased
-    let count = client.get_signer_count();
-    assert_eq!(count, 1);
+    // Two distinct payloads sharing one root: nonces are consumed independently.
+    let payload1 = make_payload(&env, 1);
+    let payload2 = make_payload(&env, 2);
+    let leaf1 = compute_leaf(&env, &payload1);
+    let leaf2 = compute_leaf(&env, &payload2);
+    let branch = merkle_hash_pair(
+        &env,
+        &hash_leaf(&env, &leaf1.to_array()),
+        &hash_leaf(&env, &leaf2.to_array()),
+    );
+    let root = BytesN::from_array(&env, &branch);
+    client.update_root(&100, &root);
+
+    let mut proof1 = Vec::new(&env);
+    proof1.push_back(leaf2);
+    let mut flags1 = Vec::new(&env);
+    flags1.push_back(false);
+    assert!(client.verify_message(&100, &payload1, &proof1, &flags1));
+
+    let mut proof2 = Vec::new(&env);
+    proof2.push_back(leaf1);
+    let mut flags2 = Vec::new(&env);
+    flags2.push_back(true);
+    assert!(client.verify_message(&100, &payload2, &proof2, &flags2));
+
+    assert!(client.is_nonce_processed(&1u64));
+    assert!(client.is_nonce_processed(&2u64));
 }
 
 #[test]
@@ -337,9 +392,13 @@ fn test_remove_authorized_signer() {
     let payload2 = make_payload(&env, 2);
     let leaf2 = compute_leaf(&env, &payload2);
 
-    // Build a root that commits to both leaves (2-level tree)
-    // Level 1: combine leaf1 with leaf2
-    let branch = merkle_hash_pair(&env, &leaf1.to_array(), &leaf2.to_array());
+    // Build a root that commits to both leaves. Both children are leaves, so
+    // each is hashed with the 0x00 prefix before being combined (#076).
+    let branch = merkle_hash_pair(
+        &env,
+        &hash_leaf(&env, &leaf1.to_array()),
+        &hash_leaf(&env, &leaf2.to_array()),
+    );
     let root = BytesN::from_array(&env, &branch);
 
     let block_height = 100;
@@ -511,21 +570,12 @@ fn test_verify_signed_message_success_ed25519() {
     let sibling1 = BytesN::from_array(&env, &[3; 32]);
     let sibling2 = BytesN::from_array(&env, &[4; 32]);
 
-    let mut combined_1 = [0u8; 64];
-    combined_1[0..32].copy_from_slice(&sibling1.to_array());
-    combined_1[32..64].copy_from_slice(&message_hash.to_array());
-    let hash_1 = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_1))
-        .to_array();
-
-    let mut combined_2 = [0u8; 64];
-    combined_2[0..32].copy_from_slice(&hash_1);
-    combined_2[32..64].copy_from_slice(&sibling2.to_array());
-    let final_root = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_2))
-        .to_array();
+    let hash_1 = merkle_hash_pair(
+        &env,
+        &sibling1.to_array(),
+        &hash_leaf(&env, &message_hash.to_array()),
+    );
+    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
 
     let expected_root = BytesN::from_array(&env, &final_root);
     let block_height = 100;
@@ -604,21 +654,12 @@ fn test_verify_signed_message_accepts_valid_signature() {
     let sibling1 = BytesN::from_array(&env, &[11; 32]);
     let sibling2 = BytesN::from_array(&env, &[13; 32]);
 
-    let mut combined_1 = [0u8; 64];
-    combined_1[0..32].copy_from_slice(&sibling1.to_array());
-    combined_1[32..64].copy_from_slice(&leaf.to_array());
-    let hash_1 = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_1))
-        .to_array();
-
-    let mut combined_2 = [0u8; 64];
-    combined_2[0..32].copy_from_slice(&hash_1);
-    combined_2[32..64].copy_from_slice(&sibling2.to_array());
-    let final_root = env
-        .crypto()
-        .sha256(&Bytes::from_slice(&env, &combined_2))
-        .to_array();
+    let hash_1 = merkle_hash_pair(
+        &env,
+        &sibling1.to_array(),
+        &hash_leaf(&env, &leaf.to_array()),
+    );
+    let final_root = merkle_hash_pair(&env, &hash_1, &sibling2.to_array());
 
     let expected_root = BytesN::from_array(&env, &final_root);
     let block_height = 200;
@@ -791,13 +832,7 @@ fn setup_valid_proof(
     let leaf = BytesN::from_array(env, &[2u8; 32]);
     let sibling = BytesN::from_array(env, &[3u8; 32]);
 
-    let mut combined = [0u8; 64];
-    combined[0..32].copy_from_slice(&sibling.to_array());
-    combined[32..64].copy_from_slice(&leaf.to_array());
-    let root_arr = env
-        .crypto()
-        .sha256(&Bytes::from_slice(env, &combined))
-        .to_array();
+    let root_arr = merkle_hash_pair(env, &sibling.to_array(), &hash_leaf(env, &leaf.to_array()));
     let root = BytesN::from_array(env, &root_arr);
 
     let block_height: u32 = 42;
@@ -929,14 +964,206 @@ fn test_verify_signed_message_panics_when_paused() {
     client.verify_signed_message(&signed_message, &100u32, &proof, &flags);
 }
 
-fn merkle_hash_pair(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut combined = [0u8; 64];
-    if left <= right {
-        combined[0..32].copy_from_slice(left);
-        combined[32..64].copy_from_slice(right);
-    } else {
-        combined[0..32].copy_from_slice(right);
-        combined[32..64].copy_from_slice(left);
+// ============================================================================
+// Merkle domain separation (issue #076)
+// ============================================================================
+
+#[test]
+fn test_leaf_prefix_is_zero() {
+    assert_eq!(LEAF_PREFIX, 0x00);
+    assert_eq!(NODE_PREFIX, 0x01);
+    assert_ne!(LEAF_PREFIX, NODE_PREFIX);
+}
+
+/// A leaf hash must not equal the bare hash of the same data. Without the
+/// prefix they are identical, which is exactly what lets a node be replayed
+/// as a leaf.
+#[test]
+fn test_leaf_hash_is_domain_separated() {
+    let env = Env::default();
+    let data = [7u8; 32];
+
+    let prefixed = hash_leaf(&env, &data);
+    let bare = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &data))
+        .to_array();
+
+    assert_ne!(prefixed, bare);
+}
+
+/// A node hash must not equal the bare hash of `0x01 || left || right`'s
+/// payload, nor the hash of the same children with the leaf prefix.
+#[test]
+fn test_node_hash_is_domain_separated() {
+    let env = Env::default();
+    let left = [1u8; 32];
+    let right = [2u8; 32];
+
+    let node = hash_node(&env, &left, &right);
+
+    let mut bare = [0u8; 64];
+    bare[0..32].copy_from_slice(&left);
+    bare[32..64].copy_from_slice(&right);
+    assert_ne!(
+        node,
+        env.crypto()
+            .sha256(&Bytes::from_slice(&env, &bare))
+            .to_array()
+    );
+
+    // A node is not interchangeable with a leaf over the same child bytes.
+    assert_ne!(node, hash_leaf(&env, &left));
+}
+
+/// The forgery this guards against: an attacker who knows an internal node's
+/// children presents those 64 bytes as leaf data. Under an unprefixed scheme
+/// the leaf hash of that data equals the node hash, so the proof verifies.
+/// With prefixes it does not.
+#[test]
+fn test_internal_node_cannot_be_forged_as_a_leaf() {
+    let env = Env::default();
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    // A real two-level tree over two leaves.
+    let leaf_a = [10u8; 32];
+    let leaf_b = [20u8; 32];
+    let node = merkle_hash_pair(&env, &leaf_a, &leaf_b);
+    let root = BytesN::from_array(&env, &node);
+    client.update_root(&100, &root);
+
+    // The attacker supplies the *node's children* as if they were a leaf.
+    let forged_leaf = BytesN::from_array(&env, &merkle_hash_pair(&env, &leaf_a, &leaf_b));
+    let sibling = BytesN::from_array(&env, &[30u8; 32]);
+    let mut proof = Vec::new(&env);
+    proof.push_back(sibling);
+    let mut flags = Vec::new(&env);
+    flags.push_back(true);
+
+    // Build the root the attacker would need the contract to accept: a node
+    // combining their forged leaf with the sibling. That is a *different* root
+    // from the real one, so verification fails.
+    let forged_root = merkle_hash_pair(&env, &forged_leaf.to_array(), &sibling.to_array());
+    assert_ne!(BytesN::from_array(&env, &forged_root), root);
+
+    // And the un-prefixed leaf hash of the 64 child bytes is not the node hash
+    // either, so the forgery has no preimage to work with.
+    let mut child_bytes = [0u8; 64];
+    child_bytes[0..32].copy_from_slice(&leaf_a);
+    child_bytes[32..64].copy_from_slice(&leaf_b);
+    let unprefixed_forgery = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &child_bytes))
+        .to_array();
+    assert_ne!(BytesN::from_array(&env, &unprefixed_forgery), root);
+
+    let mut forged_proof = Vec::new(&env);
+    forged_proof.push_back(sibling);
+    assert!(!client.verify_message_and_consume(&100, &1u64, &forged_leaf, &forged_proof, &flags));
+}
+
+#[test]
+fn test_valid_proof_still_verifies_with_prefixes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let leaf = BytesN::from_array(&env, &[5u8; 32]);
+    let sibling = BytesN::from_array(&env, &[6u8; 32]);
+    let root_arr = merkle_hash_pair(
+        &env,
+        &sibling.to_array(),
+        &hash_leaf(&env, &leaf.to_array()),
+    );
+    client.update_root(&42, &BytesN::from_array(&env, &root_arr));
+
+    let mut proof = Vec::new(&env);
+    proof.push_back(sibling);
+    let mut flags = Vec::new(&env);
+    flags.push_back(true);
+
+    assert!(client.verify_message_and_consume(&42, &1u64, &leaf, &proof, &flags));
+}
+
+#[test]
+fn test_single_leaf_tree_root_must_be_prefixed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let leaf = BytesN::from_array(&env, &[8u8; 32]);
+    let empty_proof = Vec::new(&env);
+    let empty_flags = Vec::new(&env);
+
+    // An un-prefixed root — the old scheme — no longer verifies.
+    let unprefixed = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &leaf.to_array()))
+        .to_array();
+    client.update_root(&7, &BytesN::from_array(&env, &unprefixed));
+    assert!(!client.verify_message_and_consume(&7, &1u64, &leaf, &empty_proof, &empty_flags));
+
+    // The RFC 6962 root does.
+    client.update_root(
+        &8,
+        &BytesN::from_array(&env, &hash_leaf(&env, &leaf.to_array())),
+    );
+    assert!(client.verify_message_and_consume(&8, &2u64, &leaf, &empty_proof, &empty_flags));
+}
+
+#[test]
+fn test_proof_longer_than_max_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let leaf = BytesN::from_array(&env, &[9u8; 32]);
+    client.update_root(&1, &BytesN::from_array(&env, &[0u8; 32]));
+
+    let mut proof = Vec::new(&env);
+    let mut flags = Vec::new(&env);
+    for i in 0..=MAX_PROOF_LENGTH {
+        proof.push_back(BytesN::from_array(&env, &[i as u8; 32]));
+        flags.push_back(true);
     }
-    env.crypto().sha256(&Bytes::from_slice(env, &combined)).to_array()
+
+    assert!(!client.verify_message_and_consume(&1, &1u64, &leaf, &proof, &flags));
+}
+
+#[test]
+fn test_mismatched_flag_length_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let leaf = BytesN::from_array(&env, &[4u8; 32]);
+    let sibling = BytesN::from_array(&env, &[5u8; 32]);
+    let root_arr = merkle_hash_pair(
+        &env,
+        &sibling.to_array(),
+        &hash_leaf(&env, &leaf.to_array()),
+    );
+    client.update_root(&3, &BytesN::from_array(&env, &root_arr));
+
+    let mut proof = Vec::new(&env);
+    proof.push_back(sibling);
+    // No flags at all: the proof cannot be interpreted consistently.
+    let empty_flags = Vec::new(&env);
+
+    assert!(!client.verify_message_and_consume(&3, &1u64, &leaf, &proof, &empty_flags));
 }
