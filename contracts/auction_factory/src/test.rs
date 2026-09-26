@@ -164,6 +164,25 @@ fn test_factory_deploys_auctions_collects_fees_and_indexes_them() {
     );
     assert_eq!(client.get_auction_type(&dutch), Some(AuctionType::Dutch));
     assert_eq!(client.get_auctions(&0, &10), vec![&env, english, dutch]);
+
+    // Issue #084: deployments are mirrored into the `instance` registry so the
+    // factory owner can enumerate them from a single read.
+    assert_eq!(client.get_instance_count(), 2);
+    assert_eq!(client.get_instances(), vec![&env, english, dutch]);
+    assert!(client.is_instance(&english));
+    assert!(client.is_instance(&dutch));
+    assert!(!client.is_instance(&seller));
+    assert_eq!(client.get_instance_capacity(), MAX_TRACKED_AUCTIONS - 2);
+}
+
+#[test]
+fn test_instance_registry_starts_empty() {
+    let (env, client, _admins) = setup(1, 1);
+
+    assert_eq!(client.get_instance_count(), 0);
+    assert_eq!(client.get_instances(), vec![&env]);
+    assert!(!client.is_instance(&Address::generate(&env)));
+    assert_eq!(client.get_instance_capacity(), MAX_TRACKED_AUCTIONS);
 }
 
 /// Deployments are recorded in the factory's instance-scoped `Vec<Address>`

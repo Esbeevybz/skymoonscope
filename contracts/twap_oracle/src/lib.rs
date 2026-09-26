@@ -13,11 +13,11 @@ pub enum Error {
     NotInitialized = 2,
     InvalidPrice = 3,
     InsufficientTimeElapsed = 4,
-    /// A cumulative-price accumulation step overflowed `u128`.
+    /// A cumulative-price or elapsed-time accumulator would have overflowed.
     ///
-    /// The accumulator is checked rather than wrapping: silently wrapping would
-    /// corrupt the TWAP and make `get_twap` report a nonsense price, which is
-    /// far worse for a price oracle than refusing the update (issue #85).
+    /// The TWAP accumulators are `u128`; a long-running feed with a large price
+    /// can exhaust that range, and silently wrapping would corrupt every
+    /// subsequent TWAP. The update is rejected instead (issue #085).
     ArithmeticOverflow = 5,
 }
 
@@ -84,12 +84,11 @@ impl TwapOracle {
     /// Updates the TWAP accumulator with a new price.
     /// Only allows updates after the minimum interval has elapsed.
     ///
-    /// The cumulative-price accumulation is fully checked: both the
-    /// `price x time_delta` product and the running total use `checked_mul` /
-    /// `checked_add`, and an overflow aborts the update with
-    /// [`Error::ArithmeticOverflow`] instead of wrapping around (issue #85).
-    /// Wrapping would corrupt the accumulator and make `get_twap` report a
-    /// nonsense price, which for an oracle feeds incorrect liquidations.
+    /// Every step of the accumulation — `price * elapsed` and both accumulator
+    /// additions — is checked, and an update that would exceed the `u128` range
+    /// is rejected with [`Error::ArithmeticOverflow`] rather than wrapping. A
+    /// wrapped accumulator would silently poison every later TWAP, so failing
+    /// loudly is the safe behaviour for a long-running feed (issue #085).
     ///
     /// # Parameters
     /// - `e`: Soroban environment.
@@ -100,7 +99,7 @@ impl TwapOracle {
     /// - `Err(Error::NotInitialized)` if not initialized.
     /// - `Err(Error::InvalidPrice)` if price <= 0.
     /// - `Err(Error::InsufficientTimeElapsed)` if not enough time has passed since last update.
-    /// - `Err(Error::ArithmeticOverflow)` if the cumulative accumulation would overflow.
+    /// - `Err(Error::ArithmeticOverflow)` if the accumulators would overflow.
     pub fn update_price(e: Env, current_price: i128) -> Result<(), Error> {
         if !e.storage().instance().has(&DataKey::TokenA) {
             return Err(Error::NotInitialized);
@@ -121,7 +120,15 @@ impl TwapOracle {
             .get(&DataKey::MinUpdateIntervalSeconds)
             .unwrap_or(0);
 
-        if last_update > 0 && now - last_update < min_interval {
+        // The very first observation has no preceding price history, so it
+        // contributes no elapsed time. `saturating_sub` keeps a rewound test
+        // ledger from underflowing.
+        let elapsed = if last_update == 0 {
+            0
+        } else {
+            now.saturating_sub(last_update)
+        };
+        if last_update > 0 && elapsed < min_interval {
             return Err(Error::InsufficientTimeElapsed);
         }
 
@@ -133,23 +140,16 @@ impl TwapOracle {
             .unwrap_or(0);
         let total_time: u128 = e.storage().instance().get(&DataKey::TotalTime).unwrap_or(0);
 
-        let elapsed = if last_update == 0 {
-            0
-        } else {
-            now - last_update
-        };
-        let elapsed_u128 = elapsed as u128;
-
-        // Checked accumulation: reject an update that would overflow rather than
-        // letting the accumulator wrap to a small value and corrupt the TWAP.
-        let price_delta = last_price
-            .checked_mul(elapsed_u128)
+        // Checked accumulation: a product or sum that does not fit in u128 aborts
+        // the update instead of wrapping around into a nonsense TWAP.
+        let weighted = last_price
+            .checked_mul(elapsed as u128)
             .ok_or(Error::ArithmeticOverflow)?;
         let new_cumulative = cumulative
-            .checked_add(price_delta)
+            .checked_add(weighted)
             .ok_or(Error::ArithmeticOverflow)?;
         let new_total_time = total_time
-            .checked_add(elapsed_u128)
+            .checked_add(elapsed as u128)
             .ok_or(Error::ArithmeticOverflow)?;
 
         e.storage()
