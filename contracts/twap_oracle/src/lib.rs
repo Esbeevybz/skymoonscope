@@ -13,6 +13,12 @@ pub enum Error {
     NotInitialized = 2,
     InvalidPrice = 3,
     InsufficientTimeElapsed = 4,
+    /// A cumulative-price accumulation step overflowed `u128`.
+    ///
+    /// The accumulator is checked rather than wrapping: silently wrapping would
+    /// corrupt the TWAP and make `get_twap` report a nonsense price, which is
+    /// far worse for a price oracle than refusing the update (issue #85).
+    ArithmeticOverflow = 5,
 }
 
 /// Storage keys used by the TWAP oracle contract.
@@ -78,8 +84,12 @@ impl TwapOracle {
     /// Updates the TWAP accumulator with a new price.
     /// Only allows updates after the minimum interval has elapsed.
     ///
-    /// Uses u128 accumulators with wrapping arithmetic to prevent overflow panics
-    /// and ensure continuous operation beyond one year.
+    /// The cumulative-price accumulation is fully checked: both the
+    /// `price x time_delta` product and the running total use `checked_mul` /
+    /// `checked_add`, and an overflow aborts the update with
+    /// [`Error::ArithmeticOverflow`] instead of wrapping around (issue #85).
+    /// Wrapping would corrupt the accumulator and make `get_twap` report a
+    /// nonsense price, which for an oracle feeds incorrect liquidations.
     ///
     /// # Parameters
     /// - `e`: Soroban environment.
@@ -90,6 +100,7 @@ impl TwapOracle {
     /// - `Err(Error::NotInitialized)` if not initialized.
     /// - `Err(Error::InvalidPrice)` if price <= 0.
     /// - `Err(Error::InsufficientTimeElapsed)` if not enough time has passed since last update.
+    /// - `Err(Error::ArithmeticOverflow)` if the cumulative accumulation would overflow.
     pub fn update_price(e: Env, current_price: i128) -> Result<(), Error> {
         if !e.storage().instance().has(&DataKey::TokenA) {
             return Err(Error::NotInitialized);
@@ -128,9 +139,18 @@ impl TwapOracle {
             now - last_update
         };
         let elapsed_u128 = elapsed as u128;
-        // Use wrapping arithmetic for modulo overflow handling per u128 accumulator design.
-        let new_cumulative = cumulative.wrapping_add(last_price.wrapping_mul(elapsed_u128));
-        let new_total_time = total_time.wrapping_add(elapsed_u128);
+
+        // Checked accumulation: reject an update that would overflow rather than
+        // letting the accumulator wrap to a small value and corrupt the TWAP.
+        let price_delta = last_price
+            .checked_mul(elapsed_u128)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let new_cumulative = cumulative
+            .checked_add(price_delta)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let new_total_time = total_time
+            .checked_add(elapsed_u128)
+            .ok_or(Error::ArithmeticOverflow)?;
 
         e.storage()
             .instance()
@@ -157,8 +177,9 @@ impl TwapOracle {
     /// - The TWAP as i128, or 0 if no updates.
     ///
     /// # Safety
-    /// - The `as i128` cast on the division result assumes the TWAP fits within i128.
-    ///   This is safe for all practical token prices given u128 range for the accumulator.
+    /// - The accumulator is `u128` while the reported price is `i128`, so the
+    ///   quotient is converted with `try_from` and saturates at `i128::MAX`
+    ///   rather than wrapping round to a negative price (issue #85).
     pub fn get_twap(e: Env) -> i128 {
         let cumulative: u128 = e
             .storage()
@@ -169,7 +190,7 @@ impl TwapOracle {
         if total_time == 0 {
             0
         } else {
-            (cumulative / total_time) as i128
+            i128::try_from(cumulative / total_time).unwrap_or(i128::MAX)
         }
     }
 

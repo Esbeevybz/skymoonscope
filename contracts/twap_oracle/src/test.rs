@@ -157,7 +157,7 @@ fn test_large_price_accumulation_no_overflow() {
 }
 
 #[test]
-fn test_u128_wrapping_does_not_panic() {
+fn test_price_time_overflow_is_rejected_not_wrapped() {
     let e = Env::default();
     e.ledger().with_mut(|li| li.timestamp = 0);
 
@@ -169,7 +169,8 @@ fn test_u128_wrapping_does_not_panic() {
 
     client.initialize(&token_a, &token_b, &1);
 
-    // Use extremely large values that would overflow i128 but are handled safely by u128 wrapping.
+    // Values whose price x time_delta product overflows u128. The checked
+    // accumulation must abort the update instead of wrapping (issue #85).
     let max_price: i128 = i128::MAX;
 
     assert_eq!(client.update_price(&max_price), Ok(()));
@@ -177,11 +178,44 @@ fn test_u128_wrapping_does_not_panic() {
     // Advance by a large amount
     e.ledger().with_mut(|li| li.timestamp = 1_000_000);
 
-    // This multiplication would overflow i128, but u128 wrapping handles it gracefully.
     let result = client.update_price(&max_price);
-    // The update should succeed without panicking.
-    assert_eq!(result, Ok(()));
+    assert_eq!(result, Err(Error::ArithmeticOverflow));
 
-    // get_twap should not panic either.
-    let _twap = client.get_twap();
+    // get_twap should not panic, and must never report a negative price.
+    let twap = client.get_twap();
+    assert!(twap >= 0);
+}
+
+/// The accumulator stays usable after a rejected overflow: the state written by
+/// the failed update is not partially applied.
+#[test]
+fn test_overflow_update_leaves_accumulator_intact() {
+    let e = Env::default();
+    e.ledger().with_mut(|li| li.timestamp = 0);
+
+    let contract_id = e.register(TwapOracle, ());
+    let client = TwapOracleClient::new(&e, &contract_id);
+
+    let token_a = Address::generate(&e);
+    let token_b = Address::generate(&e);
+
+    client.initialize(&token_a, &token_b, &1);
+
+    let max_price: i128 = i128::MAX;
+    assert_eq!(client.update_price(&max_price), Ok(()));
+
+    e.ledger().with_mut(|li| li.timestamp = 1_000_000);
+    assert_eq!(
+        client.update_price(&max_price),
+        Err(Error::ArithmeticOverflow)
+    );
+
+    // A price small enough to accumulate is still accepted afterwards.
+    e.ledger().with_mut(|li| li.timestamp = 2_000_000);
+    assert_eq!(client.update_price(&100), Ok(()));
+
+    // Accumulating that price over the following interval produces a real TWAP.
+    e.ledger().with_mut(|li| li.timestamp = 3_000_000);
+    assert_eq!(client.update_price(&100), Ok(()));
+    assert_eq!(client.get_twap(), 100);
 }
