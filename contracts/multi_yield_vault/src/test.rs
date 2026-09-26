@@ -1,6 +1,6 @@
-use crate::{Error, MultiYieldVault, MultiYieldVaultClient};
-use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+use crate::{Error, MultiYieldVault, MultiYieldVaultClient, ScheduleFrequency, MAX_SCHEDULES};
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, TryIntoVal};
 
 // ── Mock AMM pool ─────────────────────────────────────────────────────────────
 
@@ -695,4 +695,749 @@ fn test_cancel_withdrawal_twice() {
 
     client.cancel_withdrawal(&user, &0);
     client.cancel_withdrawal(&user, &0);
+}
+
+// ── Withdrawal schedules ─────────────────────────────────────────────────────
+
+/// Set the ledger sequence the vault will read.
+fn set_sequence(e: &Env, sequence: u32) {
+    e.ledger().set_sequence_number(sequence);
+}
+
+#[test]
+fn test_schedule_one_time_reserves_shares_without_moving_them() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+    assert_eq!(client.vault_balance(&owner), 1_000);
+
+    let id = client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &250,
+        &ScheduleFrequency::OneTime,
+        &10,
+        &0,
+        &0,
+    );
+    assert_eq!(id, 0);
+
+    let schedule = client.get_withdrawal_schedule(&0).unwrap();
+    assert_eq!(schedule.owner, owner);
+    assert_eq!(schedule.recipient, recipient);
+    assert_eq!(schedule.amount_per_execution, 250);
+    assert_eq!(schedule.total_executions, 1);
+    assert_eq!(schedule.executions, 0);
+    assert_eq!(schedule.next_execution_ledger, 10);
+    assert!(!schedule.closed);
+
+    // The shares are reserved, not spent: still in the balance and in
+    // total_shares, but not withdrawable.
+    assert_eq!(client.vault_balance(&owner), 1_000);
+    assert_eq!(client.get_vault().total_shares, 1_000);
+    assert_eq!(client.escrowed_shares(&owner), 250);
+    assert_eq!(client.schedule_count(), 1);
+    assert_eq!(client.get_withdrawal_schedules().len(), 1);
+}
+
+#[test]
+fn test_reserved_shares_cannot_be_withdrawn() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    client.schedule_withdrawals(
+        &owner,
+        &owner,
+        &400,
+        &ScheduleFrequency::OneTime,
+        &10,
+        &0,
+        &0,
+    );
+
+    // The unreserved 600 is still withdrawable.
+    assert_eq!(client.withdraw(&owner, &600), 600);
+    assert_eq!(client.vault_balance(&owner), 400);
+
+    // The reserved 400 is not, or the schedule could never be paid.
+    assert_eq!(
+        client.try_withdraw(&owner, &400),
+        Err(Ok(Error::InsufficientShares))
+    );
+    assert_eq!(client.escrowed_shares(&owner), 400);
+}
+
+#[test]
+fn test_schedule_rejects_more_than_the_spendable_balance() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    // 4 x 300 = 1_200 > 1_000 held.
+    let err = client.try_schedule_withdrawals(
+        &owner,
+        &owner,
+        &300,
+        &ScheduleFrequency::Recurring,
+        &10,
+        &10,
+        &40,
+    );
+    assert_eq!(err, Err(Ok(Error::InsufficientShares)));
+    assert_eq!(client.schedule_count(), 0);
+    assert_eq!(client.escrowed_shares(&owner), 0);
+}
+
+#[test]
+fn test_two_schedules_cannot_double_reserve_the_same_shares() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    client.schedule_withdrawals(
+        &owner,
+        &owner,
+        &600,
+        &ScheduleFrequency::OneTime,
+        &10,
+        &0,
+        &0,
+    );
+    assert_eq!(client.escrowed_shares(&owner), 600);
+
+    // Only 400 is left unreserved, so a 600 schedule must be refused.
+    let err = client.try_schedule_withdrawals(
+        &owner,
+        &owner,
+        &600,
+        &ScheduleFrequency::OneTime,
+        &20,
+        &0,
+        &0,
+    );
+    assert_eq!(err, Err(Ok(Error::InsufficientShares)));
+    assert_eq!(client.escrowed_shares(&owner), 600);
+    assert_eq!(client.schedule_count(), 1);
+
+    // 400 still fits.
+    client.schedule_withdrawals(
+        &owner,
+        &owner,
+        &400,
+        &ScheduleFrequency::OneTime,
+        &20,
+        &0,
+        &0,
+    );
+    assert_eq!(client.escrowed_shares(&owner), 1_000);
+    assert_eq!(client.schedule_count(), 2);
+}
+
+#[test]
+fn test_schedule_validates_timing_parameters() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 10_000);
+    client.deposit(&owner, &10_000);
+
+    // First execution must be in the future; the ledger is at 0 here.
+    let past = client.try_schedule_withdrawals(
+        &owner,
+        &owner,
+        &10,
+        &ScheduleFrequency::OneTime,
+        &0,
+        &0,
+        &0,
+    );
+    assert_eq!(past, Err(Ok(Error::InvalidSchedule)));
+
+    // A recurring schedule needs a non-zero interval.
+    let zero_interval = client.try_schedule_withdrawals(
+        &owner,
+        &owner,
+        &10,
+        &ScheduleFrequency::Recurring,
+        &10,
+        &0,
+        &100,
+    );
+    assert_eq!(zero_interval, Err(Ok(Error::InvalidSchedule)));
+
+    // The end must not precede the first execution.
+    let inverted = client.try_schedule_withdrawals(
+        &owner,
+        &owner,
+        &10,
+        &ScheduleFrequency::Recurring,
+        &100,
+        &10,
+        &50,
+    );
+    assert_eq!(inverted, Err(Ok(Error::InvalidSchedule)));
+
+    // Non-positive amounts are rejected.
+    let zero_amount = client.try_schedule_withdrawals(
+        &owner,
+        &owner,
+        &0,
+        &ScheduleFrequency::OneTime,
+        &10,
+        &0,
+        &0,
+    );
+    assert_eq!(zero_amount, Err(Ok(Error::InvalidAmount)));
+
+    assert_eq!(client.schedule_count(), 0);
+}
+
+#[test]
+fn test_one_time_schedule_executes_and_closes() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &300,
+        &ScheduleFrequency::OneTime,
+        &10,
+        &0,
+        &0,
+    );
+
+    // Not due yet.
+    set_sequence(&e, 5);
+    let early = client.execute_scheduled_withdrawals(&0);
+    assert_eq!(early.executed, 0);
+    assert_eq!(early.paid_out, 0);
+    assert_eq!(token_balance(&e, &deposit_token, &recipient), 0);
+
+    // Due.
+    set_sequence(&e, 10);
+    let result = client.execute_scheduled_withdrawals(&0);
+    assert_eq!(result.executed, 1);
+    assert_eq!(result.paid_out, 300);
+    assert_eq!(result.remaining, 0);
+
+    // Paid to the recipient, not the owner.
+    assert_eq!(token_balance(&e, &deposit_token, &recipient), 300);
+    assert_eq!(client.vault_balance(&owner), 700);
+    assert_eq!(client.escrowed_shares(&owner), 0);
+    assert_eq!(client.get_vault().total_shares, 700);
+
+    // Closed and no longer listed.
+    assert!(client.get_withdrawal_schedule(&0).unwrap().closed);
+    assert_eq!(client.schedule_count(), 0);
+
+    // A second call does nothing.
+    let again = client.execute_scheduled_withdrawals(&0);
+    assert_eq!(again.executed, 0);
+    assert_eq!(token_balance(&e, &deposit_token, &recipient), 300);
+}
+
+#[test]
+fn test_recurring_schedule_fires_on_each_interval() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    // 100 every 10 ledgers, on ledgers 10, 20 and 30.
+    client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &100,
+        &ScheduleFrequency::Recurring,
+        &10,
+        &10,
+        &30,
+    );
+
+    let schedule = client.get_withdrawal_schedule(&0).unwrap();
+    assert_eq!(schedule.total_executions, 3);
+    assert_eq!(client.escrowed_shares(&owner), 300);
+
+    set_sequence(&e, 10);
+    let first = client.execute_scheduled_withdrawals(&0);
+    assert_eq!(first.executed, 1);
+    assert_eq!(first.paid_out, 100);
+    assert_eq!(token_balance(&e, &deposit_token, &recipient), 100);
+
+    let after_first = client.get_withdrawal_schedule(&0).unwrap();
+    assert_eq!(after_first.executions, 1);
+    assert_eq!(after_first.next_execution_ledger, 20);
+    assert!(!after_first.closed);
+    assert_eq!(client.escrowed_shares(&owner), 200);
+    assert_eq!(client.schedule_count(), 1);
+
+    // Jumping past several intervals still fires only once per call.
+    set_sequence(&e, 30);
+    let second = client.execute_scheduled_withdrawals(&0);
+    assert_eq!(second.executed, 1);
+    assert_eq!(client.get_withdrawal_schedule(&0).unwrap().executions, 2);
+    assert_eq!(
+        client
+            .get_withdrawal_schedule(&0)
+            .unwrap()
+            .next_execution_ledger,
+        30
+    );
+
+    let third = client.execute_scheduled_withdrawals(&0);
+    assert_eq!(third.executed, 1);
+    assert_eq!(client.get_withdrawal_schedule(&0).unwrap().executions, 3);
+
+    // Complete: all three paid, nothing left reserved.
+    assert_eq!(token_balance(&e, &deposit_token, &recipient), 300);
+    assert_eq!(client.escrowed_shares(&owner), 0);
+    assert_eq!(client.vault_balance(&owner), 700);
+    assert_eq!(client.schedule_count(), 0);
+    assert!(client.get_withdrawal_schedule(&0).unwrap().closed);
+}
+
+#[test]
+fn test_recurring_schedule_does_not_fire_past_its_end() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    // Only two executions are planned: ledgers 10 and 20.
+    client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &100,
+        &ScheduleFrequency::Recurring,
+        &10,
+        &10,
+        &20,
+    );
+    assert_eq!(
+        client.get_withdrawal_schedule(&0).unwrap().total_executions,
+        2
+    );
+
+    // Well past the end and past the plan: nothing more fires.
+    set_sequence(&e, 5_000);
+    let late = client.execute_scheduled_withdrawals(&0);
+    assert_eq!(late.executed, 0);
+    assert_eq!(token_balance(&e, &deposit_token, &recipient), 0);
+    assert_eq!(client.escrowed_shares(&owner), 200);
+}
+
+#[test]
+fn test_cancel_releases_reserved_shares() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &100,
+        &ScheduleFrequency::Recurring,
+        &10,
+        &10,
+        &30,
+    );
+    assert_eq!(client.escrowed_shares(&owner), 300);
+
+    // Nothing has fired yet, so all 300 come back.
+    client.cancel_withdrawal_schedule(&owner, &0);
+    assert_eq!(client.escrowed_shares(&owner), 0);
+    assert_eq!(client.schedule_count(), 0);
+    assert!(client.get_withdrawal_schedule(&0).unwrap().closed);
+
+    // And the released shares are withdrawable again.
+    assert_eq!(client.withdraw(&owner, &1_000), 1_000);
+    assert_eq!(client.vault_balance(&owner), 0);
+
+    // Nothing was ever paid out.
+    assert_eq!(token_balance(&e, &deposit_token, &recipient), 0);
+}
+
+#[test]
+fn test_cancel_after_partial_execution_releases_only_the_rest() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &100,
+        &ScheduleFrequency::Recurring,
+        &10,
+        &10,
+        &30,
+    );
+
+    set_sequence(&e, 10);
+    client.execute_scheduled_withdrawals(&0);
+    assert_eq!(client.escrowed_shares(&owner), 200);
+
+    client.cancel_withdrawal_schedule(&owner, &0);
+    assert_eq!(client.escrowed_shares(&owner), 0);
+    assert_eq!(client.schedule_count(), 0);
+
+    // One execution was paid before the cancel; the other two never happened.
+    assert_eq!(token_balance(&e, &deposit_token, &recipient), 100);
+    assert_eq!(client.vault_balance(&owner), 900);
+}
+
+#[test]
+fn test_cancel_rejects_non_owner_and_completed_schedules() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    let attacker = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &100,
+        &ScheduleFrequency::OneTime,
+        &10,
+        &0,
+        &0,
+    );
+
+    // Someone else cannot cancel it.
+    let wrong_owner = client.try_cancel_withdrawal_schedule(&attacker, &0);
+    assert_eq!(wrong_owner, Err(Ok(Error::Unauthorized)));
+    assert_eq!(client.escrowed_shares(&owner), 100);
+
+    // Unknown id.
+    let missing = client.try_cancel_withdrawal_schedule(&owner, &99);
+    assert_eq!(missing, Err(Ok(Error::ScheduleNotFound)));
+
+    // Once it has fired there is nothing left to cancel.
+    set_sequence(&e, 10);
+    client.execute_scheduled_withdrawals(&0);
+    let completed = client.try_cancel_withdrawal_schedule(&owner, &0);
+    assert_eq!(completed, Err(Ok(Error::ScheduleClosed)));
+}
+
+#[test]
+fn test_due_schedules_reports_what_is_ready() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &100,
+        &ScheduleFrequency::OneTime,
+        &10,
+        &0,
+        &0,
+    );
+    client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &100,
+        &ScheduleFrequency::OneTime,
+        &50,
+        &0,
+        &0,
+    );
+
+    assert_eq!(client.due_schedules(&5).len(), 0);
+    assert_eq!(client.due_schedules(&10).len(), 1);
+    assert_eq!(client.due_schedules(&10).get(0).unwrap(), 0);
+    assert_eq!(client.due_schedules(&50).len(), 2);
+
+    // After the first fires it is no longer due.
+    set_sequence(&e, 10);
+    client.execute_scheduled_withdrawals(&0);
+    assert_eq!(client.due_schedules(&50).len(), 1);
+    assert_eq!(client.due_schedules(&50).get(0).unwrap(), 1);
+}
+
+#[test]
+fn test_execute_respects_the_schedule_budget() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    for _ in 0..3 {
+        client.schedule_withdrawals(
+            &owner,
+            &recipient,
+            &100,
+            &ScheduleFrequency::OneTime,
+            &10,
+            &0,
+            &0,
+        );
+    }
+
+    set_sequence(&e, 10);
+    let first = client.execute_scheduled_withdrawals(&1);
+    assert_eq!(first.considered, 1);
+    assert_eq!(first.executed, 1);
+    assert_eq!(first.remaining, 2);
+    assert_eq!(token_balance(&e, &deposit_token, &recipient), 100);
+
+    // The rest drain on subsequent calls.
+    let second = client.execute_scheduled_withdrawals(&0);
+    assert_eq!(second.executed, 2);
+    assert_eq!(second.remaining, 0);
+    assert_eq!(token_balance(&e, &deposit_token, &recipient), 300);
+}
+
+#[test]
+fn test_schedules_are_capped() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000_000);
+    client.deposit(&owner, &1_000_000);
+
+    for _ in 0..MAX_SCHEDULES {
+        client.schedule_withdrawals(
+            &owner,
+            &recipient,
+            &1,
+            &ScheduleFrequency::OneTime,
+            &10,
+            &0,
+            &0,
+        );
+    }
+    assert_eq!(client.schedule_count(), MAX_SCHEDULES);
+
+    let err = client.try_schedule_withdrawals(
+        &owner,
+        &recipient,
+        &1,
+        &ScheduleFrequency::OneTime,
+        &10,
+        &0,
+        &0,
+    );
+    assert_eq!(err, Err(Ok(Error::TooManySchedules)));
+    assert_eq!(client.schedule_count(), MAX_SCHEDULES);
+}
+
+#[test]
+fn test_execution_count_is_capped() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 10_000_000);
+    client.deposit(&owner, &10_000_000);
+
+    // 1 + 1_000 would be 1_001 executions, over the cap.
+    let err = client.try_schedule_withdrawals(
+        &owner,
+        &owner,
+        &1,
+        &ScheduleFrequency::Recurring,
+        &10,
+        &1,
+        &1_010,
+    );
+    assert_eq!(err, Err(Ok(Error::InvalidSchedule)));
+    assert_eq!(client.schedule_count(), 0);
+}
+
+#[test]
+fn test_execute_is_a_noop_when_no_schedules_exist() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, _, _) = setup(&e);
+
+    let result = client.execute_scheduled_withdrawals(&0);
+    assert_eq!(result.considered, 0);
+    assert_eq!(result.executed, 0);
+    assert_eq!(result.paid_out, 0);
+    assert_eq!(result.remaining, 0);
+}
+
+#[test]
+fn test_execute_emits_lifecycle_events() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, vault_id) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &100,
+        &ScheduleFrequency::OneTime,
+        &10,
+        &0,
+        &0,
+    );
+    set_sequence(&e, 10);
+    client.execute_scheduled_withdrawals(&0);
+
+    let names: std::vec::Vec<Symbol> = e
+        .events()
+        .all()
+        .iter()
+        .filter(|(addr, _, _)| addr == &vault_id)
+        .filter_map(|(_, topics, _)| {
+            let name: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&e);
+            name.ok()
+        })
+        .collect();
+
+    assert!(names.contains(&Symbol::new(&e, "withdrawal_scheduled")));
+    assert!(names.contains(&Symbol::new(&e, "scheduled_withdrawal_executed")));
+}
+
+#[test]
+fn test_execute_is_permissionless() {
+    // Anyone may act as the keeper; no admin or owner signature is required.
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    setup_thin(&e, &client, &deposit_token, 10_000);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &100,
+        &ScheduleFrequency::OneTime,
+        &10,
+        &0,
+        &0,
+    );
+    set_sequence(&e, 10);
+
+    // `execute_scheduled_withdrawals` asks for no authorization at all, so
+    // withdrawing every auth entry does not stop the keeper.
+    e.set_auths(&[]);
+    let result = client.execute_scheduled_withdrawals(&0);
+    assert_eq!(result.executed, 1);
+    assert_eq!(token_balance(&e, &deposit_token, &recipient), 100);
+}
+
+#[test]
+fn test_queued_amount_tracks_partial_scheduled_execution() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, deposit_token, _) = setup(&e);
+    // 0% payout: the pools return nothing, so the execution queues the shortfall.
+    setup_thin(&e, &client, &deposit_token, 0);
+
+    let owner = Address::generate(&e);
+    let recipient = Address::generate(&e);
+    fund(&e, &deposit_token, &owner, 1_000);
+    client.deposit(&owner, &1_000);
+
+    client.schedule_withdrawals(
+        &owner,
+        &recipient,
+        &400,
+        &ScheduleFrequency::OneTime,
+        &10,
+        &0,
+        &0,
+    );
+    assert_eq!(client.get_vault().queued_amount, 0);
+
+    set_sequence(&e, 10);
+    let result = client.execute_scheduled_withdrawals(&0);
+    assert_eq!(result.executed, 1);
+    assert_eq!(result.paid_out, 0);
+
+    // The unpaid 400 is a queue claim, and the liability counter reflects it.
+    assert_eq!(client.queue_len(), 1);
+    assert_eq!(client.get_vault().queued_amount, 400);
 }
