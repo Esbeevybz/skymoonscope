@@ -246,3 +246,67 @@ fn test_nft_is_escrowed_on_initialize() {
     assert_eq!(fx.nft().balance(&fx.seller), 0);
     assert_eq!(fx.nft().balance(&fx.auction_id), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Refund funding (issue #73)
+// ---------------------------------------------------------------------------
+
+/// The refund is a native `transfer` out of the contract's own balance, funded
+/// at bid time — not a `transfer_from` that depends on an allowance the contract
+/// never sets (issue #73).
+///
+/// The mock token panics on insufficient balance and its `transfer` requires the
+/// *sender's* auth, so a successful refund proves the contract held the funds and
+/// moved them itself. It has no `transfer_from` at all, so any allowance-based
+/// refund would not even compile against it.
+#[test]
+fn test_refund_is_funded_from_the_contracts_own_balance() {
+    let fx = setup(200);
+
+    // Bid 1: the contract escrows exactly the bid.
+    fx.auction().bid(&fx.bidder1, &150);
+    assert_eq!(fx.payment().balance(&fx.auction_id), 150);
+
+    // Bid 2 outbids: escrow 220, refund 150. Both legs settle.
+    fx.auction().bid(&fx.bidder2, &220);
+    assert_eq!(fx.payment().balance(&fx.bidder1), 1_000, "bidder1 refunded");
+    assert_eq!(fx.payment().balance(&fx.bidder2), 780);
+    assert_eq!(
+        fx.payment().balance(&fx.auction_id),
+        220,
+        "escrow equals the current highest bid"
+    );
+
+    // A third outbid keeps the invariant: the contract never holds more than the
+    // live bid, because each refund is funded by the incoming bid.
+    fx.auction().bid(&fx.bidder1, &300);
+    assert_eq!(fx.payment().balance(&fx.bidder2), 1_000, "bidder2 refunded");
+    assert_eq!(fx.payment().balance(&fx.auction_id), 300);
+}
+
+/// Repeated outbidding never leaves the contract short, because every refund is
+/// backed by the new bid that triggered it.
+#[test]
+fn test_repeated_outbidding_keeps_escrow_exact() {
+    let fx = setup(200);
+
+    let mut amount: i128 = 150;
+    for i in 0..5 {
+        let bidder = if i % 2 == 0 { &fx.bidder1 } else { &fx.bidder2 };
+        amount += 10;
+        fx.auction().bid(bidder, &amount);
+        assert_eq!(fx.payment().balance(&fx.auction_id), amount);
+    }
+
+    // Conservation: 2_000 minted in total, 200 escrowed, 1_800 with the bidders.
+    assert_eq!(
+        fx.payment().balance(&fx.bidder1) + fx.payment().balance(&fx.bidder2),
+        1_800
+    );
+    assert_eq!(
+        fx.payment().balance(&fx.bidder1)
+            + fx.payment().balance(&fx.bidder2)
+            + fx.payment().balance(&fx.auction_id),
+        2_000
+    );
+}
