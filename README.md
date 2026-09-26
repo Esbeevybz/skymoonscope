@@ -14,6 +14,10 @@ Building on Soroban requires careful resource management. Sky Moon Scope provide
 - `/contracts`: Sample Soroban contracts used for benchmarking.
 - `/.github/workflows`: CI/CD pipelines.
 
+### Large pull requests
+
+The **Large PR warning** workflow comments on pull requests whose combined additions and deletions exceed 800 lines. Repositories can override this default by setting the `PR_DIFF_WARNING_THRESHOLD` Actions variable to a non-negative integer. The workflow updates its existing warning as a pull request changes and removes it if the diff falls back below the limit.
+
 ## ⚙️ Getting Started
 
 ### Prerequisites
