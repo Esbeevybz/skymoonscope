@@ -1,40 +1,53 @@
 use crate::storage_types::{
-    Attestation, Claim, DIDDocument, DIDMetadata, DIDUpdated, Service, VerificationMethod,
-    ATTESTATIONS, CLAIMS, DID_DOCUMENT, DID_INDEX, DID_METADATA, OWNER,
+    Attestation, Claim, DIDDocument, DIDMetadata, DIDUpdated, Error, Service, VerificationMethod,
+    ATTESTATIONS, CLAIMS, DID_DOCUMENT, DID_INDEX, DID_METADATA, DID_OWNER, OWNER,
 };
 use soroban_sdk::{contract, contractimpl, Address, Bytes, Env, String, Symbol, Vec};
 
 pub trait DIDRegistryTrait {
     fn initialize(e: Env, owner: Address);
 
-    fn register_did(e: Env, did: String, document: DIDDocument, expiration_timestamp: Option<u64>);
+    fn register_did(
+        e: Env,
+        did: String,
+        document: DIDDocument,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<(), Error>;
 
-    fn revoke_did(e: Env, did: String);
+    fn revoke_did(e: Env, did: String) -> Result<(), Error>;
 
-    fn set_expiration(e: Env, did: String, expiration_timestamp: Option<u64>);
+    fn set_expiration(e: Env, did: String, expiration_timestamp: Option<u64>) -> Result<(), Error>;
 
     fn is_did_valid(e: Env, did: String) -> bool;
 
-    fn update_did_document(e: Env, did: String, document: DIDDocument);
+    fn update_did_document(e: Env, did: String, document: DIDDocument) -> Result<(), Error>;
 
-    fn add_verification_method(e: Env, did: String, method: VerificationMethod);
+    fn transfer_did_ownership(e: Env, did: String, new_owner: Address) -> Result<(), Error>;
 
-    fn remove_verification_method(e: Env, did: String, method_id: String);
+    fn get_did_owner(e: Env, did: String) -> Option<Address>;
+
+    fn add_verification_method(
+        e: Env,
+        did: String,
+        method: VerificationMethod,
+    ) -> Result<(), Error>;
+
+    fn remove_verification_method(e: Env, did: String, method_id: String) -> Result<(), Error>;
 
     fn rotate_verification_method(
         e: Env,
         did: String,
         method_id: String,
         new_public_key_multibase: Bytes,
-    );
+    ) -> Result<(), Error>;
 
-    fn add_service(e: Env, did: String, service: Service);
+    fn add_service(e: Env, did: String, service: Service) -> Result<(), Error>;
 
-    fn remove_service(e: Env, did: String, service_id: String);
+    fn remove_service(e: Env, did: String, service_id: String) -> Result<(), Error>;
 
-    fn add_claim(e: Env, claim: Claim);
+    fn add_claim(e: Env, claim: Claim) -> Result<(), Error>;
 
-    fn attest_claim(e: Env, attestation: Attestation);
+    fn attest_claim(e: Env, attestation: Attestation) -> Result<(), Error>;
 
     fn get_did_document(e: Env, did: String) -> DIDDocument;
 
@@ -56,6 +69,35 @@ impl DIDRegistry {
     fn require_owner_auth(e: &Env) {
         let owner = Self::owner(e);
         owner.require_auth();
+    }
+
+    /// The address allowed to mutate `did`'s document.
+    ///
+    /// Recorded at registration time and changeable only through
+    /// `transfer_did_ownership`, which is itself registry-owner gated.
+    fn did_owner(e: &Env, did: &String) -> Result<Address, Error> {
+        e.storage()
+            .persistent()
+            .get(&(DID_OWNER, did.clone()))
+            .ok_or(Error::DIDOwnerNotFound)
+    }
+
+    /// Gate every state-mutating operation on a DID.
+    ///
+    /// Issue #79: these operations previously required only the global registry
+    /// owner, so a DID document had no owner of its own. Both the registry owner
+    /// and the DID owner must now authorize, which lets ownership be delegated
+    /// per DID without exposing the document to arbitrary callers.
+    ///
+    /// The workspace pins `soroban-sdk` 22, which does not expose
+    /// `Env::invoker()`, so the caller check is expressed as `require_auth()`:
+    /// the transaction must carry that address's authorization for this
+    /// contract, this function and these arguments.
+    fn require_did_owner_auth(e: &Env, did: &String) -> Result<(), Error> {
+        Self::require_owner_auth(e);
+        let owner = Self::did_owner(e, did)?;
+        owner.require_auth();
+        Ok(())
     }
 
     fn validate_did_uri(e: &Env, did: &String) {
@@ -159,7 +201,12 @@ impl DIDRegistryTrait for DIDRegistry {
         e.storage().persistent().set(&DID_INDEX, &Vec::new(&e));
     }
 
-    fn register_did(e: Env, did: String, document: DIDDocument, expiration_timestamp: Option<u64>) {
+    fn register_did(
+        e: Env,
+        did: String,
+        document: DIDDocument,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<(), Error> {
         Self::require_owner_auth(&e);
         Self::validate_did_uri(&e, &did);
 
@@ -167,6 +214,12 @@ impl DIDRegistryTrait for DIDRegistry {
         if e.storage().persistent().has(&key) {
             panic!("DID already registered");
         }
+
+        // The registry owner is the initial owner of every DID it registers.
+        let registry_owner = Self::owner(&e);
+        e.storage()
+            .persistent()
+            .set(&(DID_OWNER, did.clone()), &registry_owner);
 
         let metadata = DIDMetadata {
             expiration_timestamp,
@@ -178,10 +231,11 @@ impl DIDRegistryTrait for DIDRegistry {
         e.storage().persistent().set(&metadata_key, &metadata);
         Self::append_did_index(&e, &did);
         Self::emit_did_updated(&e, &did, "register");
+        Ok(())
     }
 
-    fn revoke_did(e: Env, did: String) {
-        Self::require_owner_auth(&e);
+    fn revoke_did(e: Env, did: String) -> Result<(), Error> {
+        Self::require_did_owner_auth(&e, &did)?;
 
         let key = (DID_DOCUMENT, did.clone());
         if !e.storage().persistent().has(&key) {
@@ -193,10 +247,11 @@ impl DIDRegistryTrait for DIDRegistry {
         metadata.revocation_bitmap = 1;
         e.storage().persistent().set(&metadata_key, &metadata);
         Self::emit_did_updated(&e, &did, "revoke");
+        Ok(())
     }
 
-    fn set_expiration(e: Env, did: String, expiration_timestamp: Option<u64>) {
-        Self::require_owner_auth(&e);
+    fn set_expiration(e: Env, did: String, expiration_timestamp: Option<u64>) -> Result<(), Error> {
+        Self::require_did_owner_auth(&e, &did)?;
 
         let key = (DID_DOCUMENT, did.clone());
         if !e.storage().persistent().has(&key) {
@@ -208,14 +263,15 @@ impl DIDRegistryTrait for DIDRegistry {
         metadata.expiration_timestamp = expiration_timestamp;
         e.storage().persistent().set(&metadata_key, &metadata);
         Self::emit_did_updated(&e, &did, "set_expiration");
+        Ok(())
     }
 
     fn is_did_valid(e: Env, did: String) -> bool {
         Self::_is_did_valid(&e, did)
     }
 
-    fn update_did_document(e: Env, did: String, document: DIDDocument) {
-        Self::require_owner_auth(&e);
+    fn update_did_document(e: Env, did: String, document: DIDDocument) -> Result<(), Error> {
+        Self::require_did_owner_auth(&e, &did)?;
 
         let key = (DID_DOCUMENT, did.clone());
         if !e.storage().persistent().has(&key) {
@@ -224,20 +280,47 @@ impl DIDRegistryTrait for DIDRegistry {
 
         e.storage().persistent().set(&key, &document);
         Self::emit_did_updated(&e, &did, "update");
+        Ok(())
     }
 
-    fn add_verification_method(e: Env, did: String, method: VerificationMethod) {
+    /// Hand a DID to a new owner. Registry-owner gated.
+    fn transfer_did_ownership(e: Env, did: String, new_owner: Address) -> Result<(), Error> {
         Self::require_owner_auth(&e);
+
+        let key = (DID_DOCUMENT, did.clone());
+        if !e.storage().persistent().has(&key) {
+            panic!("DID not found");
+        }
+
+        e.storage()
+            .persistent()
+            .set(&(DID_OWNER, did.clone()), &new_owner);
+        Self::emit_did_updated(&e, &did, "transfer_ownership");
+        Ok(())
+    }
+
+    /// The address currently allowed to mutate `did`'s document.
+    fn get_did_owner(e: Env, did: String) -> Option<Address> {
+        e.storage().persistent().get(&(DID_OWNER, did))
+    }
+
+    fn add_verification_method(
+        e: Env,
+        did: String,
+        method: VerificationMethod,
+    ) -> Result<(), Error> {
+        Self::require_did_owner_auth(&e, &did)?;
 
         let key = (DID_DOCUMENT, did.clone());
         let mut document: DIDDocument = e.storage().persistent().get(&key).unwrap();
         document.verification_method.push_back(method);
         e.storage().persistent().set(&key, &document);
         Self::emit_did_updated(&e, &did, "add_verification_method");
+        Ok(())
     }
 
-    fn remove_verification_method(e: Env, did: String, method_id: String) {
-        Self::require_owner_auth(&e);
+    fn remove_verification_method(e: Env, did: String, method_id: String) -> Result<(), Error> {
+        Self::require_did_owner_auth(&e, &did)?;
 
         let key = (DID_DOCUMENT, did.clone());
         let mut document: DIDDocument = e.storage().persistent().get(&key).unwrap();
@@ -258,6 +341,7 @@ impl DIDRegistryTrait for DIDRegistry {
 
         e.storage().persistent().set(&key, &document);
         Self::emit_did_updated(&e, &did, "remove_verification_method");
+        Ok(())
     }
 
     fn rotate_verification_method(
@@ -265,8 +349,8 @@ impl DIDRegistryTrait for DIDRegistry {
         did: String,
         method_id: String,
         new_public_key_multibase: Bytes,
-    ) {
-        Self::require_owner_auth(&e);
+    ) -> Result<(), Error> {
+        Self::require_did_owner_auth(&e, &did)?;
 
         let key = (DID_DOCUMENT, did.clone());
         let mut document: DIDDocument = e.storage().persistent().get(&key).unwrap();
@@ -290,10 +374,11 @@ impl DIDRegistryTrait for DIDRegistry {
 
         e.storage().persistent().set(&key, &document);
         Self::emit_did_updated(&e, &did, "rotate_verification_method");
+        Ok(())
     }
 
-    fn add_service(e: Env, did: String, service: Service) {
-        Self::require_owner_auth(&e);
+    fn add_service(e: Env, did: String, service: Service) -> Result<(), Error> {
+        Self::require_did_owner_auth(&e, &did)?;
 
         let key = (DID_DOCUMENT, did.clone());
         let mut document: DIDDocument = e.storage().persistent().get(&key).unwrap();
@@ -306,10 +391,11 @@ impl DIDRegistryTrait for DIDRegistry {
         }
         document.service.push_back(service);
         e.storage().persistent().set(&key, &document);
+        Ok(())
     }
 
-    fn remove_service(e: Env, did: String, service_id: String) {
-        Self::require_owner_auth(&e);
+    fn remove_service(e: Env, did: String, service_id: String) -> Result<(), Error> {
+        Self::require_did_owner_auth(&e, &did)?;
 
         let key = (DID_DOCUMENT, did.clone());
         let mut document: DIDDocument = e.storage().persistent().get(&key).unwrap();
@@ -329,18 +415,20 @@ impl DIDRegistryTrait for DIDRegistry {
         }
 
         e.storage().persistent().set(&key, &document);
+        Ok(())
     }
 
-    fn add_claim(e: Env, claim: Claim) {
+    fn add_claim(e: Env, claim: Claim) -> Result<(), Error> {
         Self::require_owner_auth(&e);
 
         let key = (CLAIMS, claim.subject.clone());
         let mut claims: Vec<Claim> = e.storage().persistent().get(&key).unwrap_or(Vec::new(&e));
         claims.push_back(claim);
         e.storage().persistent().set(&key, &claims);
+        Ok(())
     }
 
-    fn attest_claim(e: Env, attestation: Attestation) {
+    fn attest_claim(e: Env, attestation: Attestation) -> Result<(), Error> {
         Self::require_owner_auth(&e);
 
         let key = (ATTESTATIONS, attestation.claim_hash.clone());
@@ -348,6 +436,7 @@ impl DIDRegistryTrait for DIDRegistry {
             e.storage().persistent().get(&key).unwrap_or(Vec::new(&e));
         attestations.push_back(attestation);
         e.storage().persistent().set(&key, &attestations);
+        Ok(())
     }
 
     fn get_did_document(e: Env, did: String) -> DIDDocument {

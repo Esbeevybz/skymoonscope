@@ -1,4 +1,20 @@
-use soroban_sdk::{contracttype, Address, Bytes, Map, String, Symbol, Vec};
+use soroban_sdk::{contracterror, contracttype, Address, Bytes, Map, String, Symbol, Vec};
+
+/// Errors returned by the DID registry.
+///
+/// The access-control failures added for issue #79 are reported as contract
+/// errors so a caller can tell "you may not do this" apart from a host-level
+/// failure. The pre-existing validation panics are deliberately left as they
+/// were, so existing behaviour and tests are unchanged.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// The caller is neither the registry owner nor the owner of this DID.
+    Unauthorized = 1,
+    /// No owner is recorded for this DID.
+    DIDOwnerNotFound = 2,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,3 +87,5 @@ pub const DID_INDEX: Symbol = Symbol::short("DID_IDX");
 pub const CLAIMS: Symbol = Symbol::short("CLAIMS");
 pub const ATTESTATIONS: Symbol = Symbol::short("ATTEST");
 pub const OWNER: Symbol = Symbol::short("OWNER");
+/// Maps a DID to the address allowed to mutate its document (issue #79).
+pub const DID_OWNER: Symbol = Symbol::short("DID_OWNR");
