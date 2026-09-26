@@ -8,6 +8,7 @@ pub mod comparison;
 pub mod contract_registry;
 pub mod cors;
 pub mod engine;
+pub mod error_middleware;
 pub mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;

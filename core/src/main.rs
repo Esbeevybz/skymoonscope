@@ -6,6 +6,7 @@ mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
+mod error_middleware;
 mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
@@ -2805,6 +2806,10 @@ async fn main() {
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
+        // ── Error sanitization middleware (#error-security) ─────────────────
+        // Replaces 5xx error details with opaque messages while logging
+        // full Debug details server-side to prevent information leakage.
+        .layer(middleware::from_fn(error_middleware::error_sanitization_middleware))
         // ── x-request-id (#572) ───────────────────────────────────────
         // Assigns a UUID to every inbound request under the `x-request-id`
         // header and propagates it to outbound responses so clients can
