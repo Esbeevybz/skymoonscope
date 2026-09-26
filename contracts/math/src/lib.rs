@@ -187,6 +187,58 @@ pub fn ray_div(a: i128, b: i128) -> Result<i128, MathError> {
     mul_div(a, RAY, b).ok_or(MathError::Overflow)
 }
 
+/// Maximum iterations the integer square root is allowed to take (issue #88).
+///
+/// Newton's method converges quadratically, so ~7 iterations suffice for any
+/// `u128` input. The bound exists purely as a backstop: if a future change to
+/// the iteration order or the seed ever breaks convergence, the loop must fail
+/// with an error rather than spin until the host's CPU budget traps the
+/// contract. Inputs near `i128::MAX` are exactly where an unbounded Newton loop
+/// is most likely to stall, because `x / y` and the midpoint stop making
+/// progress at that magnitude.
+pub const SQRT_MAX_ITERATIONS: u32 = 128;
+
+/// Integer square root: the largest `r` with `r * r <= x`.
+///
+/// Returns `Err(MathError::InvalidInput)` for negative inputs and
+/// `Err(MathError::Overflow)` if the iteration does not converge within
+/// [`SQRT_MAX_ITERATIONS`] steps (issue #88). Both are errors rather than
+/// panics, so a caller can distinguish a bad input from a convergence failure.
+pub fn isqrt(x: i128) -> Result<i128, MathError> {
+    if x < 0 {
+        return Err(MathError::InvalidInput);
+    }
+    if x == 0 {
+        return Ok(0);
+    }
+
+    // Newton's method in u128: r_{n+1} = (r_n + x / r_n) / 2, seeded above the
+    // root so the first step can only decrease.
+    let ux = x as u128;
+    let mut r = ux;
+    let mut i: u32 = 0;
+
+    loop {
+        let next = (r + ux / r) / 2;
+        if next >= r {
+            // r is a fixed point: either the exact root or one above it.
+            break;
+        }
+        r = next;
+        i += 1;
+        if i >= SQRT_MAX_ITERATIONS {
+            return Err(MathError::Overflow);
+        }
+    }
+
+    // Newton can settle one above the true root; step back if we overshot.
+    let mut root = r as i128;
+    while root > 0 && root > x / root {
+        root -= 1;
+    }
+    Ok(root)
+}
+
 fn mul_div(a: i128, b: i128, d: i128) -> Option<i128> {
     if d == 0 {
         return None;
@@ -263,6 +315,10 @@ impl Math {
     }
     pub fn ray_div(_e: Env, a: i128, b: i128) -> Result<i128, MathError> {
         crate::ray_div(a, b)
+    }
+    /// Integer square root with a bounded iteration count (issue #88).
+    pub fn isqrt(_e: Env, x: i128) -> Result<i128, MathError> {
+        isqrt(x)
     }
 }
 
@@ -418,6 +474,80 @@ mod test {
     }
 
     #[test]
+    fn test_isqrt_is_exact() {
+        // r * r <= x < (r+1)*(r+1) for every case.
+        for x in [
+            0i128,
+            1,
+            2,
+            3,
+            4,
+            8,
+            9,
+            10,
+            15,
+            16,
+            99,
+            100,
+            10_000,
+            1_000_000_000_000_000_000,
+        ] {
+            let r = isqrt(x).unwrap();
+            assert!(r * r <= x, "isqrt({x}) = {r} overshoots");
+            assert!(
+                (r + 1).saturating_mul(r + 1) > x,
+                "isqrt({x}) = {r} undershoots"
+            );
+        }
+    }
+
+    #[test]
+    fn test_isqrt_perfect_squares() {
+        for base in [1i128, 2, 3, 10, 100, 1_000, 1_000_000, 1_000_000_000] {
+            let sq = base * base;
+            assert_eq!(isqrt(sq).unwrap(), base, "isqrt({base}^2)");
+        }
+    }
+
+    #[test]
+    fn test_isqrt_converges_near_i128_max() {
+        // The regime the issue calls out: near i128::MAX the intermediate
+        // values stop moving quickly, so this is where an unbounded loop would
+        // stall. It must return a correct answer, not hang.
+        for x in [
+            i128::MAX,
+            i128::MAX - 1,
+            i128::MAX / 2,
+            i128::MAX / 3,
+            1i128 << 62,
+            (1i128 << 62) + 1,
+        ] {
+            let r = isqrt(x).unwrap();
+            assert!(r * r <= x, "isqrt({x}) = {r} overshoots");
+            assert!((r + 1).saturating_mul(r + 1) > x, "isqrt({x}) = {r} undershoots");
+        }
+
+        // 2^126 is exactly 2^63 squared, so the root is exactly 2^63.
+        assert_eq!(isqrt(1i128 << 126).unwrap(), 1i128 << 63);
+    }
+
+    #[test]
+    fn test_isqrt_rejects_negative_input() {
+        assert_eq!(isqrt(-1), Err(MathError::InvalidInput));
+        assert_eq!(isqrt(i128::MIN), Err(MathError::InvalidInput));
+    }
+
+    #[test]
+    fn test_isqrt_is_monotonic() {
+        let mut previous = 0i128;
+        for x in 0..2000i128 {
+            let r = isqrt(x).unwrap();
+            assert!(r >= previous, "isqrt is not monotonic at {x}");
+            previous = r;
+        }
+    }
+
+    #[test]
     fn test_contract_methods() {
         let env = Env::default();
         assert_eq!(Math::wad_mul(env.clone(), 2 * WAD, 3 * WAD), Ok(6 * WAD));
@@ -428,5 +558,7 @@ mod test {
             Math::wad_div(env.clone(), 1, 0),
             Err(MathError::DivisionByZero)
         );
+        assert_eq!(Math::isqrt(env.clone(), 144), Ok(12));
+        assert_eq!(Math::isqrt(env.clone(), -1), Err(MathError::InvalidInput));
     }
 }
