@@ -11,4 +11,6 @@ soroban-sdk.workspace = true
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-ed25519-dalek = { workspace = true }
+# Pinned to the version already present in Cargo.lock (as `soroban-sdk`
+# pulls it in transitively) so `--locked` builds stay reproducible.
+ed25519-dalek = "=2.1.1"

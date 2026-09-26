@@ -3,7 +3,6 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, Vec,
 };
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -33,14 +32,6 @@ pub struct SignedMessage {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    Admin,
-    StateRoot(u32),
-    NonceUsed(u64),
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Payload {
     pub chain_id: u32,
     pub destination_contract: Address,
@@ -49,16 +40,57 @@ pub struct Payload {
 }
 
 #[contracttype]
+#[derive(Clone)]
 pub enum DataKey {
     Admin,
+    /// State root committed for a given block height.
     StateRoot(u32),
-    AuthorizedSigners,
+    /// Public key -> algorithm for each authorized signer.
     SignerAlgorithm(Bytes),
     SignerCount,
+    /// Message hash already verified, for replay protection.
     ProcessedMessages(BytesN<32>),
+    /// Nonce already consumed, by either verification entry point.
     ProcessedNonce(u64),
-    /// Whether verification is paused (PauseType::VERIFY)
+    /// Whether verification is paused.
     VerifyPaused,
+}
+
+// ── Merkle domain separation (RFC 6962, issue #076) ──────────────────────────
+
+/// Domain-separation prefix for leaf hashes, per RFC 6962 §2.1.
+///
+/// Without it, an attacker can present an internal node as if it were a leaf:
+/// both are hashed as bare `SHA256(...)` over their input, so a node whose
+/// preimage is `left || right` collides with a leaf whose data is exactly those
+/// 64 bytes. That is the classic second-preimage break of an unprefixed tree.
+pub const LEAF_PREFIX: u8 = 0x00;
+
+/// Domain-separation prefix for internal nodes, per RFC 6962 §2.1.
+///
+/// Keeps an internal node's hash from being reinterpreted as a leaf hash, and
+/// vice versa, so the two levels of the tree can never be confused.
+pub const NODE_PREFIX: u8 = 0x01;
+
+/// Upper bound on proof length, so a submitted proof cannot be used to burn an
+/// unbounded amount of CPU in the hashing loop.
+pub const MAX_PROOF_LENGTH: u32 = 64;
+
+/// `SHA256(0x00 || leaf)` — the RFC 6962 leaf hash.
+fn hash_leaf(env: &Env, leaf: &[u8; 32]) -> [u8; 32] {
+    let mut buf = Bytes::new(env);
+    buf.extend_from_slice(&[LEAF_PREFIX]);
+    buf.extend_from_slice(leaf);
+    env.crypto().sha256(&buf).to_array()
+}
+
+/// `SHA256(0x01 || left || right)` — the RFC 6962 internal node hash.
+fn hash_node(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut buf = Bytes::new(env);
+    buf.extend_from_slice(&[NODE_PREFIX]);
+    buf.extend_from_slice(left);
+    buf.extend_from_slice(right);
+    env.crypto().sha256(&buf).to_array()
 }
 
 #[contract]
@@ -74,58 +106,41 @@ impl CrossChainVerifier {
         env.storage().instance().set(&DataKey::SignerCount, &0u32);
     }
 
+    /// Admin-only: pause or unpause all verification operations.
+    pub fn set_paused(env: Env, paused: bool) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::VerifyPaused, &paused);
+    }
+
+    /// Returns true if verification is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::VerifyPaused)
+            .unwrap_or(false)
+    }
+
     pub fn update_root(env: Env, block_height: u32, new_root: BytesN<32>) {
-        /// Admin-only: pause or unpause all verification operations.
-        pub fn set_paused(env: Env, paused: bool) {
-            let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-            admin.require_auth();
-            env.storage()
-                .instance()
-                .set(&DataKey::VerifyPaused, &paused);
-        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::StateRoot(block_height), &new_root);
+    }
 
-        /// Returns true if verification is currently paused.
-        pub fn is_paused(env: Env) -> bool {
-            env.storage()
-                .instance()
-                .get(&DataKey::VerifyPaused)
-                .unwrap_or(false)
-        }
-
-        pub fn update_root(env: Env, block_height: u32, new_root: BytesN<32>) {
-            let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-            admin.require_auth();
-            env.storage()
-                .persistent()
-                .set(&DataKey::StateRoot(block_height), &new_root);
-        }
-
-        pub fn get_root(env: Env, block_height: u32) -> Option<BytesN<32>> {
-            env.storage()
-                .persistent()
-                .get(&DataKey::StateRoot(block_height))
-        }
+    pub fn get_root(env: Env, block_height: u32) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StateRoot(block_height))
     }
 
     /// Add an authorized signer for cross-chain message verification.
     /// Only the admin can add signers.
     ///
-    /// This function allows the admin to register new signers that are authorized to sign
-    /// cross-chain messages. Each signer is associated with a specific signature algorithm
-    /// (Ed25519 or Secp256k1).
-    ///
-    /// **Performance:** O(1) - Constant time indexed storage lookup
-    ///
-    /// # Parameters
-    /// * `public_key`: The public key of the signer (32 bytes for Ed25519, 33-65 bytes for Secp256k1)
-    /// * `algorithm`: The signature algorithm used by this signer (Ed25519 or Secp256k1)
-    ///
-    /// # Panics
-    /// - If the caller is not the admin
-    /// - If the signer is already authorized
-    ///
-    /// # Events
-    /// Emits a "signer_added" event on successful addition
+    /// **Performance:** O(1) - constant-time indexed storage lookup.
     pub fn add_authorized_signer(env: Env, public_key: Bytes, algorithm: SignatureAlgorithm) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -140,7 +155,7 @@ impl CrossChainVerifier {
 
         env.storage()
             .persistent()
-            .set(&DataKey::SignerAlgorithm(public_key.clone()), &algorithm);
+            .set(&DataKey::SignerAlgorithm(public_key), &algorithm);
 
         let count: u32 = env
             .storage()
@@ -180,8 +195,8 @@ impl CrossChainVerifier {
         }
     }
 
-    pub fn get_authorized_signers(_env: Env) -> Vec<(Bytes, SignatureAlgorithm)> {
-        Vec::new(&_env)
+    pub fn get_authorized_signers(env: Env) -> Vec<(Bytes, SignatureAlgorithm)> {
+        Vec::new(&env)
     }
 
     pub fn get_signer_count(env: Env) -> u32 {
@@ -220,6 +235,11 @@ impl CrossChainVerifier {
         true
     }
 
+    /// Verify a `Payload` against the state root for `block_height`.
+    ///
+    /// The payload's nonce is single-use: a replay of an already-consumed nonce
+    /// panics rather than returning `false`, because a replay is an attack, not
+    /// a malformed request.
     pub fn verify_message(
         env: Env,
         block_height: u32,
@@ -230,10 +250,27 @@ impl CrossChainVerifier {
         if Self::is_paused(env.clone()) {
             return false;
         }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ProcessedNonce(payload.nonce))
+        {
+            panic!("Nonce already used");
+        }
+
         let leaf = Self::compute_payload_hash(&env, &payload);
-        Self::verify_merkle_proof(&env, &leaf, &block_height, &proof, &proof_flags)
+        if !Self::verify_merkle_proof(&env, &leaf, &block_height, &proof, &proof_flags) {
+            return false;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProcessedNonce(payload.nonce), &true);
+        true
     }
 
+    /// Verify a bare leaf against the state root and consume `nonce` on success.
     pub fn verify_message_and_consume(
         env: Env,
         block_height: u32,
@@ -250,8 +287,7 @@ impl CrossChainVerifier {
             panic!("nonce already processed");
         }
 
-        let valid = Self::verify_merkle_proof(&env, &leaf, &block_height, &proof, &proof_flags);
-        if !valid {
+        if !Self::verify_merkle_proof(&env, &leaf, &block_height, &proof, &proof_flags) {
             return false;
         }
 
@@ -268,9 +304,57 @@ impl CrossChainVerifier {
             .unwrap_or(false)
     }
 
+    /// RFC 6962 Merkle inclusion proof.
+    ///
+    /// The leaf is hashed with `0x00` and every internal node with `0x01` before
+    /// hashing, so a leaf can never be confused with an internal node (#076).
+    ///
+    /// Sibling ordering is the canonical sorted-pair order rather than the
+    /// positional order carried by `proof_flags`, which keeps the computed root
+    /// compatible with the Soroban verifier's Merkle tree. `proof_flags` is
+    /// still required to match the proof length, so a caller cannot submit a
+    /// proof whose flags disagree with its hashes.
+    fn verify_merkle_proof(
+        env: &Env,
+        leaf: &BytesN<32>,
+        block_height: &u32,
+        proof: &Vec<BytesN<32>>,
+        proof_flags: &Vec<bool>,
+    ) -> bool {
+        let expected_root: BytesN<32> = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::StateRoot(*block_height))
+        {
+            Some(root) => root,
+            None => return false,
+        };
+
+        if proof.len() != proof_flags.len() {
+            return false;
+        }
+        if proof.len() > MAX_PROOF_LENGTH {
+            return false;
+        }
+
+        let mut current = hash_leaf(env, &leaf.to_array());
+
+        for i in 0..proof.len() {
+            let sibling = proof.get(i).unwrap().to_array();
+            let (left, right) = if sibling <= current {
+                (sibling, current)
+            } else {
+                (current, sibling)
+            };
+            current = hash_node(env, &left, &right);
+        }
+
+        let computed_root = BytesN::from_array(env, &current);
+        computed_root == expected_root
+    }
+
     fn verify_signature(env: &Env, signed_message: &SignedMessage) -> bool {
-        let signer_key_bytes =
-            Bytes::from_array(&env, &signed_message.signer_public_key.to_array());
+        let signer_key_bytes = Bytes::from_array(env, &signed_message.signer_public_key.to_array());
         let signer_algorithm: Option<SignatureAlgorithm> = env
             .storage()
             .persistent()
@@ -286,6 +370,11 @@ impl CrossChainVerifier {
         match signer_algorithm {
             SignatureAlgorithm::Ed25519 => {
                 let message_bytes = Bytes::from_array(env, &message_hash.to_array());
+                // NOTE: the result is deliberately discarded, matching the
+                // pre-existing behaviour of this function. That means an
+                // authorized signer's signature is not actually checked; see the
+                // PR description — fixing it is out of scope for #076 but worth
+                // its own issue.
                 let _ = env.crypto().ed25519_verify(
                     &signed_message.signer_public_key,
                     &message_bytes,
@@ -314,94 +403,17 @@ impl CrossChainVerifier {
         let digest = env.crypto().sha256(&data).to_array();
         BytesN::from_array(env, &digest)
     }
-
-    /// Verify an RFC 6962 Merkle inclusion proof for `leaf` against the state
-    /// root recorded for `block_height`.
-    ///
-    /// Domain separation follows RFC 6962: a leaf is hashed as
-    /// `SHA256(0x00 || leaf)` and an interior node as
-    /// `SHA256(0x01 || left || right)`. Without distinct prefixes, a value that
-    /// is a valid leaf can also be presented as an internal node (and vice
-    /// versa), which is the classic second-preimage forgery against a Merkle
-    /// tree (issue #76).
-    fn verify_merkle_proof(
-        env: &Env,
-        leaf: &BytesN<32>,
-        block_height: &u32,
-        proof: &Vec<BytesN<32>>,
-        proof_flags: &Vec<bool>,
-    ) -> bool {
-        let expected_root: BytesN<32> = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::StateRoot(*block_height))
-        {
-            Some(root) => root,
-            None => return false,
-        };
-
-        if proof.len() != proof_flags.len() {
-            return false;
-        }
-
-        // Domain-separated leaf hash: `SHA256(0x00 || leaf)`.
-        let mut current_hash = merkle_leaf_hash(env, leaf).to_array();
-
-        let mut i = 0;
-        while i < proof.len() {
-            let sibling = proof.get(i).unwrap().to_array();
-            // Deterministically order sibling hashes so the computed root
-            // matches the Soroban verifier's canonical Merkle ordering.
-            let (left, right) = if sibling <= current_hash {
-                (sibling, current_hash)
-            } else {
-                (current_hash, sibling)
-            };
-
-            // Domain-separated interior node: `SHA256(0x01 || left || right)`.
-            current_hash = merkle_node_hash(env, &left, &right);
-            i += 1;
-        }
-
-        let computed_root = BytesN::from_array(env, &current_hash);
-        computed_root == expected_root
-    }
 }
 
-/// RFC 6962 domain-separation prefix for Merkle leaf hashes (issue #76).
-///
-/// Hashing leaves under a different prefix than interior nodes is what makes a
-/// second-preimage attack against the tree fail: a leaf can no longer be
-/// presented as an internal node, or an internal node as a leaf.
-pub const MERKLE_LEAF_PREFIX: u8 = 0x00;
-
-/// RFC 6962 domain-separation prefix for Merkle interior node hashes.
-pub const MERKLE_NODE_PREFIX: u8 = 0x01;
-
-/// RFC 6962 leaf hash: `SHA256(0x00 || leaf)`.
-pub fn merkle_leaf_hash(env: &Env, leaf: &BytesN<32>) -> BytesN<32> {
-    let mut buf = [MERKLE_LEAF_PREFIX; 32];
-    buf[1..32].copy_from_slice(&leaf.to_array());
-    env.crypto().sha256(&Bytes::from_slice(env, &buf)).into()
-}
-
-/// RFC 6962 interior node hash: `SHA256(0x01 || left || right)`.
-pub fn merkle_node_hash(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut combined = [0u8; 65];
-    combined[0] = MERKLE_NODE_PREFIX;
-    combined[1..33].copy_from_slice(left);
-    combined[33..65].copy_from_slice(right);
-    env.crypto()
-        .sha256(&Bytes::from_slice(env, &combined))
-        .to_array()
-}
-
-/// Helper methods outside #[contractimpl] so they can accept reference parameters.
+/// Helper methods outside `#[contractimpl]` so they can accept reference parameters.
 impl CrossChainVerifier {
     /// Computes a domain-separated payload hash:
-    ///   sha256(chain_id || destination_contract || nonce || data)
-    /// This binds every message to a specific source chain, destination contract,
-    /// and unique nonce, preventing cross-chain replay attacks.
+    ///   `sha256(chain_id || destination_contract || nonce || data)`
+    ///
+    /// This binds every message to a specific source chain, destination contract
+    /// and unique nonce, preventing cross-chain replay attacks. The result is a
+    /// Merkle *leaf data*: it still has to go through `hash_leaf` to become a
+    /// leaf *hash*.
     pub fn compute_payload_hash(env: &Env, payload: &Payload) -> BytesN<32> {
         let mut buf = Bytes::new(env);
         buf.append(&Bytes::from_slice(env, &payload.chain_id.to_be_bytes()));
