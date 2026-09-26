@@ -31,6 +31,24 @@
 //! persistent `WithdrawalRequest`.  `process_withdraw_queue()` then settles those
 //! requests oldest-first as liquidity returns, and `cancel_withdrawal()` lets an
 //! owner walk away from a claim they no longer want.
+//!
+//! ## Withdrawal schedules
+//! A depositor who wants a periodic income stream can stand up a
+//! `WithdrawalSchedule` instead of watching for each payout.  One-time and
+//! recurring schedules are both supported, and each execution pays a fixed
+//! amount of shares to a chosen recipient.
+//!
+//! The shares covering every remaining execution are **reserved at creation**:
+//! they stay in the owner's balance and in `total_shares`, so the LP backing
+//! them is still accounted for, but `withdraw` refuses to touch them.
+//! `cancel_withdrawal_schedule` releases whatever has not fired.  Because the
+//! reservation is exact, a recurring schedule declares how long it runs rather
+//! than running open-ended.
+//!
+//! Soroban has no scheduler, so "automatic" means permissionless:
+//! `execute_scheduled_withdrawals()` is callable by anyone and settles every
+//! schedule that has come due, in the same keeper-driven spirit as
+//! `process_withdraw_queue()`.
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
@@ -59,6 +77,16 @@ pub enum Error {
     WithdrawalNotFound = 12,
     /// The withdrawal request has already been fully filled or cancelled.
     WithdrawalClosed = 13,
+    /// The schedule parameters are unusable (non-positive amount, a first
+    /// execution that is not in the future, a zero interval, or an end ledger
+    /// before the first execution).
+    InvalidSchedule = 14,
+    /// No schedule exists for the given id.
+    ScheduleNotFound = 15,
+    /// The schedule has been cancelled or has already run to completion.
+    ScheduleClosed = 16,
+    /// The schedule list is full; no new schedule could be recorded.
+    TooManySchedules = 17,
 }
 
 // ── External pool interface ───────────────────────────────────────────────────
@@ -101,26 +129,6 @@ pub struct VaultState {
     pub queued_amount: i128,
 }
 
-/// A withdrawal that the vault could not settle in full because it did not have
-/// enough available liquidity at execution time.
-///
-/// The settled portion is paid out immediately by `withdraw`; `remaining_amount`
-/// is persisted here so the depositor keeps an enforceable claim on the vault
-/// instead of the shortfall being silently dropped.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WithdrawalRequest {
-    /// Address entitled to the payout.
-    pub owner: Address,
-    /// Deposit-token amount still owed to `owner`.
-    pub remaining_amount: i128,
-    /// Ledger sequence on which the entry was first created.  Preserved across
-    /// top-ups so the queue stays first-come, first-served.
-    pub requested_at_ledger: u32,
-    /// How many times this entry has been (re)queued with a larger remainder.
-    pub queue_count: u32,
-}
-
 /// Per-pool allocation record.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,6 +157,95 @@ pub enum DataKey {
     NextQueueId,
     /// WithdrawalRequest by id.
     Withdrawal(u32),
+    /// Vec<u32> — ids of the open withdrawal schedules, in creation order.
+    Schedules,
+    /// Id to hand out to the next withdrawal schedule.
+    NextScheduleId,
+    /// WithdrawalSchedule by id.
+    Schedule(u32),
+    /// Deposit-token amount still owed to `owner` across all their schedules.
+    ///
+    /// These shares are *reserved*, not removed: they stay in the owner's
+    /// balance and in `total_shares` so the LP backing them is still accounted
+    /// for, but `withdraw` refuses to touch them until a schedule fires or is
+    /// cancelled.  Deducting them from `total_shares` up front instead would
+    /// leave the LP unbacked and make each execution over-redeem from the pools.
+    Escrowed(Address),
+}
+
+/// How often a [`WithdrawalSchedule`] fires.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScheduleFrequency {
+    /// Fires exactly once, on `next_execution_ledger`.
+    OneTime,
+    /// Fires every `interval_ledgers` until `end_ledger`.
+    Recurring,
+}
+
+/// A standing instruction to withdraw a fixed amount from the vault on a
+/// timetable, so a depositor can turn a balance into a periodic income stream
+/// without having to be online when each withdrawal falls due.
+///
+/// ## Reservation
+/// The shares backing **every** remaining execution are *reserved* when the
+/// schedule is created: the owner's withdrawable balance drops by the full
+/// escrow, and cancelling restores whatever has not fired yet. Two consequences
+/// matter:
+///
+/// - execution cannot fail for want of funds, because the shares are already
+///   committed — a schedule that was affordable when it was created stays
+///   payable even if the owner later withdraws everything else;
+/// - those shares are not spendable, so they cannot be double-spent.
+///
+/// The shares stay in the owner's balance and in `total_shares` — they are
+/// reserved, not burned — so the LP backing them remains accounted for and each
+/// execution redeems exactly what an ordinary `withdraw` of the same size
+/// would. Only `withdraw` is held off them.
+///
+/// Because the reservation is exact, a recurring schedule must state how long it
+/// runs (`end_ledger`); there is no open-ended variant, which would make the
+/// amount to reserve unknowable at creation time.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalSchedule {
+    /// Schedule id, unique and monotonic.
+    pub id: u32,
+    /// Who created the schedule and may cancel it.
+    pub owner: Address,
+    /// Where the withdrawn deposit token is sent each time the schedule fires.
+    pub recipient: Address,
+    /// Shares burned per execution. Shares are minted 1:1 with the deposit
+    /// token, so this is also the token amount per execution.
+    pub amount_per_execution: i128,
+    pub frequency: ScheduleFrequency,
+    /// Ledgers between executions. Ignored for `OneTime`.
+    pub interval_ledgers: u32,
+    /// Earliest ledger on which this schedule may fire.
+    pub next_execution_ledger: u32,
+    /// Last ledger on which this schedule may fire.
+    pub end_ledger: u32,
+    /// Total executions this schedule will ever perform. Fixed at creation,
+    /// because it determines the escrow.
+    pub total_executions: u32,
+    /// Executions performed so far.
+    pub executions: u32,
+    /// True once cancelled or once `total_executions` have been performed.
+    pub closed: bool,
+}
+
+/// Summary returned by `execute_scheduled_withdrawals`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleExecutionResult {
+    /// Schedules inspected during this call.
+    pub considered: u32,
+    /// Schedules that fired.
+    pub executed: u32,
+    /// Deposit token paid out across all executions.
+    pub paid_out: i128,
+    /// Schedules still open when the call returned.
+    pub remaining: u32,
 }
 
 /// A withdrawal that the vault could not satisfy in full at request time.
@@ -200,6 +297,16 @@ pub const DEFAULT_VOLUME_PROXY_BPS: i128 = 10_000; // 100 % of reserve
 /// to grow `persistent` storage without bound.  Requests beyond this are rejected
 /// outright rather than silently dropped.
 pub const MAX_QUEUE_ENTRIES: u32 = 128;
+
+/// Hard ceiling on open withdrawal schedules.  Bounds both `persistent` storage
+/// growth and the work `execute_scheduled_withdrawals` can be asked to do in a
+/// single call.
+pub const MAX_SCHEDULES: u32 = 64;
+
+/// Upper bound on how many times one schedule may fire.  Together with the
+/// owner's balance this caps the escrowed amount, so a schedule can never lock up
+/// an unbounded share of the vault.
+pub const MAX_SCHEDULE_EXECUTIONS: u32 = 1_000;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -264,6 +371,9 @@ fn available_liquidity(e: &Env, deposit_token: &Address) -> i128 {
 }
 
 /// Append a new open request to the FIFO queue and return its id.
+///
+/// Adds `requested` to the vault's `queued_amount` liability so the counter
+/// stays in lockstep with the queue entries it is supposed to summarise.
 fn enqueue_request(e: &Env, owner: &Address, requested: i128) -> Result<u32, Error> {
     let mut queue = load_queue(e);
     if queue.len() >= MAX_QUEUE_ENTRIES {
@@ -289,7 +399,124 @@ fn enqueue_request(e: &Env, owner: &Address, requested: i128) -> Result<u32, Err
     );
     queue.push_back(id);
     save_queue(e, &queue);
+
+    if let Ok(mut vault) = load_vault(e) {
+        vault.queued_amount += requested;
+        save_vault(e, &vault);
+    }
     Ok(id)
+}
+
+/// Reduce the vault's `queued_amount` liability by `amount`, never below zero.
+fn reduce_queued(e: &Env, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    if let Ok(mut vault) = load_vault(e) {
+        vault.queued_amount = (vault.queued_amount - amount).max(0);
+        save_vault(e, &vault);
+    }
+}
+
+// ── Withdrawal schedule helpers ───────────────────────────────────────────────
+
+fn load_schedules(e: &Env) -> Vec<u32> {
+    e.storage()
+        .instance()
+        .get(&DataKey::Schedules)
+        .unwrap_or(Vec::new(e))
+}
+
+fn save_schedules(e: &Env, schedules: &Vec<u32>) {
+    e.storage().instance().set(&DataKey::Schedules, schedules);
+}
+
+fn schedule_key(id: u32) -> DataKey {
+    DataKey::Schedule(id)
+}
+
+fn load_schedule(e: &Env, id: u32) -> Result<WithdrawalSchedule, Error> {
+    e.storage()
+        .persistent()
+        .get(&schedule_key(id))
+        .ok_or(Error::ScheduleNotFound)
+}
+
+fn save_schedule(e: &Env, id: u32, schedule: &WithdrawalSchedule) {
+    let key = schedule_key(id);
+    e.storage().persistent().set(&key, schedule);
+    e.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+}
+
+/// Drop a schedule id from the open-schedule list.
+fn remove_from_schedules(e: &Env, id: u32) {
+    let mut schedules = load_schedules(e);
+    for i in 0..schedules.len() {
+        if schedules.get(i).unwrap() == id {
+            schedules.remove(i);
+            break;
+        }
+    }
+    save_schedules(e, &schedules);
+}
+
+/// Shares `owner` has committed to their open withdrawal schedules.  These stay
+/// in the owner's balance but are not withdrawable.
+fn escrowed_of(e: &Env, owner: &Address) -> i128 {
+    e.storage()
+        .persistent()
+        .get(&DataKey::Escrowed(owner.clone()))
+        .unwrap_or(0)
+}
+
+/// Change `owner`'s reserved total by `delta` (negative to release).
+fn adjust_escrowed(e: &Env, owner: &Address, delta: i128) {
+    let key = DataKey::Escrowed(owner.clone());
+    let next = (escrowed_of(e, owner) + delta).max(0);
+    e.storage().persistent().set(&key, &next);
+    e.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+}
+
+/// Number of executions implied by the timing parameters, and the escrow they
+/// require.  Returns `Err` for unusable combinations.
+fn plan_executions(
+    amount_per_execution: i128,
+    frequency: &ScheduleFrequency,
+    first_execution_ledger: u32,
+    interval_ledgers: u32,
+    end_ledger: u32,
+) -> Result<(u32, i128), Error> {
+    if amount_per_execution <= 0 {
+        return Err(Error::InvalidAmount);
+    }
+
+    let total_executions = match frequency {
+        ScheduleFrequency::OneTime => 1u32,
+        ScheduleFrequency::Recurring => {
+            if interval_ledgers == 0 {
+                return Err(Error::InvalidSchedule);
+            }
+            if end_ledger < first_execution_ledger {
+                return Err(Error::InvalidSchedule);
+            }
+            // Firing on `first`, `first + interval`, ... up to and including `end`.
+            ((end_ledger - first_execution_ledger) / interval_ledgers) + 1
+        }
+    };
+
+    if total_executions == 0 || total_executions > MAX_SCHEDULE_EXECUTIONS {
+        return Err(Error::InvalidSchedule);
+    }
+
+    let escrow = amount_per_execution
+        .checked_mul(total_executions as i128)
+        .ok_or(Error::InvalidAmount)?;
+
+    Ok((total_executions, escrow))
 }
 
 /// Pay `owner` up to `amount` from idle vault liquidity, returning what was
@@ -579,7 +806,10 @@ impl MultiYieldVault {
 
         let bal_key = DataKey::Balance(to.clone());
         let cur: i128 = e.storage().persistent().get(&bal_key).unwrap_or(0);
-        if shares > cur {
+        // Shares reserved for an open withdrawal schedule are not spendable, or
+        // the owner could withdraw them and leave the schedule unpayable.
+        let spendable = cur - escrowed_of(&e, &to);
+        if shares > spendable {
             return Err(Error::InsufficientShares);
         }
 
@@ -693,6 +923,7 @@ impl MultiYieldVault {
 
             req.remaining_shares -= payout;
             req.filled_amount += payout;
+            reduce_queued(&e, payout);
             result.processed += 1;
             result.paid_out += payout;
             visited += 1;
@@ -732,8 +963,11 @@ impl MultiYieldVault {
         if req.closed || req.remaining_shares <= 0 {
             return Err(Error::WithdrawalClosed);
         }
+        // The unpaid remainder is written off, so it leaves the liability too.
+        let written_off = req.remaining_shares;
         req.remaining_shares = 0;
         req.closed = true;
+        reduce_queued(&e, written_off);
         save_request(&e, id, &req);
 
         let mut queue = load_queue(&e);
@@ -744,6 +978,315 @@ impl MultiYieldVault {
             }
         }
         save_queue(&e, &queue);
+        Ok(())
+    }
+
+    // ── Withdrawal schedules ──────────────────────────────────────────────────
+
+    /// Create a standing instruction to withdraw `amount_per_execution` shares
+    /// on a timetable, paying each payout to `recipient`.
+    ///
+    /// The shares backing **every** execution are escrowed now, so the schedule
+    /// cannot fail later for want of funds and the escrowed shares cannot be
+    /// spent twice. `vault_balance` drops by the full escrow immediately, and
+    /// cancelling returns whatever has not fired yet.
+    ///
+    /// - `frequency`: `OneTime` fires a single time on `first_execution_ledger`;
+    ///   `Recurring` then fires every `interval_ledgers` up to and including
+    ///   `end_ledger`.
+    /// - `interval_ledgers` is ignored for `OneTime`, and must be non-zero for
+    ///   `Recurring`.
+    /// - `end_ledger` is ignored for `OneTime`, and must be at or after
+    ///   `first_execution_ledger` for `Recurring`.
+    ///
+    /// Returns the new schedule id.
+    pub fn schedule_withdrawals(
+        e: Env,
+        owner: Address,
+        recipient: Address,
+        amount_per_execution: i128,
+        frequency: ScheduleFrequency,
+        first_execution_ledger: u32,
+        interval_ledgers: u32,
+        end_ledger: u32,
+    ) -> Result<u32, Error> {
+        owner.require_auth();
+        load_vault(&e)?;
+
+        // The first execution has to be in the future, otherwise the schedule
+        // would be due before it could ever be observed.
+        if first_execution_ledger <= e.ledger().sequence() {
+            return Err(Error::InvalidSchedule);
+        }
+
+        let (total_executions, escrow) = plan_executions(
+            amount_per_execution,
+            &frequency,
+            first_execution_ledger,
+            interval_ledgers,
+            end_ledger,
+        )?;
+
+        // The escrow must fit in what the owner holds *and* has not already
+        // promised to another schedule.
+        let cur: i128 = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(owner.clone()))
+            .unwrap_or(0);
+        let spendable = cur - escrowed_of(&e, &owner);
+        if escrow > spendable {
+            return Err(Error::InsufficientShares);
+        }
+
+        let mut schedules = load_schedules(&e);
+        if schedules.len() >= MAX_SCHEDULES {
+            return Err(Error::TooManySchedules);
+        }
+
+        // A one-time schedule has exactly one due ledger, so record it as the
+        // end too.  Otherwise `end_ledger` would stay 0 and the due-check
+        // ("not past the end") would treat the schedule as already expired.
+        let effective_end_ledger = match frequency {
+            ScheduleFrequency::OneTime => first_execution_ledger,
+            ScheduleFrequency::Recurring => end_ledger,
+        };
+
+        let id: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::NextScheduleId)
+            .unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&DataKey::NextScheduleId, &(id + 1));
+
+        let schedule = WithdrawalSchedule {
+            id,
+            owner: owner.clone(),
+            recipient: recipient.clone(),
+            amount_per_execution,
+            frequency: frequency.clone(),
+            interval_ledgers,
+            next_execution_ledger: first_execution_ledger,
+            end_ledger: effective_end_ledger,
+            total_executions,
+            executions: 0,
+            closed: false,
+        };
+        save_schedule(&e, id, &schedule);
+        schedules.push_back(id);
+        save_schedules(&e, &schedules);
+
+        // Reserve the shares. They stay in the owner's balance and in
+        // `total_shares`; only `withdraw` is held off them.
+        adjust_escrowed(&e, &owner, escrow);
+        e.events().publish(
+            (Symbol::new(&e, "withdrawal_scheduled"), owner, id),
+            (
+                recipient,
+                amount_per_execution,
+                first_execution_ledger,
+                interval_ledgers,
+                total_executions,
+                frequency,
+            ),
+        );
+
+        Ok(id)
+    }
+
+    /// Fire every schedule that is due, paying each one to its recipient.
+    ///
+    /// Soroban has no scheduler, so "automatic" means permissionless: anyone may
+    /// call this, and it settles every schedule whose `next_execution_ledger`
+    /// has arrived. Each schedule fires at most once per call, so a keeper that
+    /// calls once per ledger keeps a schedule on time.
+    ///
+    /// A due schedule cannot fail for want of funds — its shares were escrowed
+    /// at creation — so the worst case is a partial token payout, which falls
+    /// back to the ordinary withdrawal queue exactly as `withdraw` does.
+    ///
+    /// `max_schedules` bounds how many are inspected per call; 0 means
+    /// `MAX_SCHEDULES`.
+    pub fn execute_scheduled_withdrawals(
+        e: Env,
+        max_schedules: u32,
+    ) -> Result<ScheduleExecutionResult, Error> {
+        let deposit_token = load_vault(&e)?.deposit_token;
+        let budget = if max_schedules == 0 {
+            MAX_SCHEDULES
+        } else {
+            max_schedules.min(MAX_SCHEDULES)
+        };
+
+        let mut schedules = load_schedules(&e);
+        let mut result = ScheduleExecutionResult {
+            considered: 0,
+            executed: 0,
+            paid_out: 0,
+            remaining: schedules.len(),
+        };
+        if schedules.len() == 0 {
+            return Ok(result);
+        }
+
+        let now = e.ledger().sequence();
+        let mut i = 0u32;
+        // Walk in creation order and compact the list as schedules close, so a
+        // finished schedule does not linger and cost gas forever.
+        while i < schedules.len() && result.considered < budget {
+            let id = schedules.get(i).unwrap();
+            let mut schedule = load_schedule(&e, id)?;
+            result.considered += 1;
+
+            if schedule.closed || schedule.executions >= schedule.total_executions {
+                schedule.closed = true;
+                save_schedule(&e, id, &schedule);
+                schedules.remove(i);
+                continue;
+            }
+
+            if now < schedule.next_execution_ledger || now > schedule.end_ledger {
+                i += 1;
+                continue;
+            }
+
+            // Reloaded each round: the queue entry written below for a partial
+            // execution updates the vault, so a cached copy would go stale.
+            let mut vault = load_vault(&e)?;
+            let amount = schedule.amount_per_execution;
+
+            // Defensive.  The reservation is validated against the balance when
+            // the schedule is created and `withdraw` is held off the reserved
+            // shares, so the owner must still hold this tranche.  Checked before
+            // any LP is redeemed: skipping here leaves the schedule intact for a
+            // later call instead of stranding half-redeemed positions.
+            let owner_key = DataKey::Balance(schedule.owner.clone());
+            let owner_balance: i128 = e.storage().persistent().get(&owner_key).unwrap_or(0);
+            if owner_balance < amount {
+                i += 1;
+                continue;
+            }
+
+            // Redeem this execution's reserved shares across the pools. Because
+            // they were only reserved — never removed from `total_shares` — this
+            // is exactly the redemption an ordinary `withdraw` of the same size
+            // would perform.
+            let mut pools = load_pools(&e);
+            let mut total_received: i128 = 0;
+            for p in 0..pools.len() {
+                let mut alloc = pools.get(p).unwrap();
+                if alloc.lp_shares == 0 || vault.total_shares == 0 {
+                    continue;
+                }
+                let lp_to_burn = alloc.lp_shares * amount / vault.total_shares;
+                if lp_to_burn == 0 {
+                    continue;
+                }
+                let client = AmmPoolClient::new(&e, &alloc.pool);
+                let (out_a, out_b) = client.withdraw(&e.current_contract_address(), &lp_to_burn);
+                total_received += if alloc.deposit_is_a { out_a } else { out_b };
+                alloc.lp_shares -= lp_to_burn;
+                pools.set(p, alloc);
+            }
+            save_pools(&e, &pools);
+
+            // Spend the reservation and burn the shares, exactly as `withdraw`
+            // would have for the owner.
+            adjust_escrowed(&e, &schedule.owner, -amount);
+            e.storage()
+                .persistent()
+                .set(&owner_key, &(owner_balance - amount));
+            e.storage()
+                .persistent()
+                .extend_ttl(&owner_key, TTL_LEDGERS, TTL_LEDGERS);
+            vault.total_shares -= amount;
+            save_vault(&e, &vault);
+
+            let payout = pay_out(
+                &e,
+                &deposit_token,
+                &schedule.recipient,
+                total_received.min(amount),
+            );
+            let remainder = amount - payout;
+
+            if remainder > 0 {
+                // The pools could not cover this execution in full. The unpaid
+                // part rides the same queue an ordinary partial withdrawal uses.
+                enqueue_request(&e, &schedule.recipient, remainder)?;
+            }
+
+            schedule.executions += 1;
+            let finished = schedule.executions >= schedule.total_executions;
+            if finished {
+                schedule.closed = true;
+            } else {
+                schedule.next_execution_ledger = schedule
+                    .next_execution_ledger
+                    .saturating_add(schedule.interval_ledgers);
+            }
+            save_schedule(&e, id, &schedule);
+
+            result.executed += 1;
+            result.paid_out += payout;
+
+            e.events().publish(
+                (Symbol::new(&e, "scheduled_withdrawal_executed"), id),
+                (
+                    schedule.owner,
+                    schedule.recipient,
+                    amount,
+                    payout,
+                    schedule.executions,
+                    schedule.total_executions,
+                ),
+            );
+
+            if finished {
+                schedules.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        save_schedules(&e, &schedules);
+        result.remaining = schedules.len();
+        Ok(result)
+    }
+
+    /// Cancel a schedule and release the shares it had reserved but not yet paid
+    /// out.  Only the owner may cancel, and only while the schedule is still
+    /// open — once every execution has fired there is nothing left to release.
+    pub fn cancel_withdrawal_schedule(e: Env, owner: Address, id: u32) -> Result<(), Error> {
+        owner.require_auth();
+        let mut schedule = load_schedule(&e, id)?;
+        if schedule.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+        if schedule.closed || schedule.executions >= schedule.total_executions {
+            return Err(Error::ScheduleClosed);
+        }
+
+        let remaining_executions = schedule.total_executions - schedule.executions;
+        let released = schedule
+            .amount_per_execution
+            .checked_mul(remaining_executions as i128)
+            .ok_or(Error::InvalidAmount)?;
+
+        schedule.closed = true;
+        save_schedule(&e, id, &schedule);
+        remove_from_schedules(&e, id);
+
+        // The shares were only ever reserved, so releasing them is a matter of
+        // making them withdrawable again — no balance movement needed.
+        adjust_escrowed(&e, &owner, -released);
+
+        e.events().publish(
+            (Symbol::new(&e, "withdrawal_schedule_cancelled"), id),
+            (owner, released, remaining_executions),
+        );
         Ok(())
     }
 
@@ -905,6 +1448,51 @@ impl MultiYieldVault {
             aprs.push_back(estimate_apr_bps(fee_bps, vault.volume_proxy_bps));
         }
         Ok(aprs)
+    }
+
+    /// A single withdrawal schedule, or `None` when the id was never issued.
+    pub fn get_withdrawal_schedule(e: Env, id: u32) -> Option<WithdrawalSchedule> {
+        e.storage().persistent().get(&schedule_key(id))
+    }
+
+    /// Ids of the open withdrawal schedules, in creation order.
+    pub fn get_withdrawal_schedules(e: Env) -> Vec<u32> {
+        load_schedules(&e)
+    }
+
+    /// How many withdrawal schedules are still open.
+    pub fn schedule_count(e: Env) -> u32 {
+        load_schedules(&e).len()
+    }
+
+    /// Shares `user` has reserved across all their open withdrawal schedules.
+    ///
+    /// Included in `vault_balance` but not withdrawable until the schedule fires
+    /// or is cancelled.
+    pub fn escrowed_shares(e: Env, user: Address) -> i128 {
+        escrowed_of(&e, &user)
+    }
+
+    /// Ids of the schedules due to fire on `ledger`, in creation order.
+    ///
+    /// Lets a keeper decide whether a call to `execute_scheduled_withdrawals`
+    /// would do anything, without paying to execute it speculatively.
+    pub fn due_schedules(e: Env, ledger: u32) -> Vec<u32> {
+        let schedules = load_schedules(&e);
+        let mut due = Vec::new(&e);
+        for i in 0..schedules.len() {
+            let id = schedules.get(i).unwrap();
+            if let Ok(schedule) = load_schedule(&e, id) {
+                if !schedule.closed
+                    && schedule.executions < schedule.total_executions
+                    && ledger >= schedule.next_execution_ledger
+                    && ledger <= schedule.end_ledger
+                {
+                    due.push_back(id);
+                }
+            }
+        }
+        due
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
