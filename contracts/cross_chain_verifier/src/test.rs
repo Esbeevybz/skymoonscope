@@ -19,7 +19,12 @@ fn make_payload(env: &Env, nonce: u64) -> Payload {
     }
 }
 
-fn compute_leaf(env: &Env, payload: &Payload) -> BytesN<32> {
+fn merkle_hash_pair(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    crate::merkle_node_hash(env, left, right)
+}
+
+/// The leaf value the contract is asked to prove inclusion of: the payload hash.
+fn raw_leaf(env: &Env, payload: &Payload) -> BytesN<32> {
     CrossChainVerifier::compute_payload_hash(env, payload)
 }
 
@@ -132,8 +137,6 @@ fn test_verify_message_success() {
     let mut proof_flags = Vec::new(&env);
     proof_flags.push_back(true);
     proof_flags.push_back(false);
-    proof_flags.push_back(true); // left
-    proof_flags.push_back(false); // right
 
     let result = client.verify_message(&block_height, &payload, &proof, &proof_flags);
     assert!(result);

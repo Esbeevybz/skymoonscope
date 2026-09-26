@@ -511,3 +511,69 @@ fn test_partial_burn() {
         "remaining burn should also recover tokens"
     );
 }
+
+// -- Tick range validation (issue #75) -----------------------------------------
+
+/// `mint` must reject `tick_lower >= tick_upper` rather than quietly creating a
+/// zero-liquidity position (issue #75).
+#[test]
+fn test_mint_rejects_inverted_tick_range() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let (token_a, token_b, admin_a, admin_b) = setup_tokens(&e);
+    let client = setup_amm(&e, &token_a, &token_b);
+
+    let lp = Address::generate(&e);
+    admin_a.mint(&lp, &1_000_000);
+    admin_b.mint(&lp, &1_000_000);
+
+    // lower > upper
+    let inverted = client.try_mint(&lp, &100, &-100, &1_000, &1_000);
+    assert_eq!(inverted, Err(Ok(crate::Error::InvalidTickRange)));
+
+    // lower == upper, the degenerate case the issue calls out
+    let degenerate = client.try_mint(&lp, &0, &0, &1_000, &1_000);
+    assert_eq!(degenerate, Err(Ok(crate::Error::InvalidTickRange)));
+
+    // A valid range is still accepted, so the guard is not over-broad.
+    assert!(client.try_mint(&lp, &-100, &100, &1_000, &1_000).is_ok());
+}
+
+/// The same guard applies to the other tick-taking entry points.
+#[test]
+fn test_other_entry_points_reject_inverted_tick_ranges() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (token_a, token_b, _admin_a, _admin_b) = setup_tokens(&e);
+    let client = setup_amm(&e, &token_a, &token_b);
+
+    let lp = Address::generate(&e);
+
+    let burn = client.try_burn(&lp, &100, &-100, &1);
+    assert_eq!(burn, Err(Ok(crate::Error::InvalidTickRange)));
+
+    let fees = client.try_collect_fees(&lp, &100, &-100);
+    assert_eq!(fees, Err(Ok(crate::Error::InvalidTickRange)));
+}
+
+/// Out-of-bounds ranges are rejected too, so a valid ordering is not enough.
+#[test]
+fn test_mint_rejects_out_of_bounds_ticks() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let (token_a, token_b, _admin_a, _admin_b) = setup_tokens(&e);
+    let client = setup_amm(&e, &token_a, &token_b);
+
+    let lp = Address::generate(&e);
+
+    let too_low = client.try_mint(&lp, &crate::math::MIN_TICK - 10, &0, &1, &1);
+    assert_eq!(too_low, Err(Ok(crate::Error::InvalidTickRange)));
+
+    let too_high = client.try_mint(&lp, &0, &crate::math::MAX_TICK + 10, &1, &1);
+    assert_eq!(too_high, Err(Ok(crate::Error::InvalidTickRange)));
+}

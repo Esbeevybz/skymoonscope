@@ -203,8 +203,9 @@ fn test_stale_source_excluded_when_three_fresh_remain() {
     let aggregator_id = env.register(OracleAggregator, ());
     let client = OracleAggregatorClient::new(&env, &aggregator_id);
 
-    // max_age_seconds = 60 → stale source (age 500 s) is excluded.
-    // We now reject the entire aggregation if any source is stale.
+    // max_age_seconds = 60 → the stale source (age 500 s) is excluded, but the
+    // three fresh sources still carry the aggregate: one lagging oracle must not
+    // halt aggregation (issue #71).
     let sources = Vec::from_array(&env, [fresh_100, fresh_101, fresh_99, stale]);
     assert_eq!(client.aggregate_price(&sources, &60), 100);
 }
@@ -219,11 +220,11 @@ fn test_returns_oracle_staleness_when_too_few_fresh_sources() {
     let aggregator_id = env.register(OracleAggregator, ());
     let client = OracleAggregatorClient::new(&env, &aggregator_id);
 
-    // Stale sources now trigger InvalidOraclePrice.
+    // Stale sources trigger StalePriceFeed, distinct from a bad price value.
     let sources = Vec::from_array(&env, [fresh_100, stale, stale2]);
     assert_eq!(
         client.try_aggregate_price(&sources, &60),
-        Err(Ok(Error::InvalidOraclePrice))
+        Err(Ok(Error::StalePriceFeed))
     );
 }
 
@@ -241,7 +242,7 @@ fn test_all_stale_returns_oracle_staleness() {
     let sources = Vec::from_array(&env, [stale, stale2, stale3]);
     assert_eq!(
         client.try_aggregate_price(&sources, &60),
-        Err(Ok(Error::InvalidOraclePrice))
+        Err(Ok(Error::StalePriceFeed))
     );
 }
 
@@ -483,4 +484,65 @@ fn test_initialize_rejects_zero_window() {
     let aggregator_id = env.register(OracleAggregator, ());
     let client = OracleAggregatorClient::new(&env, &aggregator_id);
     assert_eq!(client.try_initialize(&0), Err(Ok(Error::InvalidWindow)));
+}
+
+// ---------------------------------------------------------------------------
+// Staleness is reported distinctly, and a stale feed never reaches the median
+// ---------------------------------------------------------------------------
+
+/// A stale feed in the middle of the list is skipped, and the aggregate still
+/// comes from the fresh feeds.
+#[test]
+fn test_stale_feed_in_the_middle_is_skipped() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+    let (fresh_100, fresh_101, _, stale, _, _) = register_all(&env);
+    let aggregator_id = env.register(OracleAggregator, ());
+    let client = OracleAggregatorClient::new(&env, &aggregator_id);
+
+    let sources = Vec::from_array(&env, [fresh_100, stale, fresh_101]);
+    assert_eq!(client.aggregate_price(&sources, &60), 100);
+}
+
+/// A stale feed is surfaced as `StalePriceFeed`, not as `InvalidOraclePrice`:
+/// the value may be perfectly well-formed, it is just too old to act on.
+#[test]
+fn test_stale_feed_error_is_distinct_from_invalid_price() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+    let (_, _, _, stale, _, _) = register_all(&env);
+    let aggregator_id = env.register(OracleAggregator, ());
+    let client = OracleAggregatorClient::new(&env, &aggregator_id);
+
+    let sources = Vec::from_array(&env, [stale.clone(), stale.clone(), stale]);
+    assert_eq!(
+        client.try_aggregate_price(&sources, &60),
+        Err(Ok(Error::StalePriceFeed))
+    );
+    assert_ne!(Error::StalePriceFeed, Error::InvalidOraclePrice);
+}
+
+/// Exactly at the threshold boundary the feed is still accepted; only strictly
+/// older records are stale.
+#[test]
+fn test_feed_exactly_at_max_age_is_accepted() {
+    let env = Env::default();
+    // stale_source's timestamp is `now - 500`.
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+
+    let (fresh_100, fresh_101, fresh_99, stale, _, _) = register_all(&env);
+    let aggregator_id = env.register(OracleAggregator, ());
+    let client = OracleAggregatorClient::new(&env, &aggregator_id);
+
+    let sources = Vec::from_array(&env, [fresh_100, fresh_101, fresh_99, stale]);
+
+    // age == max_age_seconds → fresh.
+    assert_eq!(client.aggregate_price(&sources, &500), 100);
+    // age > max_age_seconds → stale.
+    assert_eq!(
+        client.try_aggregate_price(&sources, &499),
+        Err(Ok(Error::StalePriceFeed))
+    );
 }

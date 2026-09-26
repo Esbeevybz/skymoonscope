@@ -157,7 +157,7 @@ fn test_large_price_accumulation_no_overflow() {
 }
 
 #[test]
-fn test_u128_wrapping_does_not_panic() {
+fn test_overflow_is_rejected_instead_of_wrapping() {
     let e = Env::default();
     e.ledger().with_mut(|li| li.timestamp = 0);
 
@@ -169,19 +169,47 @@ fn test_u128_wrapping_does_not_panic() {
 
     client.initialize(&token_a, &token_b, &1);
 
-    // Use extremely large values that would overflow i128 but are handled safely by u128 wrapping.
+    // A price at the very top of the i128 range, so price * elapsed cannot fit
+    // in the u128 accumulator.
     let max_price: i128 = i128::MAX;
 
     assert_eq!(client.update_price(&max_price), Ok(()));
 
-    // Advance by a large amount
+    // Advance far enough that `max_price * elapsed` exceeds u128::MAX.
     e.ledger().with_mut(|li| li.timestamp = 1_000_000);
 
-    // This multiplication would overflow i128, but u128 wrapping handles it gracefully.
-    let result = client.update_price(&max_price);
-    // The update should succeed without panicking.
-    assert_eq!(result, Ok(()));
+    // Issue #085: this used to wrap silently and corrupt the accumulator. It is
+    // now rejected, leaving the stored state untouched.
+    assert_eq!(
+        client.update_price(&max_price),
+        Err(Error::ArithmeticOverflow)
+    );
 
-    // get_twap should not panic either.
-    let _twap = client.get_twap();
+    // Still consistent: no partial accumulation was written.
+    assert_eq!(client.get_twap(), 0);
+}
+
+#[test]
+fn test_accumulation_just_below_overflow_succeeds() {
+    let e = Env::default();
+    e.ledger().with_mut(|li| li.timestamp = 0);
+
+    let contract_id = e.register(TwapOracle, ());
+    let client = TwapOracleClient::new(&e, &contract_id);
+
+    let token_a = Address::generate(&e);
+    let token_b = Address::generate(&e);
+
+    client.initialize(&token_a, &token_b, &1);
+
+    // price * elapsed = 1e18 * 1e18 = 1e36 < u128::MAX (~3.4e38).
+    let price: i128 = 1_000_000_000_000_000_000;
+    let elapsed: u64 = 1_000_000_000_000_000_000;
+
+    assert_eq!(client.update_price(&price), Ok(()));
+
+    e.ledger().with_mut(|li| li.timestamp = elapsed);
+
+    assert_eq!(client.update_price(&price), Ok(()));
+    assert_eq!(client.get_twap(), price);
 }

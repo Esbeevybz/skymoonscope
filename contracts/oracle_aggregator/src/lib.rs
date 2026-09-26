@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 /// Default rolling window for TWAP samples (1 hour).
 const DEFAULT_TWAP_WINDOW_SECONDS: u64 = 3_600;
@@ -24,6 +24,13 @@ pub enum Error {
     InvalidWindow = 6,
     /// Returned when an oracle returns a stale price.
     InvalidOraclePrice = 7,
+    /// Returned when a price feed is older than `max_age_seconds`, and when too
+    /// few fresh feeds remain to produce a trustworthy aggregate (issue #71).
+    ///
+    /// Distinct from `InvalidOraclePrice`: a stale feed is not a bad value, it
+    /// is a value that is too old to act on, and the two need different
+    /// operational responses.
+    StalePriceFeed = 8,
 }
 
 /// A price record returned by an oracle source, including a Unix timestamp
@@ -101,7 +108,9 @@ impl OracleAggregator {
     ///
     /// # Errors
     /// - `NotEnoughSources`        – fewer than 3 source addresses provided.
-    /// - `OracleStaleness`         – fewer than 3 sources returned a fresh price.
+    /// - `StalePriceFeed`          – a feed was older than `max_age_seconds`, or
+    ///                               fewer than 3 feeds were fresh enough to
+    ///                               aggregate.
     /// - `NotEnoughValidPrices`    – fewer than 3 sources returned a valid (> 0) price.
     /// - `NotEnoughReliableSources`– after outlier filtering, fewer than 3 prices remain.
     pub fn aggregate_price(
@@ -115,6 +124,7 @@ impl OracleAggregator {
 
         let now = env.ledger().timestamp();
         let mut fresh_count: u32 = 0;
+        let mut stale_count: u32 = 0;
         let mut prices = Vec::new(&env);
 
         for idx in 0..sources.len() {
@@ -125,11 +135,23 @@ impl OracleAggregator {
                 Ok(Ok(record)) => record,
                 _ => continue,
             };
-            // Reject stale prices: price is stale if its timestamp is older
-            // than `max_age_seconds` before the current ledger time.
+
+            // Reject stale prices: a record is stale when its timestamp is older
+            // than `max_age_seconds` relative to the current ledger time.
+            //
+            // A stale feed is skipped rather than aborting the whole call. One
+            // lagging oracle must not be able to halt aggregation while the
+            // remaining feeds are healthy — a stale price feeding a CDP can
+            // trigger incorrect liquidations, which is exactly what issue #71 is
+            // about, so stale feeds are reported via an event and never used.
             let age = now.saturating_sub(record.timestamp);
             if age > max_age_seconds {
-                return Err(Error::InvalidOraclePrice);
+                stale_count += 1;
+                env.events().publish(
+                    (Symbol::new(&env, "stale_feed"), source),
+                    (record.timestamp, age, max_age_seconds),
+                );
+                continue;
             }
 
             fresh_count += 1;
@@ -139,9 +161,15 @@ impl OracleAggregator {
             }
         }
 
-        // Need at least 3 fresh (non-stale) sources even before validity check.
+        // Too few feeds survived the staleness check to produce a trustworthy
+        // aggregate. Surface the staleness specifically rather than as a generic
+        // "not enough valid prices" error.
         if fresh_count < 3 {
-            return Err(Error::OracleStaleness);
+            return Err(if stale_count > 0 {
+                Error::StalePriceFeed
+            } else {
+                Error::OracleStaleness
+            });
         }
 
         if prices.len() < 3 {
