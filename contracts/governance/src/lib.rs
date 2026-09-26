@@ -29,6 +29,9 @@ pub enum Error {
     InvalidExecutionThreshold = 13,
     DuplicateAdmin = 14,
     InsufficientApprovals = 15,
+    /// `execute_proposal` was called before `execution_delay_ledgers` had
+    /// elapsed since voting closed (issue #68).
+    ExecutionDelayNotElapsed = 16,
 }
 
 #[contracttype]
@@ -38,6 +41,13 @@ pub struct GovernanceConfig {
     pub min_voting_units: i128,
     pub identity_required: bool,
     pub execution_threshold: u32,
+    /// Ledgers that must pass between the end of voting and execution of a
+    /// passed proposal (issue #68).
+    ///
+    /// Without this window a proposal becomes executable the instant voting
+    /// closes, leaving token holders no opportunity to react to — or veto — a
+    /// proposal that turns out to be malicious.
+    pub execution_delay_ledgers: u32,
 }
 
 #[contracttype]
@@ -85,6 +95,9 @@ pub enum DataKey {
     Receipt(u32, Address),
     ExecutionAdmins,
     ExecutionThreshold,
+    /// Ledgers that must elapse after voting closes before a passed proposal can
+    /// be executed (issue #68).
+    ExecutionDelayLedgers,
 }
 
 fn sqrt(x: i128) -> i128 {
@@ -174,12 +187,18 @@ fn get_config(env: &Env) -> Result<GovernanceConfig, Error> {
         .instance()
         .get(&DataKey::ExecutionThreshold)
         .unwrap_or(1u32);
+    let execution_delay_ledgers = env
+        .storage()
+        .instance()
+        .get(&DataKey::ExecutionDelayLedgers)
+        .unwrap_or(0u32);
 
     Ok(GovernanceConfig {
         admin,
         min_voting_units,
         identity_required,
         execution_threshold,
+        execution_delay_ledgers,
     })
 }
 
@@ -206,6 +225,7 @@ impl GovernanceContract {
         admin: Address,
         min_voting_units: i128,
         identity_required: bool,
+        execution_delay_ledgers: u32,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -216,7 +236,15 @@ impl GovernanceContract {
 
         let mut admins = Vec::new(&env);
         admins.push_back(admin.clone());
-        Self::initialize_with_admins(env, admin, admins, 1, min_voting_units, identity_required)
+        Self::initialize_with_admins(
+            env,
+            admin,
+            admins,
+            1,
+            min_voting_units,
+            identity_required,
+            execution_delay_ledgers,
+        )
     }
 
     pub fn initialize_with_admins(
@@ -226,6 +254,7 @@ impl GovernanceContract {
         execution_threshold: u32,
         min_voting_units: i128,
         identity_required: bool,
+        execution_delay_ledgers: u32,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -263,8 +292,32 @@ impl GovernanceContract {
         env.storage()
             .instance()
             .set(&DataKey::ExecutionThreshold, &execution_threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::ExecutionDelayLedgers, &execution_delay_ledgers);
 
         Ok(())
+    }
+
+    /// Governance-controlled update of the execution delay.
+    ///
+    /// The delay is the window token holders have to react to a passed proposal
+    /// before it can be executed, so it is deliberately admin-settable rather
+    /// than fixed at deployment (issue #68).
+    pub fn set_execution_delay(env: Env, execution_delay_ledgers: u32) -> Result<(), Error> {
+        require_admin(&env)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::ExecutionDelayLedgers, &execution_delay_ledgers);
+        Ok(())
+    }
+
+    /// The configured execution delay, in ledgers.
+    pub fn execution_delay_ledgers(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ExecutionDelayLedgers)
+            .unwrap_or(0)
     }
 
     pub fn get_execution_admins(env: Env) -> Result<Vec<Address>, Error> {
@@ -336,9 +389,7 @@ impl GovernanceContract {
                 .get(&DataKey::VoterList)
                 .unwrap_or_else(|| Vec::new(&env));
             voters.push_back(voter.clone());
-            env.storage()
-                .persistent()
-                .set(&DataKey::VoterList, &voters);
+            env.storage().persistent().set(&DataKey::VoterList, &voters);
         }
         env.storage().persistent().set(&voter_key, &profile);
         Ok(profile)
@@ -382,9 +433,10 @@ impl GovernanceContract {
                 voting_units_snapshot.set(voter.clone(), profile.voting_units);
             }
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::ProposalSnapshot(proposal_id), &voting_units_snapshot);
+        env.storage().persistent().set(
+            &DataKey::ProposalSnapshot(proposal_id),
+            &voting_units_snapshot,
+        );
         let proposal = Proposal {
             id: proposal_id,
             creator: admin,
@@ -428,9 +480,40 @@ impl GovernanceContract {
         if !proposal.open || env.ledger().sequence() <= proposal.voting_ends_at {
             return Err(Error::ProposalClosed);
         }
+
+        // Mandatory delay between the close of voting and execution (issue #68).
+        //
+        // Without this a passed proposal is executable the very next ledger,
+        // which leaves token holders no window in which to notice a malicious
+        // proposal and veto it. The delay is measured in ledgers from the end of
+        // the voting window, and `saturating_add` keeps it well-defined even if
+        // a proposal is created with a voting period at the far end of the
+        // ledger range.
+        let delay: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExecutionDelayLedgers)
+            .unwrap_or(0);
+        let earliest_execution = proposal.voting_ends_at.saturating_add(delay);
+        if env.ledger().sequence() < earliest_execution {
+            return Err(Error::ExecutionDelayNotElapsed);
+        }
+
         proposal.open = false;
         write_proposal(&env, &proposal);
         Ok(proposal)
+    }
+
+    /// The earliest ledger at which `proposal_id` may be executed, given the
+    /// current execution delay. Useful for front-ends and for integrators.
+    pub fn earliest_execution_ledger(env: Env, proposal_id: u32) -> Result<u32, Error> {
+        let proposal = get_proposal(&env, proposal_id)?;
+        let delay: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ExecutionDelayLedgers)
+            .unwrap_or(0);
+        Ok(proposal.voting_ends_at.saturating_add(delay))
     }
 
     pub fn quote_votes_for_credits(_env: Env, credits: i128) -> Result<i128, Error> {
