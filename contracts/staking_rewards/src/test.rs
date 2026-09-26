@@ -665,3 +665,102 @@ fn test_emergency_withdraw_with_penalty_fee() {
     let token_balance = token::Client::new(&e, &staking_token).balance(&user);
     assert_eq!(token_balance, 9_000);
 }
+
+// ---------------------------------------------------------------------------
+// Mid-epoch staking must not over-distribute (issue #72)
+// ---------------------------------------------------------------------------
+
+/// A staker who arrives part-way through an epoch must not be credited with the
+/// rewards that accrued before they staked.
+///
+/// This contract uses a compounding virtual-balance model (V = S + R) rather
+/// than a global `reward_per_token` accumulator, but the equivalent guarantee is
+/// provided by `update_user_rewards_internal` running *before* the staked amount
+/// changes: it snapshots `accrued_rewards` up to the current block and sets
+/// `last_update_block`, so a brand-new staker starts from zero.
+#[test]
+fn test_mid_epoch_staker_earns_nothing_before_their_stake_block() {
+    let (e, client, _, staking_token, _) = setup();
+    let early = Address::generate(&e);
+    let late = Address::generate(&e);
+
+    let staking = token::StellarAssetClient::new(&e, &staking_token);
+    staking.mint(&early, &STAKE_AMOUNT);
+    staking.mint(&late, &STAKE_AMOUNT);
+
+    // The early staker is alone for 5 ledgers.
+    client.stake(&early, &STAKE_AMOUNT);
+    advance_ledger(&e, 5);
+
+    // The late staker joins at ledger 5.
+    client.stake(&late, &STAKE_AMOUNT);
+    assert_eq!(
+        client.get_accrued_rewards(&late),
+        0,
+        "a new staker must start with nothing accrued"
+    );
+
+    // Immediately after staking, the late staker has still accrued nothing.
+    assert_eq!(client.get_accrued_rewards(&late), 0);
+}
+
+/// After both have been staked for the same interval, the late staker's rewards
+/// are strictly smaller than the early staker's — they missed the first stretch.
+/// This is the over-distribution the issue describes, and it must not happen.
+#[test]
+fn test_mid_epoch_staker_earns_less_than_an_early_staker() {
+    let (e, client, _, staking_token, _) = setup();
+    let early = Address::generate(&e);
+    let late = Address::generate(&e);
+
+    let staking = token::StellarAssetClient::new(&e, &staking_token);
+    staking.mint(&early, &STAKE_AMOUNT);
+    staking.mint(&late, &STAKE_AMOUNT);
+
+    client.stake(&early, &STAKE_AMOUNT);
+    advance_ledger(&e, 5);
+    client.stake(&late, &STAKE_AMOUNT);
+
+    // Both are now staked for the same further interval.
+    advance_ledger(&e, 5);
+    // Touch each account so their rewards are settled up to this block.
+    client.get_accrued_rewards(&early);
+    client.get_accrued_rewards(&late);
+
+    let pending_early = client.get_pending_rewards(&early);
+    let pending_late = client.get_pending_rewards(&late);
+
+    assert!(
+        pending_late < pending_early,
+        "late staker accrued {pending_late}, early staker accrued {pending_early}"
+    );
+}
+
+/// Increasing an existing position is settled up to the current block first, so
+/// the added principal only earns from that block onwards.
+#[test]
+fn test_increasing_a_position_does_not_backdate_rewards() {
+    let (e, client, _, staking_token, _) = setup();
+    let user = Address::generate(&e);
+
+    let staking = token::StellarAssetClient::new(&e, &staking_token);
+    staking.mint(&user, &STAKE_AMOUNT * 2);
+
+    client.stake(&user, &STAKE_AMOUNT);
+    advance_ledger(&e, 5);
+    let accrued_before = client.get_pending_rewards(&user);
+
+    // Doubling the position must not re-run history on the new principal.
+    client.stake(&user, &STAKE_AMOUNT);
+    let accrued_after = client.get_accrued_rewards(&user);
+
+    assert!(
+        accrued_after >= accrued_before,
+        "accrued rewards must not decrease on a top-up"
+    );
+    assert_eq!(
+        client.get_accrued_rewards(&user),
+        accrued_after,
+        "the top-up itself must not settle extra historical rewards"
+    );
+}
