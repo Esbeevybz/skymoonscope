@@ -81,18 +81,25 @@ impl Proxy {
             .unwrap()
     }
 
+    /// Assert the caller is authorised as the recorded admin.
+    ///
+    /// `Address::require_auth` is the only caller-identity primitive the SDK
+    /// exposes: it fails unless the transaction carries a valid authorization
+    /// entry for exactly this address, so no other account can reach any
+    /// function that goes through here (#080).
+    fn require_admin(env: &Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+    }
+
     /// Returns pending upgrade details if one exists
     pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
         env.storage().persistent().get(&DataKey::PendingUpgrade)
     }
+
     /// Step 1: Propose an upgrade with a 48-hour timelock delay
-    ///
-    /// Admin-only. There is deliberately no way to repoint the implementation
-    /// immediately: the only route to a new implementation is
-    /// propose -> timelock -> execute, so a compromised admin still cannot
-    /// silently swap in a malicious implementation (issue #80).
-    pub fn propose_upgrade(env: Env, new_implementation: Address) -> Result<(), Error> {
-        Self::require_admin(&env)?;
+    pub fn propose_upgrade(env: Env, new_implementation: Address) {
+        Self::require_admin(&env);
 
         let eta = env.ledger().timestamp() + TIMELOCK_DELAY;
         let proposal = PendingUpgrade {
@@ -110,8 +117,8 @@ impl Proxy {
     }
 
     /// Step 2: Execute the pending upgrade once 48 hours have passed
-    pub fn execute_upgrade(env: Env) -> Result<(), Error> {
-        Self::require_admin(&env)?;
+    pub fn execute_upgrade(env: Env) {
+        Self::require_admin(&env);
 
         let proposal: PendingUpgrade = env
             .storage()
@@ -135,10 +142,8 @@ impl Proxy {
     }
 
     /// Step 3: Admin can cancel a pending upgrade
-    ///
-    /// Admin-only.
-    pub fn cancel_upgrade(env: Env) -> Result<(), Error> {
-        Self::require_admin(&env)?;
+    pub fn cancel_upgrade(env: Env) {
+        Self::require_admin(&env);
 
         env.storage().persistent().remove(&DataKey::PendingUpgrade);
 
@@ -146,12 +151,20 @@ impl Proxy {
         Ok(())
     }
 
-    /// Backwards-compatible alias for [`Proxy::propose_upgrade`].
+    /// Legacy upgrade method kept for backward compatibility (delegates to proposal flow)
     ///
-    /// This routes through the timelock rather than setting the implementation
-    /// directly, which is exactly what the previous duplicate `upgrade_to` did.
-    pub fn upgrade_to(env: Env, implementation: Address) -> Result<(), Error> {
-        Self::propose_upgrade(env, implementation)
+    /// Retained name, but the behaviour is the timelocked proposal: an upgrade
+    /// is never applied immediately, so this alias cannot be used to skip the
+    /// 48-hour delay.
+    pub fn upgrade_to(env: Env, implementation: Address) {
+        Self::propose_upgrade(env, implementation);
+    }
+
+    /// Transfer proxy administration. Admin only.
+    pub fn set_admin(env: Env, new_admin: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.events().publish((symbol_short!("admin"),), new_admin);
     }
 
     /// Execute the pending upgrade (after timelock) and immediately call a method on the new implementation.
@@ -162,8 +175,8 @@ impl Proxy {
         implementation: Address,
         method: Symbol,
         args: Vec<Val>,
-    ) -> Result<Val, Error> {
-        Self::require_admin(&env)?;
+    ) -> Val {
+        Self::require_admin(&env);
 
         let proposal: PendingUpgrade = env
             .storage()
@@ -200,9 +213,7 @@ impl Proxy {
         let method = Symbol::new(&env, "calculate");
         let args: Vec<Val> = Vec::from_array(&env, [current.into_val(&env), amount.into_val(&env)]);
         let next: i32 = env.invoke_contract(&Self::get_implementation(env.clone()), &method, args);
-        // Write the counter directly rather than through `set_value`, which is
-        // now admin-gated; `increment` is callable by anyone by design.
-        env.storage().instance().set(&DataKey::Counter, &next);
+        Self::write_value(&env, next);
         next
     }
 
@@ -210,22 +221,25 @@ impl Proxy {
         env.storage().instance().get(&DataKey::Counter).unwrap_or(0)
     }
 
-    /// Direct counter write.
+    /// Overwrite the proxied counter. Admin only.
     ///
-    /// Admin-only, for the same reason as the upgrade path (issue #80): leaving
-    /// an unauthenticated state-mutating entry point on a proxy undermines the
-    /// admin check that guards the logic.
-    pub fn set_value(env: Env, value: i32) -> Result<(), Error> {
-        Self::require_admin(&env)?;
+    /// This used to be unguarded, so any caller could set the counter that
+    /// `increment` treats as its starting state (#080).  `increment` writes
+    /// through `write_value` instead, which is deliberately not an entry point.
+    pub fn set_value(env: Env, value: i32) {
+        Self::require_admin(&env);
+        Self::write_value(&env, value);
+    }
+
+    /// Internal counter write. Not a contract entry point, so not callable
+    /// directly and not subject to the admin check.
+    fn write_value(env: &Env, value: i32) {
         env.storage().instance().set(&DataKey::Counter, &value);
         Ok(())
     }
 
-    /// Arbitrary storage write used by the implementation for its own state.
-    ///
-    /// Admin-only, for the same reason as the upgrade path.
-    pub fn set_storage(env: Env, key: BytesN<32>, value: Val) -> Result<(), Error> {
-        Self::require_admin(&env)?;
+    pub fn set_storage(env: Env, key: BytesN<32>, value: Val) {
+        Self::require_admin(&env);
         env.storage()
             .persistent()
             .set(&DataKey::Storage(key), &value);

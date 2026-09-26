@@ -375,6 +375,152 @@ fn test_rotate_and_remove_verification_method() {
     assert_eq!(doc_after_removal.verification_method.len(), 0);
 }
 
+// ── Per-DID ownership (issue #079) ────────────────────────────────────────────
+
+fn empty_document(env: &Env, did: &String) -> DIDDocument {
+    DIDDocument {
+        context: Vec::from_array(env, [String::from_str(env, "https://www.w3.org/ns/did/v1")]),
+        id: did.clone(),
+        verification_method: Vec::new(env),
+        authentication: Vec::new(env),
+        assertion_method: Vec::new(env),
+        key_agreement: Vec::new(env),
+        capability_invocation: Vec::new(env),
+        capability_delegation: Vec::new(env),
+        service: Vec::new(env),
+    }
+}
+
+#[test]
+fn test_registered_did_is_owned_by_registry_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let did = String::from_str(&env, "did:example:owned");
+    let document = empty_document(&env, &did);
+    client.register_did(&did, &document, &None);
+
+    assert_eq!(client.get_did_owner(&did), Some(owner));
+}
+
+#[test]
+fn test_unregistered_did_has_no_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let did = String::from_str(&env, "did:example:missing");
+    assert_eq!(client.get_did_owner(&did), None);
+}
+
+#[test]
+fn test_document_cannot_be_rewritten_without_authorization() {
+    let env = Env::default();
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+    let did = String::from_str(&env, "did:example:guarded");
+    let document = empty_document(&env, &did);
+
+    // Register while the owner authorizes, then withdraw all authorization so
+    // any later call fails the `require_auth` on the DID's owner.
+    env.mock_all_auths();
+    client.initialize(&owner);
+    client.register_did(&did, &document, &None);
+
+    env.set_auths(&[]);
+
+    let mut tampered = document.clone();
+    tampered
+        .context
+        .push_back(String::from_str(&env, "https://evil.example/context"));
+    assert!(client.try_update_did_document(&did, &tampered).is_err());
+
+    let method = VerificationMethod {
+        id: String::from_str(&env, "key-evil"),
+        type_: String::from_str(&env, "Ed25519VerificationKey2020"),
+        controller: Address::generate(&env),
+        public_key_multibase: Bytes::from_array(&env, &[9, 9, 9]),
+    };
+    assert!(client.try_add_verification_method(&did, &method).is_err());
+    assert!(client
+        .try_add_service(
+            &did,
+            &Service {
+                id: String::from_str(&env, "svc-evil"),
+                type_: String::from_str(&env, "LinkedDomains"),
+                service_endpoint: String::from_str(&env, "https://evil.example"),
+            },
+        )
+        .is_err());
+    assert!(client.try_revoke_did(&did).is_err());
+
+    // The document on chain is untouched.
+    let stored = client.get_did_document(&did);
+    assert_eq!(stored.context.len(), 1);
+    assert_eq!(stored.verification_method.len(), 0);
+    assert_eq!(stored.service.len(), 0);
+}
+
+#[test]
+fn test_transfer_did_ownership_moves_control() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let did = String::from_str(&env, "did:example:handoff");
+    let document = empty_document(&env, &did);
+    client.register_did(&did, &document, &None);
+
+    client.transfer_did_ownership(&did, &new_owner);
+    assert_eq!(client.get_did_owner(&did), Some(new_owner.clone()));
+
+    // Still mutable with authorization present, now under the new owner.
+    let mut updated = document.clone();
+    updated
+        .context
+        .push_back(String::from_str(&env, "https://new.example/context"));
+    client.update_did_document(&did, &updated);
+    assert_eq!(client.get_did_document(&did).context.len(), 2);
+}
+
+#[test]
+fn test_mutating_missing_did_reports_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let did = String::from_str(&env, "did:example:absent");
+    let method = VerificationMethod {
+        id: String::from_str(&env, "key-1"),
+        type_: String::from_str(&env, "Ed25519VerificationKey2020"),
+        controller: owner.clone(),
+        public_key_multibase: Bytes::from_array(&env, &[1, 2, 3]),
+    };
+
+    // Previously this panicked on an unwrap of a missing document; it now fails
+    // with an explicit "DID not found".
+    assert!(client.try_add_verification_method(&did, &method).is_err());
+}
+
 #[test]
 #[should_panic(expected = "invalid DID URI format")]
 fn test_invalid_did_uri() {
