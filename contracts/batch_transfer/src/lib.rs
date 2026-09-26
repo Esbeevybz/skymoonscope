@@ -1,6 +1,9 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, IntoVal,
+    String, Symbol, Val, Vec,
+};
 
 #[cfg(test)]
 mod test;
@@ -14,6 +17,11 @@ pub enum Error {
     InvalidAmount = 3,
     InsufficientBalance = 4,
     TooManyRecipients = 5,
+    /// A transfer was rejected by the token contract itself.
+    ///
+    /// In `AllOrNothing` mode this aborts the whole call, which reverts every
+    /// transfer already performed in this batch.
+    TransferFailed = 6,
 }
 
 /// Aggregate outcome of a batch, returned by `execute_batch`.
@@ -54,6 +62,8 @@ pub enum TransferFailure {
     None,
     InvalidAmount,
     InsufficientBalance,
+    /// The token contract rejected this individual transfer.
+    TransferFailed,
 }
 
 #[contracttype]

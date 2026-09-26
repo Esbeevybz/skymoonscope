@@ -7,34 +7,47 @@ use soroban_sdk::{contract, contractimpl, Address, Bytes, Env, String, Symbol, V
 pub trait DIDRegistryTrait {
     fn initialize(e: Env, owner: Address);
 
-    fn register_did(e: Env, did: String, document: DIDDocument, expiration_timestamp: Option<u64>);
+    fn register_did(
+        e: Env,
+        did: String,
+        document: DIDDocument,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<(), Error>;
 
-    fn revoke_did(e: Env, did: String);
+    fn revoke_did(e: Env, did: String) -> Result<(), Error>;
 
-    fn set_expiration(e: Env, did: String, expiration_timestamp: Option<u64>);
+    fn set_expiration(e: Env, did: String, expiration_timestamp: Option<u64>) -> Result<(), Error>;
 
     fn is_did_valid(e: Env, did: String) -> bool;
 
-    fn update_did_document(e: Env, did: String, document: DIDDocument);
+    fn update_did_document(e: Env, did: String, document: DIDDocument) -> Result<(), Error>;
 
-    fn add_verification_method(e: Env, did: String, method: VerificationMethod);
+    fn transfer_did_ownership(e: Env, did: String, new_owner: Address) -> Result<(), Error>;
 
-    fn remove_verification_method(e: Env, did: String, method_id: String);
+    fn get_did_owner(e: Env, did: String) -> Option<Address>;
+
+    fn add_verification_method(
+        e: Env,
+        did: String,
+        method: VerificationMethod,
+    ) -> Result<(), Error>;
+
+    fn remove_verification_method(e: Env, did: String, method_id: String) -> Result<(), Error>;
 
     fn rotate_verification_method(
         e: Env,
         did: String,
         method_id: String,
         new_public_key_multibase: Bytes,
-    );
+    ) -> Result<(), Error>;
 
-    fn add_service(e: Env, did: String, service: Service);
+    fn add_service(e: Env, did: String, service: Service) -> Result<(), Error>;
 
-    fn remove_service(e: Env, did: String, service_id: String);
+    fn remove_service(e: Env, did: String, service_id: String) -> Result<(), Error>;
 
-    fn add_claim(e: Env, claim: Claim);
+    fn add_claim(e: Env, claim: Claim) -> Result<(), Error>;
 
-    fn attest_claim(e: Env, attestation: Attestation);
+    fn attest_claim(e: Env, attestation: Attestation) -> Result<(), Error>;
 
     fn get_did_document(e: Env, did: String) -> DIDDocument;
 
@@ -191,7 +204,12 @@ impl DIDRegistryTrait for DIDRegistry {
         e.storage().persistent().set(&DID_INDEX, &Vec::new(&e));
     }
 
-    fn register_did(e: Env, did: String, document: DIDDocument, expiration_timestamp: Option<u64>) {
+    fn register_did(
+        e: Env,
+        did: String,
+        document: DIDDocument,
+        expiration_timestamp: Option<u64>,
+    ) -> Result<(), Error> {
         Self::require_owner_auth(&e);
         Self::validate_did_uri(&e, &did);
 
@@ -199,6 +217,12 @@ impl DIDRegistryTrait for DIDRegistry {
         if e.storage().persistent().has(&key) {
             panic!("DID already registered");
         }
+
+        // The registry owner is the initial owner of every DID it registers.
+        let registry_owner = Self::owner(&e);
+        e.storage()
+            .persistent()
+            .set(&(DID_OWNER, did.clone()), &registry_owner);
 
         let metadata = DIDMetadata {
             expiration_timestamp,
@@ -215,6 +239,7 @@ impl DIDRegistryTrait for DIDRegistry {
             .set(&(DID_OWNER, did.clone()), &Self::owner(&e));
         Self::append_did_index(&e, &did);
         Self::emit_did_updated(&e, &did, "register");
+        Ok(())
     }
 
     fn revoke_did(e: Env, did: String) {
@@ -230,6 +255,7 @@ impl DIDRegistryTrait for DIDRegistry {
         metadata.revocation_bitmap = 1;
         e.storage().persistent().set(&metadata_key, &metadata);
         Self::emit_did_updated(&e, &did, "revoke");
+        Ok(())
     }
 
     fn set_expiration(e: Env, did: String, expiration_timestamp: Option<u64>) {
@@ -245,6 +271,7 @@ impl DIDRegistryTrait for DIDRegistry {
         metadata.expiration_timestamp = expiration_timestamp;
         e.storage().persistent().set(&metadata_key, &metadata);
         Self::emit_did_updated(&e, &did, "set_expiration");
+        Ok(())
     }
 
     fn is_did_valid(e: Env, did: String) -> bool {
@@ -261,6 +288,7 @@ impl DIDRegistryTrait for DIDRegistry {
 
         e.storage().persistent().set(&key, &document);
         Self::emit_did_updated(&e, &did, "update");
+        Ok(())
     }
 
     fn add_verification_method(e: Env, did: String, method: VerificationMethod) {
@@ -271,6 +299,7 @@ impl DIDRegistryTrait for DIDRegistry {
         document.verification_method.push_back(method);
         e.storage().persistent().set(&key, &document);
         Self::emit_did_updated(&e, &did, "add_verification_method");
+        Ok(())
     }
 
     fn remove_verification_method(e: Env, did: String, method_id: String) {
@@ -295,6 +324,7 @@ impl DIDRegistryTrait for DIDRegistry {
 
         e.storage().persistent().set(&key, &document);
         Self::emit_did_updated(&e, &did, "remove_verification_method");
+        Ok(())
     }
 
     fn rotate_verification_method(
@@ -327,6 +357,7 @@ impl DIDRegistryTrait for DIDRegistry {
 
         e.storage().persistent().set(&key, &document);
         Self::emit_did_updated(&e, &did, "rotate_verification_method");
+        Ok(())
     }
 
     fn add_service(e: Env, did: String, service: Service) {
@@ -343,6 +374,7 @@ impl DIDRegistryTrait for DIDRegistry {
         }
         document.service.push_back(service);
         e.storage().persistent().set(&key, &document);
+        Ok(())
     }
 
     fn remove_service(e: Env, did: String, service_id: String) {
@@ -366,6 +398,7 @@ impl DIDRegistryTrait for DIDRegistry {
         }
 
         e.storage().persistent().set(&key, &document);
+        Ok(())
     }
 
     fn get_did_owner(e: Env, did: String) -> Option<Address> {
@@ -397,9 +430,10 @@ impl DIDRegistryTrait for DIDRegistry {
         let mut claims: Vec<Claim> = e.storage().persistent().get(&key).unwrap_or(Vec::new(&e));
         claims.push_back(claim);
         e.storage().persistent().set(&key, &claims);
+        Ok(())
     }
 
-    fn attest_claim(e: Env, attestation: Attestation) {
+    fn attest_claim(e: Env, attestation: Attestation) -> Result<(), Error> {
         Self::require_owner_auth(&e);
 
         let key = (ATTESTATIONS, attestation.claim_hash.clone());
@@ -407,6 +441,7 @@ impl DIDRegistryTrait for DIDRegistry {
             e.storage().persistent().get(&key).unwrap_or(Vec::new(&e));
         attestations.push_back(attestation);
         e.storage().persistent().set(&key, &attestations);
+        Ok(())
     }
 
     fn get_did_document(e: Env, did: String) -> DIDDocument {

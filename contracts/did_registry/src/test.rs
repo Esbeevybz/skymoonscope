@@ -548,3 +548,142 @@ fn test_invalid_did_uri() {
 
     client.register_did(&invalid_did, &document, &None);
 }
+
+// ── Per-DID ownership (issue #79) ────────────────────────────────────────────
+
+fn sample_document(env: &Env, did: &String) -> DIDDocument {
+    DIDDocument {
+        context: Vec::from_array(env, [String::from_str(env, "https://www.w3.org/ns/did/v1")]),
+        id: did.clone(),
+        verification_method: Vec::new(env),
+        authentication: Vec::new(env),
+        assertion_method: Vec::new(env),
+        key_agreement: Vec::new(env),
+        capability_invocation: Vec::new(env),
+        capability_delegation: Vec::new(env),
+        service: Vec::new(env),
+    }
+}
+
+#[test]
+fn registering_a_did_records_the_registry_owner_as_its_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let did = String::from_str(&env, "did:example:owner");
+    client.register_did(&did, &sample_document(&env, &did), &None);
+
+    assert_eq!(client.get_did_owner(&did), Some(owner));
+}
+
+#[test]
+fn ownership_can_be_transferred_and_then_controls_updates() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let did = String::from_str(&env, "did:example:transfer");
+    client.register_did(&did, &sample_document(&env, &did), &None);
+
+    client.transfer_did_ownership(&did, &new_owner);
+    assert_eq!(client.get_did_owner(&did), Some(new_owner.clone()));
+
+    // The new owner can still mutate the document.
+    let mut doc = sample_document(&env, &did);
+    doc.context
+        .push_back(String::from_str(&env, "https://example.com/ctx"));
+    client.update_did_document(&did, &doc);
+    assert_eq!(client.get_did_document(&did).context.len(), 2);
+}
+
+#[test]
+fn a_caller_without_the_did_owner_authorization_cannot_update() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let did = String::from_str(&env, "did:example:guarded");
+    client.register_did(&did, &sample_document(&env, &did), &None);
+    client.transfer_did_ownership(&did, &new_owner);
+
+    // An attacker authorizes the call, but neither the registry owner nor the
+    // DID owner does, so the DID-owner gate must reject it.
+    let attacker = Address::generate(&env);
+    let mut doc = sample_document(&env, &did);
+    doc.context
+        .push_back(String::from_str(&env, "https://evil.example"));
+
+    let res = client
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "update_did_document",
+                args: (did.clone(), doc.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_update_did_document(&did, &doc);
+
+    assert!(res.is_err());
+    // The document is untouched.
+    assert_eq!(client.get_did_document(&did).context.len(), 1);
+}
+
+#[test]
+fn revoking_requires_the_did_owner_too() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(DIDRegistry, ());
+    let client = DIDRegistryClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    client.initialize(&owner);
+
+    let did = String::from_str(&env, "did:example:revoke-guard");
+    client.register_did(&did, &sample_document(&env, &did), &None);
+    client.transfer_did_ownership(&did, &new_owner);
+
+    let attacker = Address::generate(&env);
+    let res = client
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "revoke_did",
+                args: (did.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_revoke_did(&did);
+
+    assert!(res.is_err());
+    // Still valid: the revoke was rejected.
+    assert!(client.is_did_valid(&did));
+}

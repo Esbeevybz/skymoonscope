@@ -1,7 +1,17 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol, Val,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    IntoVal, Symbol, Val, Vec,
 };
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    /// `initialize` has not been called, so there is no admin to authorize.
+    NotInitialized = 1,
+    /// The caller did not supply an authorization for the admin.
+    Unauthorized = 2,
+}
 
 pub const TIMELOCK_DELAY: u64 = 172_800; // 48 hours in seconds (48 * 60 * 60)
 
@@ -40,6 +50,28 @@ impl Proxy {
 
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Admin).unwrap()
+    }
+
+    /// Single audited gate for every privileged operation (issue #80).
+    ///
+    /// The admin lives in `instance` storage, written once by `initialize`, and
+    /// every upgrade operation funnels through this helper so there is exactly
+    /// one place where the check can be wrong.
+    ///
+    /// The workspace pins `soroban-sdk` 22, which does not expose
+    /// `Env::invoker()`, so the requirement is expressed as
+    /// `admin.require_auth()`: the transaction must carry an authorization for
+    /// the admin covering this contract, this function and these arguments. A
+    /// caller that cannot produce the admin's authorization therefore cannot
+    /// repoint the implementation.
+    fn require_admin(env: &Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        Ok(())
     }
 
     pub fn get_implementation(env: Env) -> Address {
@@ -81,6 +113,7 @@ impl Proxy {
 
         env.events()
             .publish((symbol_short!("propose"),), (new_implementation, eta));
+        Ok(())
     }
 
     /// Step 2: Execute the pending upgrade once 48 hours have passed
@@ -105,6 +138,7 @@ impl Proxy {
 
         env.events()
             .publish((symbol_short!("upgraded"),), proposal.new_implementation);
+        Ok(())
     }
 
     /// Step 3: Admin can cancel a pending upgrade
@@ -114,6 +148,7 @@ impl Proxy {
         env.storage().persistent().remove(&DataKey::PendingUpgrade);
 
         env.events().publish((symbol_short!("cancel"),), ());
+        Ok(())
     }
 
     /// Legacy upgrade method kept for backward compatibility (delegates to proposal flow)
@@ -164,6 +199,8 @@ impl Proxy {
 
         env.events()
             .publish((symbol_short!("upgraded"),), proposal.new_implementation);
+        // The upgraded implementation is invoked separately by the caller.
+        Ok(Val::from(0i32))
     }
 
     pub fn delegate_call(env: Env, method: Symbol, args: Vec<Val>) -> Val {
@@ -198,6 +235,7 @@ impl Proxy {
     /// directly and not subject to the admin check.
     fn write_value(env: &Env, value: i32) {
         env.storage().instance().set(&DataKey::Counter, &value);
+        Ok(())
     }
 
     pub fn set_storage(env: Env, key: BytesN<32>, value: Val) {
@@ -205,6 +243,7 @@ impl Proxy {
         env.storage()
             .persistent()
             .set(&DataKey::Storage(key), &value);
+        Ok(())
     }
 
     pub fn get_storage(env: Env, key: BytesN<32>) -> Option<Val> {

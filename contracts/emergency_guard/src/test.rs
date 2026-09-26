@@ -671,3 +671,97 @@ fn test_unpause_requires_admin() {
     let result = DefaultEmergencyGuard::unpause(&env, outsider.clone(), PauseType::SWAP);
     assert_eq!(result, Err(GuardError::Unauthorized));
 }
+
+// ── Guardian set cap (issue #77) ─────────────────────────────────────────────
+
+/// Build a guard with `n` admins at threshold 1, plus the single admin address
+/// used to co-sign privileged calls.
+fn setup_capped(n_admins: u32) -> (Env, EmergencyGuardClient<'static>, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EmergencyGuard, ());
+    let client = EmergencyGuardClient::new(&env, &contract_id);
+    let admins = make_addresses(&env, n_admins);
+    client.initialize(&admins, &1);
+    let signer = admins.get(0).unwrap();
+    (env, client, signer)
+}
+
+#[test]
+fn test_guardian_capacity_reflects_headroom() {
+    let (_env, client, _signer) = setup_capped(3);
+
+    assert_eq!(client.get_admins().len(), 3);
+    assert_eq!(client.guardian_capacity(), crate::MAX_GUARDIANS - 3);
+    assert!(!client.is_guardian_set_full());
+}
+
+#[test]
+fn test_add_guardian_is_rejected_at_the_cap() {
+    let (env, client, signer) = setup_capped(2);
+
+    // Fill the set up to the cap.
+    let approvers = vec![&env, signer.clone()];
+    for _ in 2..crate::MAX_GUARDIANS {
+        client.add_guardian(&approvers, &Address::generate(&env));
+    }
+
+    assert_eq!(client.get_admins().len(), crate::MAX_GUARDIANS);
+    assert_eq!(client.guardian_capacity(), 0);
+    assert!(client.is_guardian_set_full());
+
+    // One more must be refused rather than growing storage without bound.
+    let extra = Address::generate(&env);
+    let err = client.try_add_guardian(&approvers, &extra);
+    assert_eq!(err, Err(Ok(GuardError::TooManyGuardians)));
+
+    // The set is unchanged and the rejected guardian was not recorded.
+    assert_eq!(client.get_admins().len(), crate::MAX_GUARDIANS);
+    assert!(!client.get_admins().iter().any(|a| a == extra));
+}
+
+#[test]
+fn test_add_admin_is_also_capped() {
+    let (env, client, signer) = setup_capped(2);
+
+    let approvers = vec![&env, signer.clone()];
+    for _ in 2..crate::MAX_GUARDIANS {
+        client.add_admin(&approvers, &Address::generate(&env));
+    }
+
+    let err = client.try_add_admin(&approvers, &Address::generate(&env));
+    assert_eq!(err, Err(Ok(GuardError::TooManyGuardians)));
+    assert_eq!(client.get_admins().len(), crate::MAX_GUARDIANS);
+}
+
+#[test]
+fn test_adding_an_existing_guardian_at_the_cap_is_idempotent() {
+    let (env, client, signer) = setup_capped(crate::MAX_GUARDIANS);
+
+    assert!(client.is_guardian_set_full());
+
+    // Re-adding a guardian that is already in the set is a no-op, not an error:
+    // the cap only blocks genuinely new entries.
+    let approvers = vec![&env, signer.clone()];
+    assert!(client.try_add_guardian(&approvers, &signer).is_ok());
+    assert_eq!(client.get_admins().len(), crate::MAX_GUARDIANS);
+}
+
+#[test]
+fn test_initialize_rejects_an_oversized_guardian_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EmergencyGuard, ());
+    let client = EmergencyGuardClient::new(&env, &contract_id);
+
+    let too_many = make_addresses(&env, crate::MAX_GUARDIANS + 1);
+    let err = client.try_initialize(&too_many, &1);
+    assert_eq!(err, Err(Ok(GuardError::TooManyGuardians)));
+
+    // Exactly at the cap is fine.
+    let at_cap = make_addresses(&env, crate::MAX_GUARDIANS);
+    let contract_id2 = env.register(EmergencyGuard, ());
+    let client2 = EmergencyGuardClient::new(&env, &contract_id2);
+    assert!(client2.try_initialize(&at_cap, &1).is_ok());
+    assert!(client2.is_guardian_set_full());
+}

@@ -75,7 +75,18 @@ pub enum GuardError {
     InvalidThreshold = 4,
     AdminNotFound = 5,
     AlreadyInitialized = 6,
+    /// The guardian set is already at `MAX_GUARDIANS` (issue #77).
+    TooManyGuardians = 7,
 }
+
+/// Hard ceiling on the size of the guardian set (issue #77).
+///
+/// Guardians live in `instance` storage, and every guarded operation reads the
+/// whole list (multi-sig checks iterate it and `is_admin` scans it). Letting the
+/// set grow without bound therefore inflates the per-call ledger footprint and
+/// lets a storage-flooding caller degrade every guarded operation, so the set is
+/// capped and `add_guardian` is rejected once the cap is reached.
+pub const MAX_GUARDIANS: u32 = 20;
 
 /// Standardized event actions emitted by every successful guard action.
 #[contracttype]
@@ -245,6 +256,11 @@ impl EmergencyGuard {
         if threshold == 0 || threshold > admins.len() {
             return Err(GuardError::InvalidThreshold);
         }
+        // Reject an oversized guardian set at registration rather than letting
+        // it start out over budget (issue #77).
+        if admins.len() > MAX_GUARDIANS {
+            return Err(GuardError::TooManyGuardians);
+        }
         env.storage().instance().set(&GuardDataKey::Admins, &admins);
         env.storage()
             .instance()
@@ -392,6 +408,12 @@ impl EmergencyGuard {
         Self::check_multi_sig(&env, &approvers)?;
         let mut admins = Self::get_admins(env.clone());
         if !admins.iter().any(|a| a == new_admin) {
+            // Refuse to grow the guardian set past `MAX_GUARDIANS`. Unbounded
+            // growth fills storage and inflates the ledger footprint of every
+            // guarded operation, which is a storage-DoS vector (issue #77).
+            if admins.len() >= MAX_GUARDIANS {
+                return Err(GuardError::TooManyGuardians);
+            }
             admins.push_back(new_admin.clone());
             env.storage().instance().set(&GuardDataKey::Admins, &admins);
             emit_guard_event(
@@ -409,6 +431,31 @@ impl EmergencyGuard {
             emit_admin_added(&env, &approvers, &new_admin);
         }
         Ok(())
+    }
+
+    /// Add a guardian to the guardian set (multi-sig required).
+    ///
+    /// Guardians are this contract's admins: the addresses that can pause
+    /// operations and that co-sign privileged changes. This is the name issue
+    /// #77 refers to; it is the same operation as [`EmergencyGuard::add_admin`]
+    /// and is subject to the same [`MAX_GUARDIANS`] cap.
+    pub fn add_guardian(
+        env: Env,
+        approvers: Vec<Address>,
+        new_guardian: Address,
+    ) -> Result<(), GuardError> {
+        Self::add_admin(env, approvers, new_guardian)
+    }
+
+    /// Number of guardian slots still available before `MAX_GUARDIANS`.
+    pub fn guardian_capacity(env: Env) -> u32 {
+        let len = Self::get_admins(env).len();
+        MAX_GUARDIANS.saturating_sub(len)
+    }
+
+    /// Whether the guardian set is at its `MAX_GUARDIANS` cap.
+    pub fn is_guardian_set_full(env: Env) -> bool {
+        Self::guardian_capacity(env) == 0
     }
 
     /// Remove admin (multi-sig required).

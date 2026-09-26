@@ -424,6 +424,54 @@ impl CdpContract {
         Ok(())
     }
 
+    /// Governance-controlled update of the liquidation threshold.
+    ///
+    /// `RiskParams` already lives in `instance` storage, so the threshold is no
+    /// longer a compile-time constant — but until this setter existed,
+    /// `initialize` was the only writer, so changing it required a full
+    /// redeployment (issue #70). This exposes it to the admin instead, subject
+    /// to the same validation `initialize` applies.
+    pub fn set_liquidation_threshold(
+        env: Env,
+        min_collateral_ratio_bps: i128,
+    ) -> Result<(), Error> {
+        require_admin(&env)?;
+        // Must be a real collateralisation requirement: 100% leaves no room for
+        // oracle drift or rounding before a position is liquidatable.
+        if min_collateral_ratio_bps <= BPS || min_collateral_ratio_bps > BPS * 10 {
+            return Err(Error::InvalidConfig);
+        }
+        let mut params = read_risk_params(&env)?;
+        params.min_collateral_ratio_bps = min_collateral_ratio_bps;
+        env.storage().instance().set(&DataKey::RiskParams, &params);
+        Ok(())
+    }
+
+    /// Governance-controlled update of the liquidation incentive.
+    pub fn set_liquidation_incentive(
+        env: Env,
+        liquidation_incentive_bps: i128,
+    ) -> Result<(), Error> {
+        require_admin(&env)?;
+        if liquidation_incentive_bps < 0 || liquidation_incentive_bps >= BPS {
+            return Err(Error::InvalidConfig);
+        }
+        let mut params = read_risk_params(&env)?;
+        params.liquidation_incentive_bps = liquidation_incentive_bps;
+        env.storage().instance().set(&DataKey::RiskParams, &params);
+        Ok(())
+    }
+
+    /// The current risk parameters, including the live liquidation threshold.
+    pub fn get_risk_params(env: Env) -> Result<RiskParams, Error> {
+        read_risk_params(&env)
+    }
+
+    /// The current liquidation threshold, in basis points.
+    pub fn liquidation_threshold_bps(env: Env) -> Result<i128, Error> {
+        Ok(read_risk_params(&env)?.min_collateral_ratio_bps)
+    }
+
     pub fn get_position(env: Env, user: Address) -> Position {
         read_position(&env, user)
     }

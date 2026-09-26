@@ -15,18 +15,24 @@ fn make_payload(env: &Env, nonce: u64) -> Payload {
     }
 }
 
-fn compute_leaf(env: &Env, payload: &Payload) -> BytesN<32> {
+fn merkle_hash_pair(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    crate::merkle_node_hash(env, left, right)
+}
+
+/// The leaf value the contract is asked to prove inclusion of: the payload hash.
+fn raw_leaf(env: &Env, payload: &Payload) -> BytesN<32> {
     CrossChainVerifier::compute_payload_hash(env, payload)
+}
+
+/// The domain-separated leaf hash the tree is actually built over:
+/// `SHA256(0x00 || payload_hash)` per RFC 6962.
+fn compute_leaf(env: &Env, payload: &Payload) -> BytesN<32> {
+    crate::merkle_leaf_hash(env, &raw_leaf(env, payload))
 }
 use crate::{
     CrossChainMessage, CrossChainVerifier, CrossChainVerifierClient, SignatureAlgorithm,
     SignedMessage,
 };
-use crate::{
-    CrossChainMessage, CrossChainVerifier, CrossChainVerifierClient, SignatureAlgorithm,
-    SignedMessage,
-};
-use crate::{CrossChainVerifier, CrossChainVerifierClient};
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, Vec};
 
@@ -105,8 +111,6 @@ fn test_verify_message_success() {
     let mut proof_flags = Vec::new(&env);
     proof_flags.push_back(true);
     proof_flags.push_back(false);
-    proof_flags.push_back(true); // left
-    proof_flags.push_back(false); // right
 
     let result = client.verify_message(&block_height, &payload, &proof, &proof_flags);
     assert!(result);
@@ -938,5 +942,102 @@ fn merkle_hash_pair(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
         combined[0..32].copy_from_slice(right);
         combined[32..64].copy_from_slice(left);
     }
-    env.crypto().sha256(&Bytes::from_slice(env, &combined)).to_array()
+    env.crypto()
+        .sha256(&Bytes::from_slice(env, &combined))
+        .to_array()
+}
+
+// ── RFC 6962 domain separation (issue #76) ───────────────────────────────────
+
+/// A leaf hash and an interior node hash must never collide, because they are
+/// hashed under different prefixes.
+#[test]
+fn test_leaf_and_node_hashes_are_domain_separated() {
+    let env = Env::default();
+
+    let a = BytesN::from_array(&env, &[0x11; 32]);
+    let b = BytesN::from_array(&env, &[0x22; 32]);
+
+    let leaf = crate::merkle_leaf_hash(&env, &a);
+    let node = BytesN::from_array(
+        &env,
+        &crate::merkle_node_hash(&env, &a.to_array(), &b.to_array()),
+    );
+
+    assert_ne!(leaf, node);
+    // And the prefixes are exactly the RFC 6962 values.
+    assert_eq!(crate::MERKLE_LEAF_PREFIX, 0x00);
+    assert_eq!(crate::MERKLE_NODE_PREFIX, 0x01);
+}
+
+/// The historical second-preimage shape: a value that is a legitimate leaf is
+/// also usable as an interior node when leaves and nodes share a hash domain.
+/// With RFC 6962 prefixes that forgery no longer verifies.
+#[test]
+fn test_leaf_cannot_be_forged_as_an_interior_node() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let payload = make_payload(&env, 1);
+    let leaf = compute_leaf(&env, &payload);
+
+    // Build a one-node tree and publish its root.
+    let block_height = 100u32;
+    client.update_root(&block_height, &leaf);
+
+    let mut proof = Vec::new(&env);
+    let mut flags = Vec::new(&env);
+
+    // The correctly domain-separated proof verifies.
+    assert!(client.verify_message(&block_height, &payload, &proof, &flags));
+
+    // Now forge: claim the *same* leaf is an interior node of a two-node tree
+    // whose root is the leaf itself. Under the old shared hash domain this
+    // collapsed into a valid-looking proof; with 0x00/0x01 prefixes the
+    // recomputed root is a different value and the claim is rejected.
+    let forged_root = client.verify_message(&block_height, &payload, &proof, &flags);
+    assert!(forged_root, "the honest proof must still verify");
+
+    let sibling = BytesN::from_array(&env, &[0x33; 32]);
+    let mut forged_proof = Vec::new(&env);
+    forged_proof.push_back(sibling);
+    let mut forged_flags = Vec::new(&env);
+    forged_flags.push_back(true);
+
+    // The root stored is the leaf hash, not the node hash of (leaf, sibling),
+    // so this must not verify.
+    assert!(!client.verify_message(&block_height, &payload, &forged_proof, &forged_flags));
+}
+
+/// The leaf hash is exactly `SHA256(0x00 || leaf)`, and the node hash exactly
+/// `SHA256(0x01 || left || right)`.
+#[test]
+fn test_merkle_hashes_match_the_rfc6962_transcript() {
+    let env = Env::default();
+
+    let leaf = BytesN::from_array(&env, &[0xAB; 32]);
+    let left = [0x01u8; 32];
+    let right = [0x02u8; 32];
+
+    let mut leaf_preimage = [0x00u8; 32];
+    leaf_preimage[1..32].copy_from_slice(&leaf.to_array());
+    let expected_leaf: BytesN<32> = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &leaf_preimage))
+        .into();
+    assert_eq!(crate::merkle_leaf_hash(&env, &leaf), expected_leaf);
+
+    let mut node_preimage = [0x01u8; 65];
+    node_preimage[1..33].copy_from_slice(&left);
+    node_preimage[33..65].copy_from_slice(&right);
+    let expected_node: [u8; 32] = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, &node_preimage))
+        .to_array();
+    assert_eq!(crate::merkle_node_hash(&env, &left, &right), expected_node);
 }
