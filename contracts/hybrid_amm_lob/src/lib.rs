@@ -24,6 +24,10 @@ pub enum Error {
     PriceDeviationExceeded = 10,
     /// A guard parameter was outside its permitted range.
     InvalidConfig = 11,
+    /// `swap` hit `MAX_MATCHES_PER_CALL` with output still outstanding.  The
+    /// request is not lost — call `swap_partial` to finish it across further
+    /// invocations (issue #082).
+    PartialFillRequired = 12,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -99,6 +103,37 @@ pub struct SwapResult {
     pub amm_filled: i128,
 }
 
+/// A swap that stopped at `MAX_MATCHES_PER_CALL` with output still outstanding
+/// (issue #082).
+///
+/// Nothing is lost: the filled leg has already been settled, and the caller can
+/// issue the same request again to work through the rest of the book.  The
+/// `in_max` slippage guard applies to each leg independently, so a taker that
+/// wants the whole fill priced at once should sum `amount_in` across the legs.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialFill {
+    /// Output the caller asked for.
+    pub requested_out: i128,
+    /// Output actually delivered by this call.
+    pub filled_out: i128,
+    /// Output still to be filled by a follow-up call.
+    pub remaining_out: i128,
+    /// Input charged for `filled_out`.
+    pub amount_in: i128,
+    /// Limit orders consumed by this call.
+    pub matches: u32,
+}
+
+/// Result of `swap_partial`: either the fill completed, or it stopped at the
+/// per-call cap and can be resumed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SwapOutcome {
+    Filled(SwapResult),
+    Partial(PartialFill),
+}
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -130,6 +165,13 @@ pub const DEFAULT_MAX_MATCH_DEPTH: u32 = 8;
 /// Hard ceiling on `max_match_depth`, so no configuration can make a swap
 /// iterate an unbounded number of orders.
 pub const MAX_MATCH_DEPTH_LIMIT: u32 = 64;
+/// Hard ceiling on how many limit orders a *single* swap call may match,
+/// independent of the per-ledger budget (issue #082).
+///
+/// The ledger budget bounds a whole block; this bounds one invocation's CPU
+/// cost.  Hitting it is not an error: the swap reports a `PartialFill` and the
+/// caller repeats the request to consume the rest of the book.
+pub const MAX_MATCHES_PER_CALL: u32 = 16;
 /// Suggested price-deviation tolerance (5%).
 pub const DEFAULT_MAX_PRICE_DEVIATION_BPS: i128 = 500;
 /// How long the per-ledger depth counter is kept alive. It only has to outlive
@@ -572,12 +614,17 @@ impl HybridAmmLob {
     ///   remainder, so no single block can cascade through thin ticks. Matching
     ///   stops rather than reverting, so an exhausted budget never makes the
     ///   pool unswappable for the rest of the ledger.
+    /// - **Per-call cap.** At most `MAX_MATCHES_PER_CALL` orders are matched by
+    ///   one invocation, however much ledger budget is left (issue #082). Unlike
+    ///   the ledger budget this does not fall back to the AMM: the call reverts
+    ///   with [`Error::PartialFillRequired`] so the caller can resume the fill
+    ///   deliberately via `swap_partial` instead of paying pool fees to finish.
     /// - **Price band.** Limit orders priced worse than the pool's spot price
     ///   by more than `max_price_deviation_bps` are not matched; the AMM prices
     ///   that remainder instead.
     /// - **Pool deviation.** If the AMM leg would move the pool's spot price by
     ///   more than `max_price_deviation_bps`, the swap reverts with
-    ///   [`Error::PriceDeviationExceeded`].
+    ///   `Error::PriceDeviationExceeded`.
     pub fn swap(
         e: Env,
         taker: Address,
@@ -585,6 +632,53 @@ impl HybridAmmLob {
         out: i128,
         in_max: i128,
     ) -> Result<SwapResult, Error> {
+        match Self::execute_swap(e, taker, buy_a, out, in_max, MAX_MATCHES_PER_CALL)? {
+            SwapOutcome::Filled(result) => Ok(result),
+            SwapOutcome::Partial(_) => Err(Error::PartialFillRequired),
+        }
+    }
+
+    /// Swap with an explicit per-call matching cap, reporting a resumable
+    /// `PartialFill` instead of reverting when the cap truncates the fill.
+    ///
+    /// `swap` is exact-output and all-or-nothing, so a book deeper than
+    /// `MAX_MATCHES_PER_CALL` would otherwise leave a taker with no way to trade.
+    /// This entry point fills as much as the cap allows, settles that leg, and
+    /// reports what is still owed.  Repeating the request with the reported
+    /// `remaining_out` consumes the rest, so a caller loops until it receives
+    /// `SwapOutcome::Filled` (or an error).
+    ///
+    /// The AMM leg is skipped once the cap binds, so a partially filled swap
+    /// never has to satisfy the pool-deviation guard.  Each leg is charged its
+    /// own `in_max`; sum the `amount_in` of every leg for the true total.
+    pub fn swap_partial(
+        e: Env,
+        taker: Address,
+        buy_a: bool,
+        out: i128,
+        in_max: i128,
+    ) -> Result<SwapOutcome, Error> {
+        Self::execute_swap(e, taker, buy_a, out, in_max, MAX_MATCHES_PER_CALL)
+    }
+
+    /// Per-call matching cap reported to callers and indexers.
+    pub fn max_matches_per_call() -> u32 {
+        MAX_MATCHES_PER_CALL
+    }
+
+    /// Shared matching engine behind `swap` and `swap_partial`.
+    ///
+    /// `per_call_cap` bounds how many limit orders one invocation may match.  It
+    /// is applied on top of the ledger's remaining depth budget, so whichever is
+    /// smaller stops the book scan first.
+    fn execute_swap(
+        e: Env,
+        taker: Address,
+        buy_a: bool,
+        out: i128,
+        in_max: i128,
+        per_call_cap: u32,
+    ) -> Result<SwapOutcome, Error> {
         if out <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -607,6 +701,9 @@ impl HybridAmmLob {
         let depth_used = load_depth_used(&e);
         let depth_budget = pool.guards.max_match_depth.saturating_sub(depth_used);
         let mut matched: u32 = 0;
+        // Set when the per-call cap, rather than the ledger budget, stopped the
+        // book scan with output still outstanding (issue #082).
+        let mut cap_hit = false;
 
         // ── Phase 1: fill from limit order book ───────────────────────────────
         //
@@ -636,6 +733,15 @@ impl HybridAmmLob {
                 // this ledger's budget is spent. Stop consuming the book and let
                 // the AMM price the remainder, where the deviation guard applies.
                 if matched >= depth_budget {
+                    break;
+                }
+
+                // Per-call cap: however much ledger budget is left, one invocation
+                // may not scan more than `MAX_MATCHES_PER_CALL` orders. The AMM
+                // deliberately does not take over here — the caller is told what is
+                // still owed and resumes with another call (issue #082).
+                if matched >= per_call_cap {
+                    cap_hit = true;
                     break;
                 }
 
@@ -707,6 +813,12 @@ impl HybridAmmLob {
                     break;
                 }
 
+                // Per-call cap: see the ask-side comment above.
+                if matched >= per_call_cap {
+                    cap_hit = true;
+                    break;
+                }
+
                 // Bid: maker escrowed token_b to buy token_a.
                 // Taker is selling token_a to get token_b.
                 // fill_b = amount of token_b taker receives from this order.
@@ -765,8 +877,12 @@ impl HybridAmmLob {
         }
 
         // ── Phase 2: fill remainder from AMM ─────────────────────────────────
+        //
+        // Skipped when the per-call cap stopped the book scan: the caller asked
+        // for a resumable fill, so the remainder is reported rather than filled
+        // at pool prices (issue #082).
 
-        if remaining_out > 0 {
+        if remaining_out > 0 && !cap_hit {
             let (reserve_in, reserve_out) = if buy_a {
                 (pool.reserve_b, pool.reserve_a)
             } else {
@@ -836,22 +952,29 @@ impl HybridAmmLob {
             );
         }
 
-        e.events().publish(
-            (Symbol::new(&e, "swap"), taker),
-            SwapResult {
+        if cap_hit && remaining_out > 0 {
+            let partial = PartialFill {
+                requested_out: out,
+                filled_out: out - remaining_out,
+                remaining_out,
                 amount_in: total_in,
-                amount_out: out,
-                lob_filled,
-                amm_filled,
-            },
-        );
+                matches: matched,
+            };
+            e.events()
+                .publish((Symbol::new(&e, "swap_partial"), taker), partial.clone());
+            return Ok(SwapOutcome::Partial(partial));
+        }
 
-        Ok(SwapResult {
+        let result = SwapResult {
             amount_in: total_in,
             amount_out: out,
             lob_filled,
             amm_filled,
-        })
+        };
+        e.events()
+            .publish((Symbol::new(&e, "swap"), taker), result.clone());
+
+        Ok(SwapOutcome::Filled(result))
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────

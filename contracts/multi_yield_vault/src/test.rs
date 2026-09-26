@@ -363,3 +363,321 @@ fn test_set_slippage() {
     client.set_slippage(&200);
     assert_eq!(client.get_vault().slippage_bps, 200);
 }
+
+// ── Withdrawal queue (issue #083) ─────────────────────────────────────────────
+
+/// A pool that actually pulls the deposit out of the vault and redeems it at a
+/// fixed haircut, modelling swap fees and slippage.  `MockPool` never moves
+/// tokens, so a vault using it can always pay a withdrawal in full; this one
+/// makes the vault genuinely liquidity-constrained, which is what the queue is for.
+#[contracttype]
+#[derive(Clone)]
+enum ThinKey {
+    Token,
+    PayoutBps,
+    Escrow,
+}
+
+#[contract]
+struct MockThinPool;
+
+#[contractimpl]
+impl MockThinPool {
+    pub fn init(e: Env, token: Address, payout_bps: i128) {
+        e.storage().instance().set(&ThinKey::Token, &token);
+        e.storage().instance().set(&ThinKey::PayoutBps, &payout_bps);
+        e.storage().instance().set(&ThinKey::Escrow, &0i128);
+    }
+
+    pub fn deposit(e: Env, from: Address, amount_a: i128, amount_b: i128) -> i128 {
+        let amount = amount_a.max(amount_b);
+        if amount <= 0 {
+            return 0;
+        }
+        let token: Address = e.storage().instance().get(&ThinKey::Token).unwrap();
+        // The vault approves this pool immediately before calling, so the pull succeeds.
+        soroban_sdk::token::Client::new(&e, &token).transfer_from(
+            &e.current_contract_address(),
+            &from,
+            &e.current_contract_address(),
+            &amount,
+        );
+        let escrow: i128 = e.storage().instance().get(&ThinKey::Escrow).unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&ThinKey::Escrow, &(escrow + amount));
+        amount
+    }
+
+    /// Redeem `share_amount`, returning only `payout_bps` of it in token_a.
+    pub fn withdraw(e: Env, to: Address, share_amount: i128) -> (i128, i128) {
+        let escrow: i128 = e.storage().instance().get(&ThinKey::Escrow).unwrap_or(0);
+        let burn = share_amount.min(escrow);
+        e.storage()
+            .instance()
+            .set(&ThinKey::Escrow, &(escrow - burn));
+
+        let payout_bps: i128 = e.storage().instance().get(&ThinKey::PayoutBps).unwrap_or(0);
+        let out_a = burn * payout_bps / 10_000;
+        if out_a > 0 {
+            let token: Address = e.storage().instance().get(&ThinKey::Token).unwrap();
+            soroban_sdk::token::Client::new(&e, &token).transfer(
+                &e.current_contract_address(),
+                &to,
+                &out_a,
+            );
+        }
+        (out_a, 0)
+    }
+
+    pub fn get_reserve_a(e: Env) -> i128 {
+        e.storage().instance().get(&ThinKey::Escrow).unwrap_or(0)
+    }
+
+    pub fn get_reserve_b(e: Env) -> i128 {
+        0
+    }
+
+    pub fn get_fee(e: Env) -> i128 {
+        30
+    }
+
+    pub fn token_a(e: Env) -> Address {
+        e.storage().instance().get(&ThinKey::Token).unwrap()
+    }
+}
+
+/// Register two haircut pools and split deposits 50/50 between them.
+fn setup_thin(e: &Env, client: &MultiYieldVaultClient<'_>, token: &Address, payout_bps: i128) {
+    let a = e.register(MockThinPool, ());
+    MockThinPoolClient::new(e, &a).init(token, &payout_bps);
+    let b = e.register(MockThinPool, ());
+    MockThinPoolClient::new(e, &b).init(token, &payout_bps);
+    client.register_pool(&a, &true);
+    client.register_pool(&b, &true);
+    client.set_weights(&soroban_sdk::vec![&e, 5_000, 5_000]);
+}
+
+fn fund(e: &Env, token: &Address, to: &Address, amount: i128) {
+    soroban_sdk::token::StellarAssetClient::new(e, token).mint(to, &amount);
+}
+
+fn token_balance(e: &Env, token: &Address, of: &Address) -> i128 {
+    soroban_sdk::token::Client::new(e, token).balance(of)
+}
+
+#[test]
+fn test_withdraw_full_fill_leaves_queue_empty() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _, deposit_token, _) = setup(&e);
+
+    setup_thin(&e, &client, &deposit_token, 10_000); // no haircut
+
+    let user = Address::generate(&e);
+    fund(&e, &deposit_token, &user, 1_000);
+    client.deposit(&user, &1_000);
+
+    let received = client.withdraw(&user, &1_000);
+
+    // The pools redeem at par, so the request is satisfied in full.
+    assert_eq!(received, 1_000);
+    assert_eq!(client.queue_len(), 0);
+    assert_eq!(client.vault_balance(&user), 0);
+    assert_eq!(token_balance(&e, &deposit_token, &user), 1_000);
+    assert_eq!(client.available_liquidity(), 0);
+}
+
+#[test]
+fn test_withdraw_partial_fill_queues_remainder() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _, deposit_token, vault_id) = setup(&e);
+
+    // 40% payout: redeeming 1_000 shares only yields 400 tokens.
+    setup_thin(&e, &client, &deposit_token, 4_000);
+
+    let user = Address::generate(&e);
+    fund(&e, &deposit_token, &user, 1_000);
+    client.deposit(&user, &1_000);
+
+    let received = client.withdraw(&user, &1_000);
+
+    // Payout is capped by what the pools actually returned, not by the request.
+    assert_eq!(received, 400);
+    assert_eq!(token_balance(&e, &deposit_token, &user), 400);
+
+    // The unpayable 600 is queued rather than skipped.
+    assert_eq!(client.queue_len(), 1);
+    let req = client.get_withdrawal_request(&0).unwrap();
+    assert_eq!(req.owner, user);
+    assert_eq!(req.requested_shares, 600);
+    assert_eq!(req.remaining_shares, 600);
+    assert_eq!(req.filled_amount, 0);
+    assert!(!req.closed);
+
+    // The whole request was deducted from the balance, so those shares cannot be
+    // claimed a second time.
+    assert_eq!(client.vault_balance(&user), 0);
+    assert_eq!(client.get_vault().total_shares, 0);
+
+    // A dry queue makes no progress.
+    let idle = client.process_withdraw_queue(&10);
+    assert_eq!(idle.processed, 0);
+    assert_eq!(idle.completed, 0);
+    assert_eq!(idle.paid_out, 0);
+    assert_eq!(idle.remaining_in_queue, 1);
+
+    // Once liquidity returns, the queue settles the claim.
+    fund(&e, &deposit_token, &vault_id, 600);
+    let result = client.process_withdraw_queue(&10);
+    assert_eq!(result.processed, 1);
+    assert_eq!(result.completed, 1);
+    assert_eq!(result.paid_out, 600);
+    assert_eq!(result.remaining_in_queue, 0);
+    assert_eq!(client.queue_len(), 0);
+    assert!(client.get_withdrawal_request(&0).unwrap().closed);
+    assert_eq!(token_balance(&e, &deposit_token, &user), 1_000);
+}
+
+#[test]
+fn test_process_queue_is_fifo_and_partial() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _, deposit_token, vault_id) = setup(&e);
+
+    // 0% payout: every withdrawal has to queue in full.
+    setup_thin(&e, &client, &deposit_token, 0);
+
+    let alice = Address::generate(&e);
+    let bob = Address::generate(&e);
+    fund(&e, &deposit_token, &alice, 1_000);
+    fund(&e, &deposit_token, &bob, 1_000);
+    client.deposit(&alice, &1_000);
+    client.deposit(&bob, &1_000);
+
+    assert_eq!(client.withdraw(&alice, &500), 0);
+    assert_eq!(client.withdraw(&bob, &500), 0);
+    assert_eq!(client.queue_len(), 2);
+    let ids = client.get_queue();
+    assert_eq!(ids.get(0).unwrap(), 0);
+    assert_eq!(ids.get(1).unwrap(), 1);
+
+    // A small injection only reaches the head of the queue.
+    fund(&e, &deposit_token, &vault_id, 300);
+    let result = client.process_withdraw_queue(&10);
+    assert_eq!(result.processed, 1);
+    assert_eq!(result.completed, 0);
+    assert_eq!(result.paid_out, 300);
+    assert_eq!(result.remaining_in_queue, 2);
+
+    // Alice (older request) is served first; Bob's claim is untouched.
+    assert_eq!(token_balance(&e, &deposit_token, &alice), 300);
+    assert_eq!(token_balance(&e, &deposit_token, &bob), 0);
+    let alice_req = client.get_withdrawal_request(&0).unwrap();
+    assert_eq!(alice_req.remaining_shares, 200);
+    assert_eq!(alice_req.filled_amount, 300);
+
+    // The rest drains on the following pass, still oldest-first.
+    fund(&e, &deposit_token, &vault_id, 700);
+    let result = client.process_withdraw_queue(&10);
+    assert_eq!(result.processed, 2);
+    assert_eq!(result.completed, 2);
+    assert_eq!(result.paid_out, 700);
+    assert_eq!(result.remaining_in_queue, 0);
+    assert_eq!(client.queue_len(), 0);
+    assert_eq!(token_balance(&e, &deposit_token, &alice), 500);
+    assert_eq!(token_balance(&e, &deposit_token, &bob), 500);
+}
+
+#[test]
+fn test_process_queue_honours_entry_budget() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _, deposit_token, vault_id) = setup(&e);
+
+    setup_thin(&e, &client, &deposit_token, 0);
+
+    let alice = Address::generate(&e);
+    let bob = Address::generate(&e);
+    fund(&e, &deposit_token, &alice, &1_000);
+    fund(&e, &deposit_token, &bob, &1_000);
+    client.deposit(&alice, &1_000);
+    client.deposit(&bob, &1_000);
+    client.withdraw(&alice, &500);
+    client.withdraw(&bob, &500);
+    assert_eq!(client.queue_len(), 2);
+
+    // Plenty of liquidity, but only one request may be visited.
+    fund(&e, &deposit_token, &vault_id, 5_000);
+    let result = client.process_withdraw_queue(&1);
+    assert_eq!(result.completed, 1);
+    assert_eq!(result.paid_out, 500);
+    assert_eq!(result.remaining_in_queue, 1);
+    assert_eq!(token_balance(&e, &deposit_token, &alice), 500);
+    assert_eq!(token_balance(&e, &deposit_token, &bob), 0);
+
+    let result = client.process_withdraw_queue(&1);
+    assert_eq!(result.completed, 1);
+    assert_eq!(result.remaining_in_queue, 0);
+    assert_eq!(token_balance(&e, &deposit_token, &bob), 500);
+}
+
+#[test]
+fn test_process_queue_is_noop_when_empty() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _, _, _) = setup(&e);
+    let result = client.process_withdraw_queue(&10);
+    assert_eq!(result.processed, 0);
+    assert_eq!(result.completed, 0);
+    assert_eq!(result.paid_out, 0);
+    assert_eq!(result.remaining_in_queue, 0);
+}
+
+#[test]
+fn test_cancel_withdrawal_closes_request() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _, deposit_token, _) = setup(&e);
+
+    setup_thin(&e, &client, &deposit_token, 0);
+
+    let user = Address::generate(&e);
+    fund(&e, &deposit_token, &user, 1_000);
+    client.deposit(&user, &1_000);
+    assert_eq!(client.withdraw(&user, &500), 0);
+    assert_eq!(client.queue_len(), 1);
+
+    client.cancel_withdrawal(&user, &0);
+    assert_eq!(client.queue_len(), 0);
+    assert!(client.get_withdrawal_request(&0).unwrap().closed);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")] // WithdrawalNotFound = 12
+fn test_cancel_unknown_withdrawal() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _, _, _) = setup(&e);
+    let user = Address::generate(&e);
+    client.cancel_withdrawal(&user, &7);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")] // WithdrawalClosed = 13
+fn test_cancel_withdrawal_twice() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _, deposit_token, _) = setup(&e);
+
+    setup_thin(&e, &client, &deposit_token, 0);
+
+    let user = Address::generate(&e);
+    fund(&e, &deposit_token, &user, 1_000);
+    client.deposit(&user, &1_000);
+    client.withdraw(&user, &500);
+
+    client.cancel_withdrawal(&user, &0);
+    client.cancel_withdrawal(&user, &0);
+}

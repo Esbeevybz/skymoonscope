@@ -19,6 +19,10 @@ pub enum DataKey {
     AuctionByIndex(u32),
     AuctionCount,
     DeploymentFee,
+    /// Vec<Address> — every auction this factory deployed, in deployment order.
+    /// Mirrors the `persistent` index above so the factory owner and indexers can
+    /// enumerate its deployments from a single `instance` read.
+    Instances,
 }
 
 #[contracttype]
@@ -39,6 +43,10 @@ pub enum FactoryError {
 }
 
 const MAX_PAGE_SIZE: u32 = 100;
+
+/// Hard ceiling on tracked deployments per factory, so a factory owner cannot grow
+/// `instance` storage without bound and push every call past its ledger footprint.
+const MAX_TRACKED_AUCTIONS: u32 = 1_000;
 
 fn collect_deployment_fee(env: &Env, seller: &Address) -> Result<(), FactoryError> {
     let fee: DeploymentFee = env
@@ -68,6 +76,21 @@ fn register_auction(env: &Env, address: &Address, auction_type: &AuctionType) {
     env.storage()
         .persistent()
         .set(&DataKey::AuctionCount, &(index + 1));
+
+    // Mirror the deployment into the `instance` registry (issue #084).  The
+    // `persistent` index above is authoritative; this list exists so the factory
+    // owner and indexers can enumerate deployments from one read.
+    let mut instances: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::Instances)
+        .unwrap_or(Vec::new(env));
+    if instances.len() < MAX_TRACKED_AUCTIONS {
+        instances.push_back(address.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::Instances, &instances);
+    }
 }
 
 #[contract]
@@ -298,6 +321,39 @@ impl AuctionFactory {
         }
 
         auctions
+    }
+
+    /// Every auction address this factory deployed, in deployment order.
+    ///
+    /// Backed by `instance` storage (issue #084).  Capped at
+    /// `MAX_TRACKED_AUCTIONS` deployments, so use `get_auctions` to page
+    /// through the full, uncapped history.
+    pub fn get_instances(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Instances)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// How many deployed auctions are tracked in `instance` storage.
+    pub fn get_instance_count(env: Env) -> u32 {
+        Self::get_instances(env).len()
+    }
+
+    /// Whether `auction_address` was deployed by this factory.
+    pub fn is_instance(env: Env, auction_address: Address) -> bool {
+        let instances = Self::get_instances(env);
+        for i in 0..instances.len() {
+            if instances.get(i).unwrap() == auction_address {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Number of deployments that fit in `instance` storage before tracking stops.
+    pub fn get_instance_capacity(env: Env) -> u32 {
+        MAX_TRACKED_AUCTIONS.saturating_sub(Self::get_instance_count(env))
     }
 }
 

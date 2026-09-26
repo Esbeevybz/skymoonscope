@@ -1,6 +1,6 @@
 use crate::{
-    Guards, HybridAmmLob, HybridAmmLobClient, DEFAULT_MAX_MATCH_DEPTH,
-    DEFAULT_MAX_PRICE_DEVIATION_BPS, MAX_MATCH_DEPTH_LIMIT, PRICE_SCALE,
+    Error, Guards, HybridAmmLob, HybridAmmLobClient, SwapOutcome, DEFAULT_MAX_MATCH_DEPTH,
+    DEFAULT_MAX_PRICE_DEVIATION_BPS, MAX_MATCHES_PER_CALL, MAX_MATCH_DEPTH_LIMIT, PRICE_SCALE,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
@@ -203,6 +203,119 @@ fn test_swap_fully_filled_by_lob() {
 }
 
 // ── AMM fallback ──────────────────────────────────────────────────────────────
+
+#[test]
+fn test_max_matches_per_call_is_exposed() {
+    assert_eq!(MAX_MATCHES_PER_CALL, 16);
+}
+
+#[test]
+fn test_swap_partial_fills_up_to_per_call_cap() {
+    let e = Env::default();
+    e.mock_all_auths();
+    // A deep ledger budget, so the per-call cap is the binding constraint.
+    let (client, admin, token_a, token_b, _) =
+        setup_with(&e, MAX_MATCH_DEPTH_LIMIT, DEFAULT_MAX_PRICE_DEVIATION_BPS);
+
+    // 20 asks of 100 token_a each at price 1.0 — deeper than one call may match.
+    seed_asks(&e, &client, &admin, &token_a, 20, 100);
+    assert_eq!(client.get_asks().len(), 20);
+
+    let taker = Address::generate(&e);
+    mint(&e, &admin, &token_b, &taker, 100_000);
+
+    // `swap` is exact-output and all-or-nothing, so it refuses rather than
+    // silently under-filling — and the refusal leaves nothing behind.
+    assert_eq!(
+        client.try_swap(&taker, &true, &2_000, &100_000),
+        Err(Ok(Error::PartialFillRequired))
+    );
+    assert_eq!(client.get_asks().len(), 20);
+    assert_eq!(balance(&e, &token_b, &taker), 100_000);
+    assert_eq!(balance(&e, &token_a, &taker), 0);
+
+    // `swap_partial` does the same work up to the cap and reports the remainder.
+    let outcome = client.swap_partial(&taker, &true, &2_000, &100_000);
+    assert!(matches!(outcome, SwapOutcome::Partial(_)));
+    let partial = match outcome {
+        SwapOutcome::Partial(p) => p,
+        SwapOutcome::Filled(_) => unreachable!(),
+    };
+
+    assert_eq!(partial.requested_out, 2_000);
+    assert_eq!(partial.filled_out, 100 * MAX_MATCHES_PER_CALL as i128);
+    assert_eq!(partial.remaining_out, 2_000 - partial.filled_out);
+    assert_eq!(partial.matches, MAX_MATCHES_PER_CALL);
+    assert_eq!(partial.amount_in, partial.filled_out);
+
+    // Only the capped number of orders was consumed, and that leg is settled.
+    assert_eq!(client.get_asks().len(), 20 - MAX_MATCHES_PER_CALL as u32);
+    assert_eq!(balance(&e, &token_a, &taker), partial.filled_out);
+    assert_eq!(balance(&e, &token_b, &taker), 100_000 - partial.amount_in);
+}
+
+#[test]
+fn test_swap_partial_completes_over_successive_calls() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin, token_a, token_b, _) =
+        setup_with(&e, MAX_MATCH_DEPTH_LIMIT, DEFAULT_MAX_PRICE_DEVIATION_BPS);
+
+    seed_asks(&e, &client, &admin, &token_a, 20, 100);
+
+    let taker = Address::generate(&e);
+    mint(&e, &admin, &token_b, &taker, 100_000);
+
+    // Drive the fill to completion the way a caller would.
+    let mut left: i128 = 2_000;
+    let mut legs = 0u32;
+    let mut total_in: i128 = 0;
+    while left > 0 && legs < 10 {
+        match client.swap_partial(&taker, &true, &left, &100_000) {
+            Ok(SwapOutcome::Filled(r)) => {
+                total_in += r.amount_in;
+                left = 0;
+            }
+            Ok(SwapOutcome::Partial(p)) => {
+                total_in += p.amount_in;
+                left = p.remaining_out;
+            }
+            Err(_) => break,
+        }
+        legs += 1;
+    }
+
+    assert_eq!(left, 0);
+    assert_eq!(legs, 2);
+    assert_eq!(total_in, 2_000);
+
+    // Every order was consumed and the taker received the full amount.
+    assert_eq!(client.get_asks().len(), 0);
+    assert_eq!(balance(&e, &token_a, &taker), 2_000);
+    assert_eq!(balance(&e, &token_b, &taker), 100_000 - 2_000);
+}
+
+#[test]
+fn test_swap_partial_below_cap_reports_filled() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin, token_a, token_b, _) = setup(&e);
+
+    let maker = Address::generate(&e);
+    mint(&e, &admin, &token_a, &maker, 200);
+    client.place_order(&maker, &false, &PRICE_SCALE, &200);
+
+    let taker = Address::generate(&e);
+    mint(&e, &admin, &token_b, &taker, 10_000);
+
+    match client.swap_partial(&taker, &true, &100, &200) {
+        Ok(SwapOutcome::Filled(r)) => {
+            assert_eq!(r.amount_out, 100);
+            assert_eq!(r.lob_filled, 100);
+        }
+        Ok(SwapOutcome::Partial(_)) => panic!("expected a full fill"),
+    }
+}
 
 #[test]
 fn test_swap_amm_fallback_when_no_orders() {

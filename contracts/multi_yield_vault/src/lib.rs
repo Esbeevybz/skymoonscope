@@ -21,6 +21,16 @@
 //! to the best pool.  Each withdrawal and deposit is slippage-protected: the
 //! contract checks that the amount received from a pool withdrawal is within
 //! `slippage_bps` of the expected amount before proceeding.
+//!
+//! ## Withdrawal queue
+//! Shares are minted 1:1 with the deposit token, so a withdrawal is entitled to
+//! exactly as many tokens as the shares it burns.  That entitlement is not always
+//! payable on the spot: the pools may have moved against the vault, or the vault's
+//! idle balance may not cover the redemption.  Rather than skipping such a
+//! withdrawal, `withdraw()` pays out what it can and books the difference as a
+//! persistent `WithdrawalRequest`.  `process_withdraw_queue()` then settles those
+//! requests oldest-first as liquidity returns, and `cancel_withdrawal()` lets an
+//! owner walk away from a claim they no longer want.
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
@@ -43,6 +53,12 @@ pub enum Error {
     InsufficientShares = 8,
     Unauthorized = 9,
     InvalidWeights = 10,
+    /// The withdrawal queue is full; the request could not be recorded.
+    QueueFull = 11,
+    /// No withdrawal request exists for the given id.
+    WithdrawalNotFound = 12,
+    /// The withdrawal request has already been fully filled or cancelled.
+    WithdrawalClosed = 13,
 }
 
 // ── External pool interface ───────────────────────────────────────────────────
@@ -103,6 +119,50 @@ pub enum DataKey {
     Pools,
     /// Per-user vault share balance.
     Balance(Address),
+    /// Vec<u32> — ids of the open withdrawal requests, oldest first.
+    Queue,
+    /// Id to hand out to the next withdrawal request.
+    NextQueueId,
+    /// WithdrawalRequest by id.
+    Withdrawal(u32),
+}
+
+/// A withdrawal that the vault could not satisfy in full at request time.
+///
+/// The vault mints shares 1:1 with the deposit token (see `MultiYieldVault::deposit`),
+/// so `remaining_shares` is also the amount of deposit token still owed to `owner`.
+/// The request is a burned-in claim: the shares backing it were already deducted from
+/// the owner's balance and from `total_shares` when the request was created, so the
+/// entry can only be settled once, by `MultiYieldVault::process_withdraw_queue`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalRequest {
+    /// Address entitled to the remaining payout.
+    pub owner: Address,
+    /// Deposit token this request was opened for.
+    pub requested_shares: i128,
+    /// Deposit token still owed to `owner`.
+    pub remaining_shares: i128,
+    /// Deposit token this request has paid out since it was opened.  Whatever was
+    /// paid directly by the `withdraw` call that opened the request is not counted
+    /// here; the originating `withdraw_partial` event reports it.
+    pub filled_amount: i128,
+    /// True once the request is fully filled or cancelled.
+    pub closed: bool,
+}
+
+/// Summary returned by `MultiYieldVault::process_withdraw_queue`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueFillResult {
+    /// Requests visited during this call.
+    pub processed: u32,
+    /// Requests that were fully settled and removed from the queue.
+    pub completed: u32,
+    /// Deposit token paid out across all settled requests.
+    pub paid_out: i128,
+    /// Requests still waiting for liquidity when the call returned.
+    pub remaining_in_queue: u32,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -111,6 +171,11 @@ pub const MAX_POOLS: u32 = 8;
 pub const TTL_LEDGERS: u32 = 17_280;
 pub const DEFAULT_SLIPPAGE_BPS: i128 = 100; // 1 %
 pub const DEFAULT_VOLUME_PROXY_BPS: i128 = 10_000; // 100 % of reserve
+
+/// Hard ceiling on open withdrawal requests, so a liquidity crunch cannot be used
+/// to grow `persistent` storage without bound.  Requests beyond this are rejected
+/// outright rather than silently dropped.
+pub const MAX_QUEUE_ENTRIES: u32 = 128;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -134,6 +199,91 @@ fn load_pools(e: &Env) -> Vec<PoolAllocation> {
 
 fn save_pools(e: &Env, pools: &Vec<PoolAllocation>) {
     e.storage().instance().set(&DataKey::Pools, pools);
+}
+
+// ── Withdrawal queue helpers ──────────────────────────────────────────────────
+
+fn load_queue(e: &Env) -> Vec<u32> {
+    e.storage()
+        .instance()
+        .get(&DataKey::Queue)
+        .unwrap_or(Vec::new(e))
+}
+
+fn save_queue(e: &Env, queue: &Vec<u32>) {
+    e.storage().instance().set(&DataKey::Queue, queue);
+}
+
+fn request_key(id: u32) -> DataKey {
+    DataKey::Withdrawal(id)
+}
+
+fn load_request(e: &Env, id: u32) -> Result<WithdrawalRequest, Error> {
+    e.storage()
+        .persistent()
+        .get(&request_key(id))
+        .ok_or(Error::WithdrawalNotFound)
+}
+
+fn save_request(e: &Env, id: u32, req: &WithdrawalRequest) {
+    let key = request_key(id);
+    e.storage().persistent().set(&key, req);
+    e.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_LEDGERS, TTL_LEDGERS);
+}
+
+/// Deposit token currently idle in the vault, i.e. available to pay a queued
+/// withdrawal without redeeming further LP positions.
+fn available_liquidity(e: &Env, deposit_token: &Address) -> i128 {
+    soroban_sdk::token::Client::new(e, deposit_token).balance(&e.current_contract_address())
+}
+
+/// Append a new open request to the FIFO queue and return its id.
+fn enqueue_request(e: &Env, owner: &Address, requested: i128) -> Result<u32, Error> {
+    let mut queue = load_queue(e);
+    if queue.len() >= MAX_QUEUE_ENTRIES {
+        return Err(Error::QueueFull);
+    }
+    let id: u32 = e
+        .storage()
+        .instance()
+        .get(&DataKey::NextQueueId)
+        .unwrap_or(0);
+    e.storage().instance().set(&DataKey::NextQueueId, &(id + 1));
+
+    save_request(
+        e,
+        id,
+        &WithdrawalRequest {
+            owner: owner.clone(),
+            requested_shares: requested,
+            remaining_shares: requested,
+            filled_amount: 0,
+            closed: false,
+        },
+    );
+    queue.push_back(id);
+    save_queue(e, &queue);
+    Ok(id)
+}
+
+/// Pay `owner` up to `amount` from idle vault liquidity, returning what was
+/// actually transferred.  Never moves more than the vault holds.
+fn pay_out(e: &Env, deposit_token: &Address, owner: &Address, amount: i128) -> i128 {
+    if amount <= 0 {
+        return 0;
+    }
+    let available = available_liquidity(e, deposit_token);
+    let payout = amount.min(available);
+    if payout > 0 {
+        soroban_sdk::token::Client::new(e, deposit_token).transfer(
+            &e.current_contract_address(),
+            owner,
+            &payout,
+        );
+    }
+    payout
 }
 
 /// Estimate APR in bps for the deposit token in a given pool.
@@ -386,6 +536,14 @@ impl MultiYieldVault {
     }
 
     /// Burn `shares` and receive deposit tokens back.
+    ///
+    /// The vault mints shares 1:1 with the deposit token, so `shares` is also the
+    /// amount of deposit token owed to `to`.  When the vault cannot cover that
+    /// amount in full — drained pools, or an idle balance smaller than the
+    /// redemption — it pays out what it can and records the remainder as a
+    /// persistent queue entry instead of skipping the withdrawal.  The returned
+    /// value is the amount actually transferred; a smaller return than `shares`
+    /// means a queue entry now exists for the difference.
     pub fn withdraw(e: Env, to: Address, shares: i128) -> Result<i128, Error> {
         if shares <= 0 {
             return Err(Error::InvalidAmount);
@@ -427,13 +585,15 @@ impl MultiYieldVault {
         }
         save_pools(&e, &pools);
 
-        // Send deposit token to user.
-        soroban_sdk::token::Client::new(&e, &vault.deposit_token).transfer(
-            &e.current_contract_address(),
-            &to,
-            &total_received,
-        );
+        // Send deposit token to user, but never more than the vault can actually
+        // cover right now.  Anything left over stays owed to the user and is
+        // recorded in the withdrawal queue.
+        let payout = pay_out(&e, &vault.deposit_token, &to, total_received.min(shares));
+        let remainder = shares - payout;
 
+        // The full request is settled against the user's balance up front: the
+        // unpaid remainder is carried by the queue entry, so leaving those shares
+        // in the balance would let the same shares be claimed twice.
         e.storage().persistent().set(&bal_key, &(cur - shares));
         e.storage()
             .persistent()
@@ -442,7 +602,123 @@ impl MultiYieldVault {
         vault.total_shares -= shares;
         save_vault(&e, &vault);
 
-        Ok(total_received)
+        if remainder > 0 {
+            let id = enqueue_request(&e, &to, remainder)?;
+            e.events().publish(
+                (Symbol::new(&e, "withdraw_partial"), to.clone()),
+                (id, payout, remainder),
+            );
+        }
+
+        Ok(payout)
+    }
+
+    // ── Withdrawal queue ──────────────────────────────────────────────────────
+
+    /// Settle queued withdrawals, oldest request first.
+    ///
+    /// Permissionless so that anyone can keep the queue moving, but strictly
+    /// FIFO: a request is never paid while an older one is still waiting.  Each
+    /// request is filled as far as idle liquidity allows and stays queued for the
+    /// rest, so a dry vault makes no progress instead of burning through claims.
+    ///
+    /// `max_entries` bounds how many requests are visited per call; it defaults to
+    /// `MAX_QUEUE_ENTRIES` when passed as 0.
+    pub fn process_withdraw_queue(e: Env, max_entries: u32) -> Result<QueueFillResult, Error> {
+        let vault = load_vault(&e)?;
+        let budget = if max_entries == 0 {
+            MAX_QUEUE_ENTRIES
+        } else {
+            max_entries.min(MAX_QUEUE_ENTRIES)
+        };
+
+        let mut queue = load_queue(&e);
+        let mut result = QueueFillResult {
+            processed: 0,
+            completed: 0,
+            paid_out: 0,
+            remaining_in_queue: queue.len(),
+        };
+        if queue.len() == 0 {
+            return Ok(result);
+        }
+
+        let mut visited: u32 = 0;
+        // Always keep looking at the head of the queue: it is the only request
+        // allowed to receive funds, so a dry head stops the whole pass.
+        while visited < budget && queue.len() > 0 {
+            let id = queue.get(0).unwrap();
+            let mut req = load_request(&e, id)?;
+            if req.closed || req.remaining_shares <= 0 {
+                queue.remove(0);
+                continue;
+            }
+
+            let available = available_liquidity(&e, &vault.deposit_token);
+            if available <= 0 {
+                break;
+            }
+
+            let want = req.remaining_shares.min(available);
+            let payout = pay_out(&e, &vault.deposit_token, &req.owner, want);
+            if payout <= 0 {
+                break;
+            }
+
+            req.remaining_shares -= payout;
+            req.filled_amount += payout;
+            result.processed += 1;
+            result.paid_out += payout;
+            visited += 1;
+
+            if req.remaining_shares == 0 {
+                req.closed = true;
+                save_request(&e, id, &req);
+                queue.remove(0);
+                result.completed += 1;
+            } else {
+                // Partially filled again: the request keeps its place at the head
+                // so ordering is preserved and no later claim jumps ahead of it.
+                save_request(&e, id, &req);
+                break;
+            }
+        }
+
+        save_queue(&e, &queue);
+        result.remaining_in_queue = queue.len();
+
+        e.events().publish(
+            (Symbol::new(&e, "queue_processed"),),
+            (result.processed, result.completed, result.paid_out),
+        );
+        Ok(result)
+    }
+
+    /// Abandon a queued withdrawal.  Only the request owner may cancel, and only
+    /// while the request is still open.  The unpaid remainder is simply written
+    /// off — the shares behind it were already deducted when the request was made.
+    pub fn cancel_withdrawal(e: Env, owner: Address, id: u32) -> Result<(), Error> {
+        owner.require_auth();
+        let mut req = load_request(&e, id)?;
+        if req.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+        if req.closed || req.remaining_shares <= 0 {
+            return Err(Error::WithdrawalClosed);
+        }
+        req.remaining_shares = 0;
+        req.closed = true;
+        save_request(&e, id, &req);
+
+        let mut queue = load_queue(&e);
+        for i in 0..queue.len() {
+            if queue.get(i).unwrap() == id {
+                queue.remove(i);
+                break;
+            }
+        }
+        save_queue(&e, &queue);
+        Ok(())
     }
 
     // ── Rebalancing ───────────────────────────────────────────────────────────
@@ -545,7 +821,10 @@ impl MultiYieldVault {
 
         save_pools(&e, &pools);
 
-        e.events().publish((Symbol::new(&e, "rebalance"),), (last_idx as u32, total_to_move));
+        e.events().publish(
+            (Symbol::new(&e, "rebalance"),),
+            (last_idx as u32, total_to_move),
+        );
         Ok(())
     }
 
@@ -564,6 +843,28 @@ impl MultiYieldVault {
             .persistent()
             .get(&DataKey::Balance(user))
             .unwrap_or(0)
+    }
+
+    /// Ids of the open withdrawal requests, oldest first.
+    pub fn get_queue(e: Env) -> Vec<u32> {
+        load_queue(&e)
+    }
+
+    /// Number of withdrawal requests still waiting for liquidity.
+    pub fn queue_len(e: Env) -> u32 {
+        load_queue(&e).len()
+    }
+
+    /// A single withdrawal request, or `None` when the id was never issued.
+    pub fn get_withdrawal_request(e: Env, id: u32) -> Option<WithdrawalRequest> {
+        e.storage().persistent().get(&request_key(id))
+    }
+
+    /// Deposit token currently idle in the vault and therefore available to pay
+    /// queued withdrawals.
+    pub fn available_liquidity(e: Env) -> Result<i128, Error> {
+        let vault = load_vault(&e)?;
+        Ok(available_liquidity(&e, &vault.deposit_token))
     }
 
     /// Returns the estimated APR (in bps) for each registered pool, in order.
