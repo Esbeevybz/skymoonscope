@@ -509,6 +509,8 @@ pub struct AppState {
     metrics: Arc<AppMetrics>,
     /// WebSocket event bus for simulation jobs.
     simulation_bus: Arc<SimulationBus>,
+    /// Stellar network passphrase (used for cache key generation)
+    network_passphrase: String,
 }
 
 #[derive(Clone)]
@@ -1023,8 +1025,12 @@ async fn analyze(
     tracing::info!("Received analyze request");
 
     let args = payload.args.clone().unwrap_or_default();
-    let cache_key =
-        SimulationCache::generate_key(&payload.contract_id, &payload.function_name, &args);
+    let cache_key = SimulationCache::generate_key_with_network(
+        &payload.contract_id,
+        &payload.function_name,
+        &args,
+        &state.network_passphrase,
+    );
 
     // Track simulation latency
     let start_time = std::time::Instant::now();
@@ -2707,6 +2713,7 @@ async fn main() {
         metrics: Arc::clone(&app_metrics),
         metrics,
         simulation_bus,
+        network_passphrase: config.network_passphrase.clone(),
     });
 
     // ── Issue #592: System Resource Alarm Monitor ────────────────────────
@@ -3095,10 +3102,18 @@ mod tests {
         let event_pool = Arc::new(EventWorkerPool::new(4).unwrap());
         let app_state = Arc::new(AppState {
             engine: SimulationEngine::new("https://test.example.com".to_string()),
+            provider_registry: Arc::new(ProviderRegistry::new(Default::default())),
             cache: SimulationCache::new(),
             insights_engine: InsightsEngine::new(),
+            gas_golfing_analyzer: GasGolfingAnalyzer::new(),
             simulation_timeout: std::time::Duration::from_secs(30),
+            job_queue: JobQueue::new(10),
             event_worker_pool: Arc::clone(&event_pool),
+            fee_analytics_engine: FeeAnalyticsEngine::new(),
+            fee_store: Arc::new(FeeStore::new()),
+            metrics: Arc::new(AppMetrics::new().unwrap()),
+            simulation_bus: Arc::new(SimulationBus::new(100)),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
         });
         let auth_state = Arc::new(auth::AuthState::new(
             "test-secret".to_string(),
