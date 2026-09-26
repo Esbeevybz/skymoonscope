@@ -230,6 +230,7 @@ impl CrossChainVerifier {
         if Self::is_paused(env.clone()) {
             return false;
         }
+        let leaf = Self::compute_payload_hash(&env, &payload);
         Self::verify_merkle_proof(&env, &leaf, &block_height, &proof, &proof_flags)
     }
 
@@ -249,7 +250,7 @@ impl CrossChainVerifier {
             panic!("nonce already processed");
         }
 
-        let valid = Self::verify_message(env.clone(), block_height, leaf, proof, proof_flags);
+        let valid = Self::verify_merkle_proof(&env, &leaf, &block_height, &proof, &proof_flags);
         if !valid {
             return false;
         }
@@ -314,6 +315,15 @@ impl CrossChainVerifier {
         BytesN::from_array(env, &digest)
     }
 
+    /// Verify an RFC 6962 Merkle inclusion proof for `leaf` against the state
+    /// root recorded for `block_height`.
+    ///
+    /// Domain separation follows RFC 6962: a leaf is hashed as
+    /// `SHA256(0x00 || leaf)` and an interior node as
+    /// `SHA256(0x01 || left || right)`. Without distinct prefixes, a value that
+    /// is a valid leaf can also be presented as an internal node (and vice
+    /// versa), which is the classic second-preimage forgery against a Merkle
+    /// tree (issue #76).
     fn verify_merkle_proof(
         env: &Env,
         leaf: &BytesN<32>,
@@ -334,21 +344,9 @@ impl CrossChainVerifier {
             return false;
         }
 
-        // Replay protection: nonce must not have been used before
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::NonceUsed(payload.nonce))
-        {
-            panic!("Nonce already used");
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::NonceUsed(payload.nonce), &true);
+        // Domain-separated leaf hash: `SHA256(0x00 || leaf)`.
+        let mut current_hash = merkle_leaf_hash(env, leaf).to_array();
 
-        // Compute domain-separated leaf hash
-        let leaf = Self::compute_payload_hash(&env, &payload);
-        let mut current_hash = leaf.to_array();
         let mut i = 0;
         while i < proof.len() {
             let sibling = proof.get(i).unwrap().to_array();
@@ -360,18 +358,42 @@ impl CrossChainVerifier {
                 (current_hash, sibling)
             };
 
-            let mut combined = [0u8; 64];
-            combined[0..32].copy_from_slice(&left);
-            combined[32..64].copy_from_slice(&right);
-
-            let combined_bytes = Bytes::from_slice(env, &combined);
-            current_hash = env.crypto().sha256(&combined_bytes).to_array();
+            // Domain-separated interior node: `SHA256(0x01 || left || right)`.
+            current_hash = merkle_node_hash(env, &left, &right);
             i += 1;
         }
 
         let computed_root = BytesN::from_array(env, &current_hash);
         computed_root == expected_root
     }
+}
+
+/// RFC 6962 domain-separation prefix for Merkle leaf hashes (issue #76).
+///
+/// Hashing leaves under a different prefix than interior nodes is what makes a
+/// second-preimage attack against the tree fail: a leaf can no longer be
+/// presented as an internal node, or an internal node as a leaf.
+pub const MERKLE_LEAF_PREFIX: u8 = 0x00;
+
+/// RFC 6962 domain-separation prefix for Merkle interior node hashes.
+pub const MERKLE_NODE_PREFIX: u8 = 0x01;
+
+/// RFC 6962 leaf hash: `SHA256(0x00 || leaf)`.
+pub fn merkle_leaf_hash(env: &Env, leaf: &BytesN<32>) -> BytesN<32> {
+    let mut buf = [MERKLE_LEAF_PREFIX; 32];
+    buf[1..32].copy_from_slice(&leaf.to_array());
+    env.crypto().sha256(&Bytes::from_slice(env, &buf)).into()
+}
+
+/// RFC 6962 interior node hash: `SHA256(0x01 || left || right)`.
+pub fn merkle_node_hash(env: &Env, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut combined = [0u8; 65];
+    combined[0] = MERKLE_NODE_PREFIX;
+    combined[1..33].copy_from_slice(left);
+    combined[33..65].copy_from_slice(right);
+    env.crypto()
+        .sha256(&Bytes::from_slice(env, &combined))
+        .to_array()
 }
 
 /// Helper methods outside #[contractimpl] so they can accept reference parameters.
