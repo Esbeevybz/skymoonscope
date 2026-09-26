@@ -486,6 +486,83 @@ fn seed_asks(
     }
 }
 
+// -- Per-call match cap (issue #82) --------------------------------------------
+
+#[test]
+fn test_per_call_match_cap_returns_partial_fill() {
+    let e = Env::default();
+    e.mock_all_auths();
+    // A generous per-ledger budget so the per-call cap, not the ledger budget,
+    // is what stops the sweep.
+    let (client, admin, token_a, token_b, _) =
+        setup_with(&e, MAX_MATCH_DEPTH_LIMIT, DEFAULT_MAX_PRICE_DEVIATION_BPS);
+
+    // One more resting ask than a single call is allowed to consume.
+    seed_asks(&e, &client, &admin, &token_a, MAX_MATCHES_PER_CALL + 1, 100);
+
+    let taker = Address::generate(&e);
+    mint(&e, &admin, &token_b, &taker, 1_000_000);
+
+    let requested = 100 * (MAX_MATCHES_PER_CALL as i128 + 1);
+    let result = client.swap(&taker, &true, &requested, &1_000_000);
+
+    let partial = result
+        .partial_fill
+        .expect("cap should report a partial fill");
+    assert!(partial.cap_reached);
+    assert_eq!(partial.matches, MAX_MATCHES_PER_CALL);
+    assert_eq!(partial.filled, 100 * (MAX_MATCHES_PER_CALL as i128));
+    assert_eq!(partial.remaining, 100);
+    assert_eq!(result.lob_filled, partial.filled);
+    // The capped call must not fall through to the AMM.
+    assert_eq!(result.amm_filled, 0);
+    assert_eq!(result.amount_out, partial.filled);
+    // The unmatched order is still resting for the follow-up call.
+    assert_eq!(client.get_asks().len(), 1);
+}
+
+#[test]
+fn test_partial_fill_completes_in_subsequent_call() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin, token_a, token_b, _) =
+        setup_with(&e, MAX_MATCH_DEPTH_LIMIT, DEFAULT_MAX_PRICE_DEVIATION_BPS);
+
+    seed_asks(&e, &client, &admin, &token_a, MAX_MATCHES_PER_CALL + 1, 100);
+
+    let taker = Address::generate(&e);
+    mint(&e, &admin, &token_b, &taker, 1_000_000);
+
+    let requested = 100 * (MAX_MATCHES_PER_CALL as i128 + 1);
+    let first = client.swap(&taker, &true, &requested, &1_000_000);
+    let remaining = first.partial_fill.unwrap().remaining;
+
+    // The caller finishes the fill with a follow-up swap for the remainder.
+    let second = client.swap(&taker, &true, &remaining, &1_000_000);
+    assert!(second.partial_fill.is_none());
+    assert_eq!(second.lob_filled, remaining);
+    assert_eq!(client.get_asks().len(), 0);
+    assert_eq!(balance(&e, &token_a, &taker), requested);
+}
+
+#[test]
+fn test_swap_at_per_call_cap_is_not_partial() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin, token_a, token_b, _) =
+        setup_with(&e, MAX_MATCH_DEPTH_LIMIT, DEFAULT_MAX_PRICE_DEVIATION_BPS);
+
+    seed_asks(&e, &client, &admin, &token_a, MAX_MATCHES_PER_CALL, 100);
+
+    let taker = Address::generate(&e);
+    mint(&e, &admin, &token_b, &taker, 1_000_000);
+
+    let requested = 100 * (MAX_MATCHES_PER_CALL as i128);
+    let result = client.swap(&taker, &true, &requested, &1_000_000);
+    assert!(result.partial_fill.is_none());
+    assert_eq!(result.lob_filled, requested);
+}
+
 #[test]
 fn test_match_depth_caps_book_consumption() {
     let e = Env::default();

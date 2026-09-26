@@ -60,6 +60,13 @@ fn collect_deployment_fee(env: &Env, seller: &Address) -> Result<(), FactoryErro
     Ok(())
 }
 
+fn load_deployed_auctions(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::DeployedAuctions)
+        .unwrap_or(Vec::new(env))
+}
+
 fn register_auction(env: &Env, address: &Address, auction_type: &AuctionType) {
     let index: u32 = env
         .storage()
@@ -306,6 +313,30 @@ impl AuctionFactory {
         env.storage()
             .persistent()
             .get(&DataKey::AuctionByIndex(index))
+    }
+
+    /// Every auction address this factory has deployed, in deployment order.
+    ///
+    /// Backed by the instance-scoped `Vec<Address>` registry that
+    /// `register_auction` appends to on each deployment.
+    pub fn get_deployed_auctions(env: Env) -> Vec<Address> {
+        load_deployed_auctions(&env)
+    }
+
+    /// Number of auctions recorded in the instance-scoped deployment registry.
+    pub fn get_deployed_auction_count(env: Env) -> u32 {
+        load_deployed_auctions(&env).len()
+    }
+
+    /// Whether `auction_address` was deployed by this factory.
+    pub fn is_deployed_auction(env: Env, auction_address: Address) -> bool {
+        let deployed = load_deployed_auctions(&env);
+        for i in 0..deployed.len() {
+            if deployed.get(i).unwrap() == auction_address {
+                return true;
+            }
+        }
+        false
     }
 
     /// Return a bounded page of deployed auction addresses for indexers.

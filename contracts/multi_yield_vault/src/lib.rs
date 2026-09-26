@@ -95,6 +95,30 @@ pub struct VaultState {
     pub slippage_bps: i128,
     /// Assumed daily volume as a fraction of pool reserve, in bps (default 10_000 = 100%).
     pub volume_proxy_bps: i128,
+    /// Deposit-token amount currently owed across all outstanding withdrawal
+    /// queue entries.  Kept in lockstep with the `WithdrawalRequest` entries so
+    /// the vault can report its total unfunded withdrawal liability.
+    pub queued_amount: i128,
+}
+
+/// A withdrawal that the vault could not settle in full because it did not have
+/// enough available liquidity at execution time.
+///
+/// The settled portion is paid out immediately by `withdraw`; `remaining_amount`
+/// is persisted here so the depositor keeps an enforceable claim on the vault
+/// instead of the shortfall being silently dropped.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WithdrawalRequest {
+    /// Address entitled to the payout.
+    pub owner: Address,
+    /// Deposit-token amount still owed to `owner`.
+    pub remaining_amount: i128,
+    /// Ledger sequence on which the entry was first created.  Preserved across
+    /// top-ups so the queue stays first-come, first-served.
+    pub requested_at_ledger: u32,
+    /// How many times this entry has been (re)queued with a larger remainder.
+    pub queue_count: u32,
 }
 
 /// Per-pool allocation record.
@@ -362,6 +386,7 @@ impl MultiYieldVault {
                 total_shares: 0,
                 slippage_bps,
                 volume_proxy_bps,
+                queued_amount: 0,
             },
         );
         Ok(())
@@ -550,6 +575,7 @@ impl MultiYieldVault {
         }
         to.require_auth();
         let mut vault = load_vault(&e)?;
+        let token = soroban_sdk::token::Client::new(&e, &vault.deposit_token);
 
         let bal_key = DataKey::Balance(to.clone());
         let cur: i128 = e.storage().persistent().get(&bal_key).unwrap_or(0);
@@ -557,9 +583,9 @@ impl MultiYieldVault {
             return Err(Error::InsufficientShares);
         }
 
-        // Proportional share of total vault assets.
-        let fraction_num = shares;
-        let fraction_den = vault.total_shares;
+        // Deposit token already idle in the vault counts towards what this
+        // withdrawal can be settled with right now.
+        let idle_before = token.balance(&e.current_contract_address());
 
         let mut pools = load_pools(&e);
         let mut total_received: i128 = 0;
@@ -570,7 +596,7 @@ impl MultiYieldVault {
                 continue;
             }
             // Withdraw proportional LP shares from this pool.
-            let lp_to_burn = alloc.lp_shares * fraction_num / fraction_den;
+            let lp_to_burn = alloc.lp_shares * shares / vault.total_shares;
             if lp_to_burn == 0 {
                 continue;
             }

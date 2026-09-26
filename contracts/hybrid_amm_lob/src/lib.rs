@@ -101,6 +101,29 @@ pub struct SwapResult {
     pub lob_filled: i128,
     /// How much of `amount_out` was filled by the AMM.
     pub amm_filled: i128,
+    /// Set when the per-call match cap stopped the order-book sweep before the
+    /// requested output was fully filled.  `None` for a complete fill.
+    pub partial_fill: Option<PartialFill>,
+}
+
+/// Description of an order-book sweep that hit [`MAX_MATCHES_PER_CALL`] before
+/// the taker's requested output was fully filled.
+///
+/// The outstanding remainder is deliberately *not* routed to the AMM in the
+/// capped call: doing so would let one transaction both walk an unbounded number
+/// of ticks and drag the pool price.  The caller is told how much is still
+/// outstanding so it can finish the fill in a subsequent call (issue #82).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartialFill {
+    /// Output actually delivered by this call.
+    pub filled: i128,
+    /// Output still outstanding after this call.
+    pub remaining: i128,
+    /// Limit orders consumed by this call.
+    pub matches: u32,
+    /// True when the sweep stopped because [`MAX_MATCHES_PER_CALL`] was reached.
+    pub cap_reached: bool,
 }
 
 /// A swap that stopped at `MAX_MATCHES_PER_CALL` with output still outstanding
@@ -729,6 +752,14 @@ impl HybridAmmLob {
                     }
                 }
 
+                // Per-call CPU bound: a matchable order is sitting right here but
+                // this invocation has already consumed `MAX_MATCHES_PER_CALL`
+                // orders. Stop the sweep and report a partial fill (issue #82).
+                if matched >= MAX_MATCHES_PER_CALL {
+                    cap_reached = true;
+                    break;
+                }
+
                 // Execution depth: a matchable order is sitting right here but
                 // this ledger's budget is spent. Stop consuming the book and let
                 // the AMM price the remainder, where the deviation guard applies.
@@ -807,6 +838,14 @@ impl HybridAmmLob {
                     }
                 }
 
+                // Per-call CPU bound: stop the sweep once this invocation has
+                // consumed `MAX_MATCHES_PER_CALL` orders and report a partial
+                // fill so the caller can finish in a later call (issue #82).
+                if matched >= MAX_MATCHES_PER_CALL {
+                    cap_reached = true;
+                    break;
+                }
+
                 // Execution depth: budget for this ledger is spent. Stop here;
                 // the AMM prices the remainder under the deviation guard.
                 if matched >= depth_budget {
@@ -874,6 +913,37 @@ impl HybridAmmLob {
 
         if matched > 0 {
             save_depth_used(&e, depth_used + matched);
+        }
+
+        // ── Per-call match cap reached ─────────────────────────────────────────
+        //
+        // The sweep consumed `MAX_MATCHES_PER_CALL` orders and output is still
+        // outstanding. Settle what was matched and hand the remainder back to the
+        // caller as a `PartialFill` instead of routing it to the AMM: the capped
+        // call must not both walk a deep book and move the pool price. The caller
+        // can submit a follow-up swap for the remaining amount (issue #82).
+        if cap_reached && remaining_out > 0 {
+            let filled = out - remaining_out;
+            if total_in > in_max {
+                return Err(Error::SlippageExceeded);
+            }
+            save_pool(&e, &pool);
+
+            let result = SwapResult {
+                amount_in: total_in,
+                amount_out: filled,
+                lob_filled,
+                amm_filled: 0,
+                partial_fill: Some(PartialFill {
+                    filled,
+                    remaining: remaining_out,
+                    matches: matched,
+                    cap_reached: true,
+                }),
+            };
+            e.events()
+                .publish((Symbol::new(&e, "swap"), taker), result.clone());
+            return Ok(result);
         }
 
         // ── Phase 2: fill remainder from AMM ─────────────────────────────────

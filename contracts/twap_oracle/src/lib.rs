@@ -177,8 +177,9 @@ impl TwapOracle {
     /// - The TWAP as i128, or 0 if no updates.
     ///
     /// # Safety
-    /// - The `as i128` cast on the division result assumes the TWAP fits within i128.
-    ///   This is safe for all practical token prices given u128 range for the accumulator.
+    /// - The accumulator is `u128` while the reported price is `i128`, so the
+    ///   quotient is converted with `try_from` and saturates at `i128::MAX`
+    ///   rather than wrapping round to a negative price (issue #85).
     pub fn get_twap(e: Env) -> i128 {
         let cumulative: u128 = e
             .storage()
@@ -189,7 +190,7 @@ impl TwapOracle {
         if total_time == 0 {
             0
         } else {
-            (cumulative / total_time) as i128
+            i128::try_from(cumulative / total_time).unwrap_or(i128::MAX)
         }
     }
 

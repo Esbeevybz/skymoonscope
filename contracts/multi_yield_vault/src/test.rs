@@ -1,4 +1,4 @@
-use crate::{MultiYieldVault, MultiYieldVaultClient};
+use crate::{Error, MultiYieldVault, MultiYieldVaultClient};
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
@@ -92,6 +92,21 @@ impl MockPool {
 
     pub fn token_a(e: Env) -> Address {
         Address::generate(&e) // unused in vault logic
+    }
+
+    /// Simulate liquidity leaving the pool without any LP shares being burned
+    /// (e.g. other LPs exiting), so the vault's pro-rata claim is worth more
+    /// than the pool can actually pay out.  Used to exercise the vault's
+    /// partial-withdrawal path.
+    pub fn drain_reserves(e: Env, amount_a: i128, amount_b: i128) {
+        let ra: i128 = e.storage().instance().get(&MockKey::ReserveA).unwrap_or(0);
+        let rb: i128 = e.storage().instance().get(&MockKey::ReserveB).unwrap_or(0);
+        e.storage()
+            .instance()
+            .set(&MockKey::ReserveA, &(ra - amount_a));
+        e.storage()
+            .instance()
+            .set(&MockKey::ReserveB, &(rb - amount_b));
     }
 }
 
