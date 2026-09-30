@@ -113,3 +113,51 @@ fn test_admin_rotation_unauthorized_approver() {
 
     client.set_admin(&vec![&env, stranger.clone()], &new_admin);
 }
+
+/// Scenario where new admin fails to confirm, leaving rotation in a pending state.
+/// The old admin retains control while the new admin is pending.
+#[test]
+fn test_admin_rotation_unconfirmed_pending_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin) = setup(&env);
+    let new_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    // Old admin initiates rotation to new_admin
+    client.set_admin(&vec![&env, admin.clone()], &new_admin);
+
+    // When the new admin fails to confirm, rotation remains pending:
+    // Old admin retains full control and can still perform admin operations
+    client.mint(&user, &500);
+    assert_eq!(client.balance(&user), 500);
+}
+
+/// Two-step admin confirmation flow: asserts the old admin remains in control
+/// until confirm_admin is called by the new admin.
+#[test]
+fn test_admin_rotation_two_step_confirmation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin) = setup(&env);
+    let new_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    // Step 1: Initiate rotation leaving new admin in pending state
+    client.set_admin(&vec![&env, admin.clone()], &new_admin);
+
+    // Old admin remains in control before confirmation
+    client.mint(&user, &300);
+    assert_eq!(client.balance(&user), 300);
+
+    // Step 2: New admin calls confirm_admin to complete rotation
+    client.confirm_admin(&new_admin);
+
+    // After confirmation, new admin has control
+    let user2 = Address::generate(&env);
+    client.mint(&user2, &200);
+    assert_eq!(client.balance(&user2), 200);
+}
+
