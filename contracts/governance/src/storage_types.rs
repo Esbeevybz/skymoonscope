@@ -1,6 +1,6 @@
 use soroban_sdk::{contracttype, Address, String, Vec};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug, EqV)]
 #[contracttype]
 pub enum ProposalState {
     Draft,
@@ -11,7 +11,7 @@ pub enum ProposalState {
     Vetoed,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug, EqV)]
 #[contracttype]
 pub struct ProposalAction {
     pub contract_id: Address,
@@ -19,7 +19,7 @@ pub struct ProposalAction {
     pub args: Vec<String>, // Simplified, in real implementation might need proper types
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug, EqV)]
 #[contracttype]
 pub struct Proposal {
     pub id: u32,
@@ -37,7 +37,7 @@ pub struct Proposal {
     pub quorum_required: i128,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug, EqV)]
 #[contracttype]
 pub struct GovernanceConfig {
     pub admin: Address,
@@ -47,7 +47,7 @@ pub struct GovernanceConfig {
     pub proposal_count: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug, EqV)]
 #[contracttype]
 pub enum DataKey {
     Proposal(u32),
@@ -60,4 +60,30 @@ pub enum DataKey {
     Voters,
     VotingPowerSnapshot(u32, Address),
     TotalVotingPowerSnapshot(u32),
+}
+
+/// A single field-level difference between two proposal versions.
+#[derive(Clone, PartialEq, Debug, EqV)]
+#[contracttype]
+pub struct ProposalFieldDiff {
+    /// Name of the compared field (e.g. "title", "description", "state").
+    pub field: String,
+    /// Rendered value on the left (older) version.
+    pub left: String,
+    /// Rendered value on the right (newer) version.
+    pub right: String,
+}
+
+/// Side-by-side comparison of two proposal versions.
+#[derive(Clone, PartialEq, Debug, EqV)]
+#[contracttype]
+pub struct ProposalComparison {
+    /// Id of the left (older) proposal.
+    pub left_id: u32,
+    /// Id of the right (newer) proposal.
+    pub right_id: u32,
+    /// True when the two proposals are functionally identical.
+    pub identical: bool,
+    /// Ordered list of fields that differ between the two versions.
+    pub diffs: Vec<ProposalFieldDiff,
 }

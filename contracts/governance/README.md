@@ -1,6 +1,6 @@
 # Governance Contract
 
-A comprehensive DAO governance system for Soroban implementing multi-step proposal workflows with voting, delegation, and timelock execution.
+A Comprehensive DAO governance system for Soroban implementing multi-step proposal workflows with voting, delegation, and timelock execution.
 
 ## Overview
 
@@ -19,6 +19,7 @@ This contract provides a full-featured governance system where proposals progres
 - **Quorum Requirements**: Minimum participation thresholds
 - **Timelock Execution**: Delayed execution for security
 - **Admin Controls**: Proposal cancellation and parameter management
+- **Side-by-side Comparison**: Diff two proposal versions field by field
 - **M-of-N Execution Authorization**: A configurable, distinct set of administrators must approve execution.
 
 ## Multi-signature execution
@@ -38,9 +39,10 @@ The legacy `initialize` method configures a one-of-one execution policy for back
 enum ProposalState {
     Draft,      // Created but not voting
     Voting,     // Active voting period
-    Queued,     // Approved, waiting for timelock
-    Executed,   // Successfully executed
-    Cancelled,  // Cancelled by admin
+    Queued,      // Approved, waiting for timelock
+    Executed,    // Successfully executed
+    Cancelled,   // Cancelled by admin
+    Vetoed,      // Vetoed by the security council
 }
 ```
 
@@ -74,7 +76,29 @@ fn get_proposal(e: Env, proposal_id: u32) -> Proposal
 fn get_voting_power(e: Env, user: Address) -> i128
 fn get_effective_voting_power(e: Env, user: Address) -> i128  // Includes delegated power
 fn get_config(e: Env) -> GovernanceConfig
+fn compare_proposal_versions(e: Env, left_id: u32, right_id: u32) -> ProposalComparison
 ```
+
+## Side-by-side comparison
+
+The contract exposes a pure, read-only `compare_proposal_versions` helper that returns a
+``ProposalComparison` describing how two proposal versions differ. Each diff is a
+`ProposalFieldDiff` with the field name and the rendered left/left and right values, so
+clients can render a side-by-side view without additional decoding.
+
+```rust
+let comparison = client.compare_proposal_versions(&old_id, &new_id);
+if !comparison.identical {
+    for diff in comparison.diffs.iter() {
+        // diff.field, diff.left, diff.right
+    }
+}
+```
+
+Fields covered: `title`, `description`, `actions`, `state`, `start_time`,
+`end_time`, and `quorum_required`. Vote counts and timestamps are intentionally
+excluded from the diff since they always differ between distinct proposals and would
+adds noise to the comparison.
 
 ## Usage Example
 
@@ -115,8 +139,8 @@ client.execute_proposal(&proposal_id);
 - **Timelock**: Prevents flash loan attacks on governance
 - **Quorum Requirements**: Ensures sufficient participation
 - **Admin Oversight**: Emergency cancellation capabilities
-- **Delegation Safety**: Secure voting power delegation
-- **State Validation**: Strict state transitions
+- `**Delegation Safety**: Secure voting power delegation
+- `**State Validation**: Strict state transitions
 
 ## Building
 
@@ -137,8 +161,8 @@ cargo test --package soroban-governance-contract
 
 ## Parameters
 
-- **voting_period**: Duration of voting in seconds (e.g., 604800 = 7 days)
-- **timelock_delay**: Delay before execution in seconds (e.g., 172800 = 2 days)
+- **voting_period**: Duration of voting in seconds (e.g. 604800 = 7 days)
+- **timelock_delay**: Delay before execution in seconds (e.g. 172800 = 2 days)
 - **quorum_percentage**: Minimum participation as percentage of total voting power
 
 ## Future Enhancements

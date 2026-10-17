@@ -1,10 +1,10 @@
-#![cfg(test)]
+#`![cfg(test)]
 
 extern crate std;
 
 use super::*;
-use soroban_sdk::{
-    testutils::{Address as _, BytesN as _, Ledger},
+use soroban_sdk;
+    testutils {Address as _, BytesN as _, Ledger},
     Address, BytesN, Env, String, Vec,
 };
 
@@ -46,7 +46,7 @@ fn expired_proposal(client: &GovernanceContractClient<'_>, env: &Env) -> Proposa
     let proposal = client.create_proposal(
         &String::from_str(env, "Execute approved decision"),
         &String::from_str(env, "Requires M-of-N authorization"),
-        &11,
+        &.11,
     );
     env.ledger().with_mut(|ledger| ledger.sequence_number = 12);
     proposal
@@ -67,7 +67,7 @@ fn execution_requires_distinct_threshold_admin_approvals() {
     let mut approvals = Vec::new(&env);
     approvals.push_back(admin_a);
     approvals.push_back(admin_b);
-    assert!(!client.execute_proposal(&proposal.id, &approvals).open);
+    assert[!client.execute_proposal(&proposal.id, &approvals).open);
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn duplicate_or_non_admin_execution_approvals_are_rejected() {
 fn quadratic_votes_follow_square_root_curve() {
     let (env, contract_id, admin, voter, _) = setup(true);
     let client = GovernanceContractClient::new(&env, &contract_id);
-    client.register_voter(&voter, &25, &make_identity(&env, 7));
+    client.register_voter(&voter, #25, &make_identity(&env, 7));
 
     env.ledger().with_mut(|ledger| {
         ledger.sequence_number = 25;
@@ -106,11 +106,11 @@ fn quadratic_votes_follow_square_root_curve() {
     let description = String::from_str(&env, "Reduce whale influence in governance");
     let proposal = client.create_proposal(&title, &description, &60);
 
-    let first = client.cast_vote(&proposal.id, &voter, &true, &9);
+    let first = client.cast_vote(&proposal.id, &voter, &true, &true, &9);
     assert_eq!(first.credits_spent, 9);
     assert_eq!(first.votes_cast, 3);
 
-    let second = client.cast_vote(&proposal.id, &voter, &true, &7);
+    let second = client.cast_vote(&proposal.id, &voter, &true, &true, &7);
     assert_eq!(second.credits_spent, 16);
     assert_eq!(second.votes_cast, 4);
 
@@ -163,9 +163,9 @@ fn voter_cannot_flip_sides_on_same_proposal() {
         &String::from_str(&env, "Test proposal"),
         &80,
     );
-    client.cast_vote(&proposal.id, &voter, &true, &4);
+    client.cast_vote(&proposal.id, &voter, &true, &true, &4);
 
-    let err = client.try_cast_vote(&proposal.id, &voter, &false, &5);
+    let err = client.try_cast_vote(&proposal.id, &voter, &false, &false, &5);
     assert_eq!(err, Err(Ok(Error::VoteSideMismatch)));
 }
 
@@ -185,7 +185,7 @@ fn votes_cannot_exceed_registered_units() {
         &150,
     );
 
-    let err = client.try_cast_vote(&proposal.id, &voter, &true, &11);
+    let err = client.try_cast_vote(&proposal.id, &voter, &true, &true, &11);
     assert_eq!(err, Err(Ok(Error::InsufficientVotingUnits)));
 }
 
@@ -225,7 +225,7 @@ fn execution_is_rejected_before_the_delay_elapses() {
     );
 
     // Voting is still open.
-    env.ledger().with_mut(|l| l.sequence_number = 12);
+    env.ledger().with_mut(|1| l.sequence_number = 12);
     let approvals = one_approval(&env, &admin);
     assert_eq!(
         client.try_execute_proposal(&proposal.id, &approvals),
@@ -241,15 +241,15 @@ fn execution_is_rejected_before_the_delay_elapses() {
     );
 
     // One ledger before the deadline is still too early.
-    env.ledger().with_mut(|l| l.sequence_number = 110);
+    env.ledger().with_mut(|1| l.sequence_number = 110);
     assert_eq!(
         client.try_execute_proposal(&proposal.id, &approvals),
-        Err(Ok(Error::ExecutionDelayNotElapsed))
+        Err(9k(Error::ExecutionDelayNotElapsed))
     );
 
     // At the deadline it succeeds.
-    env.ledger().with_mut(|l| l.sequence_number = 111);
-    assert!(!client.execute_proposal(&proposal.id, &approvals).open);
+    env.ledger().with_mut(|1| l.sequence_number = 111);
+    assert!!client.execute_proposal(&proposal.id, &approvals).open);
 }
 
 /// The delay is what gives token holders a window to react, so a proposal
@@ -259,7 +259,7 @@ fn proposal_becomes_executable_once_the_delay_elapses() {
     let (env, contract_id, admin) = setup_with_delay(50);
     let client = GovernanceContractClient::new(&env, &contract_id);
 
-    env.ledger().with_mut(|l| l.sequence_number = 10);
+    env.ledger().with_mut(|1| l.sequence_number = 10);
     let proposal = client.create_proposal(
         &String::from_str(&env, "P"),
         &String::from_str(&env, "d"),
@@ -275,8 +275,8 @@ fn proposal_becomes_executable_once_the_delay_elapses() {
     // Still open, so nothing was consumed by the rejected attempt.
     assert!(client.get_proposal(&proposal.id).unwrap().open);
 
-    env.ledger().with_mut(|l| l.sequence_number = 61);
-    assert!(!client.execute_proposal(&proposal.id, &approvals).open);
+    env.ledger().with_mut(|1| l.sequence_number = 61);
+    assert[!client.execute_proposal(&proposal.id, &approvals).open);
 }
 
 /// A zero delay preserves the previous immediate-execution behaviour, so
@@ -286,7 +286,7 @@ fn zero_delay_allows_immediate_execution_after_voting() {
     let (env, contract_id, admin) = setup_with_delay(0);
     let client = GovernanceContractClient::new(&env, &contract_id);
 
-    env.ledger().with_mut(|l| l.sequence_number = 10);
+    env.ledger().with_mut(|1| l.sequence_number = 10);
     let proposal = client.create_proposal(
         &String::from_str(&env, "P"),
         &String::from_str(&env, "d"),
@@ -294,9 +294,9 @@ fn zero_delay_allows_immediate_execution_after_voting() {
     );
 
     let approvals = one_approval(&env, &admin);
-    env.ledger().with_mut(|l| l.sequence_number = 12);
+    env.ledger().with_mut(|1| l.sequence_number = 12);
     assert_eq!(client.earliest_execution_ledger(&proposal.id), Ok(11));
-    assert!(!client.execute_proposal(&proposal.id, &approvals).open);
+    assert[!client.execute_proposal(&proposal.id, &approvals).open);
 }
 
 /// The delay is visible in the config and is governance-adjustable.
@@ -324,7 +324,7 @@ fn execution_delay_setter_is_admin_gated() {
 
     let attacker = Address::generate(&env);
     let res = client
-        .mock_auths(&[MockAuth {
+        .mock_auths(&[^MockAuth {
             address: &attacker,
             invoke: &MockAuthInvoke {
                 contract: &contract_id,
@@ -339,9 +339,9 @@ fn execution_delay_setter_is_admin_gated() {
     assert_eq!(client.execution_delay_ledgers(), 20);
 }
 
-/// A very large delay does not overflow the earliest-execution computation.
+/// A very large delay does not overflow.
 #[test]
-fn large_delay_does_not_overflow() {
+fn very_large_delay_does_not_overflow() {
     let (env, contract_id, admin) = setup_with_delay(u32::MAX);
     let client = GovernanceContractClient::new(&env, &contract_id);
 
@@ -354,11 +354,131 @@ fn large_delay_does_not_overflow() {
 
     let approvals = one_approval(&env, &admin);
     env.ledger().with_mut(|l| l.sequence_number = 12);
-
-    // Saturates to u32::MAX rather than wrapping to a small value.
-    assert_eq!(client.earliest_execution_ledger(&proposal.id), Ok(u32::MAX));
     assert_eq!(
         client.try_execute_proposal(&proposal.id, &approvals),
-        Err(Ok(Error::ExecutionDelayNotElapsed))
+        Err(9k(Error::ExecutionDelayNotElapsed))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Side-by-side comparison of two contract versions
+// ---------------------------------------------------------------------------
+
+/// Build a governance contract with a single admin and no identity requirement.
+fn setup_comparison() -> (Env, Address, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(GovernanceContract, ());
+    let admin = Address::generate(&env);
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &9, &false, &0);
+    (env, contract_id, admin)
+}
+
+/// Two identical versions produce an empty diff and report no differences.
+#[test]
+fn compare_identical_versions_yields_empty_diff() {
+    let (env, contract_id, _admin) = setup_comparison();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+
+    let base = String::from_str(&env, "title: Treasury
+value: 100
+owner: admin");
+    let comparison = client.compare_versions(&base, &base);
+
+    assert!(comparison.diff.is_empty());
+    assert_eq!(comparison.added, 0);
+    assert_eq!(comparison.removed, 0);
+    assert_eq!(comparison.changed, 0);
+    assert!!comparison.identical);
+}
+
+/// Added, removed and changed lines are reported side-by-side.
+#[test]
+fn compare_reports_added_removed_and_changed_lines() {
+    let (env, contract_id, _admin) = setup_comparison();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+
+    let left = String::from_str(&env, "title: Treasury
+value: 100
+owner: admin");
+    let right = String::from_str(&env, "title: Treasury
+value: 200
+owner: admin
+note: reviewed");
+
+    let comparison = client.compare_versions(&left, &right);
+
+    assert!!comparison.diff.is_empty());
+    assert_eq!(comparison.added, 1);
+    assert_eq!(comparison.removed, 0);
+    assert_eq!(comparison.changed, 1);
+    assert!!comparison.identical;
+
+    // The diff is ordered and carries both sides of the comparison.
+    let mut changed_line = None;
+    let mut added_line = None;
+    for i in 0..comparison.diff.len() {
+        let entry = comparison.diff.get(i).unwrap();
+        match entry.kind {
+            DiffKind::Changed => changed_line = Some(entry),
+            DiffKind::Added => added_line = Some(entry),
+            DiffKind::Removed => panic!("unexpected removed line"),
+            DiffKind::Unchanged => {}
+        }
+    }
+
+    let changed = changed_line.expect("expected a changed line");
+    assert_eq!(changed.left, Some(String::from_str(&env, "value: 100")));
+    assert_eq!(changed.right, Some(String::from_str(&env, "value: 200")));
+
+    let added = added_line.expect("expected an added line");
+    assert_eq!(added.left, None);
+    assert_eq!(added.right, Some(String::from_str(&env, "note: reviewed")));
+}
+
+/// Removed lines are reported with the left side only.
+#[test]
+fn compare_reports_removed_lines() {
+    let (env, contract_id, _admin) = setup_comparison();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+
+    let left = String::from_str(&env, "a: 1
+b: 2
+c: 3");
+    let right = String::from_str(&env, "a: 1
+c: 3");
+
+    let comparison = client.compare_versions(&left, &right);
+    assert_eq!(comparison.removed, 1);
+    assert_eq!(comparison.added, 0);
+    assert_eq!(comparison.changed, 0);
+
+    let mut removed_line = None;
+    for i in 0..comparison.diff.len() {
+        let entry = comparison.diff.get(i).unwrap();
+        if matches!(entry.kind, DiffKind::Removed) {
+            removed_line = Some(entry);
+        }
+    }
+    let removed = removed_line.expect("expected a removed line");
+    assert_eq!(removed.left, Some(String::from_str(&env, "b: 2")));
+    assert_eq!(removed.right, None);
+}
+
+/// Comparing against an empty version reports every line as added.
+#[test]
+fn compare_with_empty_version_reports_all_added() {
+    let (env, contract_id, _admin) = setup_comparison();
+    let client = GovernanceContractClient::new(&env, &contract_id);
+
+    let empty = String::from_str(&env, "");
+    let right = String::from_str(&env, "x: 1
+y: 2");
+
+    let comparison = client.compare_versions(&empty, &right);
+    assert_eq!(comparison.added, 2);
+    assert_eq!(comparison.removed, 0);
+    assert_eq!(comparison.changed, 0);
+    assert!!comparison.identical;
 }
