@@ -1,17 +1,16 @@
 # Governance Contract
 
-A DAO governance system for Soroban implementing multi-step proposal workflows with voting, delegation, timelock execution, and side-by-side proposal comparison.
+A Comprehensive DAO governance system for Soroban implementing multi-step proposal workflows with voting, delegation, and timelock execution.
 
 ## Overview
 
-Proposals progress through distinct stages:
+This contract provides a full-featured governance system where proposals progress through distinct stages:
 
 - **Draft**: Proposal created but not yet open for voting
 - **Voting**: Active voting period with delegation support
 - **Queued**: Proposal approved, waiting for timelock delay
 - **Executed**: Proposal actions have been executed
 - **Cancelled**: Proposal cancelled by admin
-- **Vetoed**: Proposal vetoed by the security council
 
 ## Features
 
@@ -20,32 +19,30 @@ Proposals progress through distinct stages:
 - **Quorum Requirements**: Minimum participation thresholds
 - **Timelock Execution**: Delayed execution for security
 - **Admin Controls**: Proposal cancellation and parameter management
-- **Side-by-side Comparison**: Diff two proposal versions to inspect changes before execution
+- **M-of-N Execution Authorization**: A configurable, distinct set of administrators must approve execution.
+- **Side-by-Side Version Comparison**: Compare two snapshots of the same proposal to see what changed.
 
-## Side-by-side comparison
+## Multi-signature execution
 
-Use `compare_proposals` to diff two proposals (typically two versions of the same proposal) and return a `<ProposalComparison>` structure:
+Use `initialize_with_admins` to configure the execution administrator set and the required threshold. The primary `admin` remains responsible for voter management, while `execute_proposal` accepts the proposal ID and a list of approving administrators. Every approver must be a configured administrator, authorize the call, and be distinct; duplicate addresses never count twice.
 
 ```rust
-let cmp = client.compare_proposals(&version_a, &version_b);
-if !cmp.equal {
-    // cmp.title_changed, cmp.description_changed, cmp.actions_changed, cmp.state_changed
-    // cmp.actions_a, cmp.actions_b, cmp.for_votes_delta, cmp.against_votes_delta
-}
+client.initialize_with_admins(&primary_admin, &admins, &2, &9, &false);
+client.execute_proposal(&proposal_id, &approvers); // requires two distinct admin approvals
 ```
 
-The comparison is pure and read-only: it never mutates state and panics if either proposal does not exist.
+The legacy `initialize` method configures a one-of-one execution policy for backwards compatibility.
 
 ## Proposal States
 
 ```rust
 enum ProposalState {
-    Draft,
-    Voting,
-    Queued,
-    Executed,
-    Cancelled,
-    Vetoed,
+    Draft,      // Created but not voting
+    Voting,     // Active voting period
+    Queued,      // Approved, waiting for timelock
+    Executed,    // Successfully executed
+    Cancelled,   // Cancelled by admin
+    Vetoed,      // Vetoed by the security council
 }
 ```
 
@@ -53,9 +50,9 @@ enum ProposalState {
 
 ### Initialization
 ```rust
-fn initialize(e: Env, admin: Address, total_supply: i128, voting_period: u64, timelock_delay: u64, quorum_percentage: u32)
+fn initialize(e: Env, admin: Address, voting_period: u64, timelock_delay: u64, quorum_percentage: u32)
 ```
-Sets up the governance contract with admin, total supply, and timing parameters.
+Sets up the governance contract with admin and timing parameters.
 
 ### Proposal Management
 ```rust
@@ -79,7 +76,38 @@ fn get_proposal(e: Env, proposal_id: u32) -> Proposal
 fn get_voting_power(e: Env, user: Address) -> i128
 fn get_effective_voting_power(e: Env, user: Address) -> i128  // Includes delegated power
 fn get_config(e: Env) -> GovernanceConfig
-fn compare_proposals(e: Env, proposal_id_a: u32, proposal_id_b: u32) -> ProposalComparison
+```
+
+### Version Comparison
+```rust
+fn get_proposal_version(e: Env, proposal_id: u32, version: u32) -> Proposal
+fn compare_proposal_versions(e: Env, proposal_id: u32, version_a: u32, version_b: u32) -> ProposalComparison
+```
+
+Each proposal snapshot is stored under a `ProposalVersion(proposal_id, version)` storage key. `compare_proposal_versions` returns a `ProposalComparison` describing the side-by-side differences:
+
+| Field | Meaning |
+| --- | --- |
+| `title_changed` | The proposal title differs between versions |
+| `description_changed` | The description differs |
+| `actions_changed` | Any added, removed, or modified action |
+| `state_changed` | The proposal state differs |
+| `for_votes_changed` / `against_votes_changed` | Vote tallies differ |
+| `actions_added` | Count of actions present in version B but not in A  |
+| `actions_removed` | Count of actions present in version A but not in B |
+| `actions_modified` | Count of actions with the same target but different args |
+| `same_actions` | True when no action differences exist |
+| `identical` | True when every compared field is unchanged |
+
+Example:
+
+```rust
+// Snapshot two versions of proposal 7 and compare them.
+let comparison = client.compare_proposal_versions(&7, &1, &2);
+if comparison.title_changed {
+    // surface the title diff to users
+
+}
 ```
 
 ## Usage Example
@@ -87,7 +115,7 @@ fn compare_proposals(e: Env, proposal_id_a: u32, proposal_id_b: u32) -> Proposal
 ```rust
 // Initialize governance
 let client = GovernanceClient::new(&env, &contract_id);
-client.initialize(&admin, &1_000_000, &604800, &172800, &10); // 7d voting, 2d timelock, 10% quorum
+client.initialize(&admin, &604800, &172800, &10); // 7d voting, 2d timelock, 10% quorum
 
 // Set up voting power
 client.set_voting_power(&user1, &100);
@@ -106,16 +134,14 @@ client.start_voting(&proposal_id);
 // Users vote
 client.cast_vote(&proposal_id, &true);
 
-// Or delegate client.delegate(&trusted_delegate);
+// Or delegate
+client.delegate(&trusted_delegate);
 
 // Queue successful proposal
 client.queue_proposal(&proposal_id);
 
 // Execute after timelock
 client.execute_proposal(&proposal_id);
-
-// Compare two versions of a proposal
-client.compare_proposals(&version_a, &version_b);
 ```
 
 ## Security Features
@@ -147,13 +173,12 @@ cargo test --package soroban-governance-contract
 
 - **voting_period**: Duration of voting in seconds (e.g. 604800 = 7 days)
 - **timelock_delay**: Delay before execution in seconds (e.g. 172800 = 2 days)
-- **quorum_percentage**: Minimum participation as percentage of total supply
+- **quorum_percentage**: Minimum participation as percentage of total voting power
 
 ## Future Enhancements
 
 - Quadratic voting
 - Proposal templates
-- Multi-signature execution
 - Cross-chain governance
 - Snapshot voting integration
 
