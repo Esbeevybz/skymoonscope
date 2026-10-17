@@ -363,3 +363,44 @@ Fixes floating-point precision loss and rounding error at high compounding frequ
 - **Compounded APY Metric**: Calculates and exposes `compoundedApyPercent` = $((1 + r/n)^n - 1) \times 100$, displaying the true annual compounding yield in the Effective APY card.
 - **Milestone Schedule Synchronization**: Guarantees the final milestone row at month $m = \text{months}$ matches `totalBalance` and `totalInterest` to the exact cent without rounding drift.
 
+
+---
+
+## 11. Animated CPU instruction utilization gauge
+
+An interactive radial gauge component that visualizes CPU instruction utilization as a percentage with smooth animations and severity-based color zones.
+
+| File | Role |
+| --- | --- |
+| `components/CPUGauge.tsx` | React component with animated SVG needle, color zones (green/amber/orange/red), scale tick marks, and utilization breakdown display |
+| `components/CPUGauge.test.cjs` | Unit tests for severity calculations, color mapping, needle rotation, formatting, and animations |
+| `components/ResultsPanel.tsx` | Integration point displaying the gauge alongside NutritionLabel and GasUsageChart in a 3-column grid |
+
+**Where to find it:** In the **Result** tab after running a contract simulation, the gauge appears in the metrics grid below the ResourceHeatmap.
+
+**Features:**
+
+- **Animated Needle**: Rotates smoothly (180° range) across severity zones using Framer Motion spring animation with live utilization percentage.
+- **Severity Levels**: Color-coded zones indicate resource usage:
+  - **Low** (green, <50%): Well within budget
+  - **Moderate** (amber, 50-70%): Normal usage
+  - **High** (orange, 70-85%): Approaching limit
+  - **Critical** (red, ≥85%): Critical usage
+- **Scale & Ticks**: 5 scale marks (0%, 25%, 50%, 75%, 100%) with angle-corrected labels around the gauge perimeter.
+- **Utilization Breakdown**: Displays current and maximum instruction counts in compact notation (K, M, B suffixes) below the gauge.
+- **Responsive Design**: Maintains square aspect ratio with mobile-friendly proportions; max-width constraint on larger screens.
+- **Entrance Animations**: Staggered opacity/scale transitions on component mount for smooth visual introduction.
+
+**Unit Test Coverage (16 tests):**
+- Severity level calculation and boundary conditions (0%, 50%, 70%, 85%, 100%)
+- Color mapping (needle color, zone gradient, severity label)
+- Needle rotation mathematics (-90° to +90°)
+- Utilization clamping (prevents out-of-range values)
+- Percentage and instruction count formatting
+- Scale tick mark generation
+- Animation timing configuration
+- Responsive sizing (aspect-square)
+- Props validation and combinations
+- Gradient definitions and labels
+
+The gauge automatically calculates utilization based on a 10M instruction limit (configurable via props), making it easy to visualize relative CPU pressure across contract executions.

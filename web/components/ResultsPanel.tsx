@@ -7,6 +7,7 @@ import { ResultViewer } from './Resultviewer';
 import { ResourceHeatmap } from './ResourceHeatmap';
 import { NutritionLabel } from './NutritionLabel';
 import { GasUsageChart } from './GasUsageChart';
+import { CPUGauge } from './CPUGauge';
 import { FeeEstimationPreview } from './FeeEstimationPreview';
 import { TransactionHistoryTable } from './TransactionHistoryTable';
 import { LiquidityPoolAnalytics } from './LiquidityPoolAnalytics';
@@ -118,7 +119,7 @@ export function ResultsPanel() {
                     cost_stroops: analysisReport.cost_stroops,
                     state_snapshot: currentResult.stateSnapshot
                   }} />
-                  <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
                     <NutritionLabel
                       cpu_instructions={analysisReport.cpu_instructions}
                       ram_bytes={analysisReport.ram_bytes}
@@ -135,6 +136,14 @@ export function ResultsPanel() {
                       cost_stroops={analysisReport.cost_stroops}
                       testnetAverages={analysisReport.testnet_averages}
                     />
+                    <div className="flex items-center justify-center">
+                      <CPUGauge
+                        utilization={(analysisReport.cpu_instructions / (10_000_000)) * 100}
+                        maxInstructions={10_000_000}
+                        currentInstructions={analysisReport.cpu_instructions}
+                        title="CPU Utilization"
+                      />
+                    </div>
                   </div>
                 </div>
               )}
