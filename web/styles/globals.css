@@ -34,8 +34,27 @@
   --skeleton: #30363d;
 }
 
+/* Fix layout shift by preventing scrollbar from affecting layout */
+html {
+  /* Allocate space for scrollbar to prevent layout shift when scrollbar appears/disappears */
+  scrollbar-gutter: stable;
+  box-sizing: border-box;
+}
+
+/* Ensure all elements use border-box sizing for consistent layout calculations */
+*,
+*::before,
+*::after {
+  box-sizing: inherit;
+}
+
 body {
   background-color: var(--bg-page);
   color: var(--text-primary);
   transition: background-color 0.2s ease, color 0.2s ease;
+  /* Ensure body doesn't overflow due to padding/margin */
+  margin: 0;
+  padding: 0;
+  /* Prevent body from being narrower than viewport when scrollbar is present */
+  overflow-x: hidden;
 }
