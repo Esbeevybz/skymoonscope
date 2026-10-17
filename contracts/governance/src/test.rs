@@ -1,10 +1,10 @@
-#![cfg(test)]
+#`!cfg(test)]
 
 extern crate std;
 
 use super::*;
-use soroban_sdk::{
-    testutils::{Address as _, BytesN as _, Ledger},
+use soroban_sdk:{
+    testutils {Address as _, BytesN as _, Ledger},
     Address, BytesN, Env, String, Vec,
 };
 
@@ -59,7 +59,7 @@ fn execution_requires_distinct_threshold_admin_approvals() {
     let proposal = expired_proposal(&client, &env);
     let mut one_approval = Vec::new(&env);
     one_approval.push_back(admin_a.clone());
-    assert_eq!(
+    assert_eq(
         client.try_execute_proposal(&proposal.id, &one_approval),
         Err(Ok(Error::InsufficientApprovals))
     );
@@ -67,7 +67,7 @@ fn execution_requires_distinct_threshold_admin_approvals() {
     let mut approvals = Vec::new(&env);
     approvals.push_back(admin_a);
     approvals.push_back(admin_b);
-    assert!(!client.execute_proposal(&proposal.id, &approvals).open);
+    assert(!client.execute_proposal(&proposal.id, &approvals).open);
 }
 
 #[test]
@@ -107,22 +107,22 @@ fn quadratic_votes_follow_square_root_curve() {
     let proposal = client.create_proposal(&title, &description, &60);
 
     let first = client.cast_vote(&proposal.id, &voter, &true, &9);
-    assert_eq!(first.credits_spent, 9);
-    assert_eq!(first.votes_cast, 3);
+    assert_eq(first.credits_spent, 9);
+    assert_eq(first.votes_cast, 3);
 
     let second = client.cast_vote(&proposal.id, &voter, &true, &7);
-    assert_eq!(second.credits_spent, 16);
-    assert_eq!(second.votes_cast, 4);
+    assert_eq(second.credits_spent, 16);
+    assert_eq(second.votes_cast, 4);
 
     let stored = client.get_proposal(&proposal.id);
-    assert_eq!(stored.for_votes, 4);
-    assert_eq!(stored.against_votes, 0);
+    assert_eq(stored.for_votes, 4);
+    assert_eq(stored.against_votes, 0);
 
     let quote = client.quote_votes_for_credits(&25);
-    assert_eq!(quote, 5);
+    assert_eq(quote, 5);
 
     let cost = client.quote_credits_for_votes(&5);
-    assert_eq!(cost, 25);
+    assert_eq(cost, 25);
 
     let _ = admin;
 }
@@ -133,7 +133,7 @@ fn split_accounts_below_threshold_are_rejected() {
     let client = GovernanceContractClient::new(&env, &contract_id);
 
     let err = client.try_register_voter(&voter, &4, &make_identity(&env, 1));
-    assert_eq!(err, Err(Ok(Error::InsufficientVotingUnits)));
+    assert_eq(err, Err(Ok(Error::InsufficientVotingUnits)));
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn duplicate_identity_commitments_are_blocked() {
     client.register_voter(&voter_a, &16, &identity);
     let err = client.try_register_voter(&voter_b, &16, &identity);
 
-    assert_eq!(err, Err(Ok(Error::IdentityAlreadyClaimed)));
+    assert_eq(err, Err(Ok(Error::IdentityAlreadyClaimed)));
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn voter_cannot_flip_sides_on_same_proposal() {
     client.cast_vote(&proposal.id, &voter, &true, &4);
 
     let err = client.try_cast_vote(&proposal.id, &voter, &false, &5);
-    assert_eq!(err, Err(Ok(Error::VoteSideMismatch)));
+    assert_eq(err, Err(Ok(Error::VoteSideMismatch)));
 }
 
 #[test]
@@ -186,12 +186,12 @@ fn votes_cannot_exceed_registered_units() {
     );
 
     let err = client.try_cast_vote(&proposal.id, &voter, &true, &11);
-    assert_eq!(err, Err(Ok(Error::InsufficientVotingUnits)));
+    assert_eq(err, Err(Ok(Error::InsufficientVotingUnits)));
 }
 
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------
 // Execution timelock (issue #68)
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------
 
 /// Build a single-admin governance with the given execution delay.
 fn setup_with_delay(delay: u32) -> (Env, Address, Address) {
@@ -221,7 +221,7 @@ fn execution_is_rejected_before_the_delay_elapses() {
     let proposal = client.create_proposal(
         &String::from_str(&env, "Risky change"),
         &String::from_str(&env, "d"),
-        &11,
+        &.11,
     );
 
     // Voting is still open.
@@ -249,7 +249,7 @@ fn execution_is_rejected_before_the_delay_elapses() {
 
     // At the deadline it succeeds.
     env.ledger().with_mut(|l| l.sequence_number = 111);
-    assert!(!client.execute_proposal(&proposal.id, &approvals).open);
+    assert(!client.execute_proposal(&proposal.id, &approvals).open);
 }
 
 /// The delay is what gives token holders a window to react, so a proposal
@@ -263,7 +263,7 @@ fn proposal_becomes_executable_once_the_delay_elapses() {
     let proposal = client.create_proposal(
         &String::from_str(&env, "P"),
         &String::from_str(&env, "d"),
-        &11,
+        &.11,
     );
 
     let approvals = one_approval(&env, &admin);
@@ -276,7 +276,7 @@ fn proposal_becomes_executable_once_the_delay_elapses() {
     assert!(client.get_proposal(&proposal.id).unwrap().open);
 
     env.ledger().with_mut(|l| l.sequence_number = 61);
-    assert!(!client.execute_proposal(&proposal.id, &approvals).open);
+    assert(!client.execute_proposal(&proposal.id, &approvals).open);
 }
 
 /// A zero delay preserves the previous immediate-execution behaviour, so
@@ -290,13 +290,13 @@ fn zero_delay_allows_immediate_execution_after_voting() {
     let proposal = client.create_proposal(
         &String::from_str(&env, "P"),
         &String::from_str(&env, "d"),
-        &11,
+        &.11,
     );
 
     let approvals = one_approval(&env, &admin);
     env.ledger().with_mut(|l| l.sequence_number = 12);
     assert_eq!(client.earliest_execution_ledger(&proposal.id), Ok(11));
-    assert!(!client.execute_proposal(&proposal.id, &approvals).open);
+    assert(!client.execute_proposal(&proposal.id, &approvals).open);
 }
 
 /// The delay is visible in the config and is governance-adjustable.
@@ -326,7 +326,7 @@ fn execution_delay_setter_is_admin_gated() {
     let res = client
         .mock_auths(&[MockAuth {
             address: &attacker,
-            invoke: &MockAuthInvoke {
+            invoke: &MOckAuthInvoke {
                 contract: &contract_id,
                 fn_name: "set_execution_delay",
                 args: (0u32,).into_val(&env),
@@ -339,26 +339,133 @@ fn execution_delay_setter_is_admin_gated() {
     assert_eq!(client.execution_delay_ledgers(), 20);
 }
 
-/// A very large delay does not overflow the earliest-execution computation.
+/// A very large delay does not overflow.
 #[test]
-fn large_delay_does_not_overflow() {
-    let (env, contract_id, admin) = setup_with_delay(u32::MAX);
+fn large_execution_delay_does_not_overflow() {
+    let (env, contract_id, admin) = setup_with_delay(u32::MAX - 1);
     let client = GovernanceContractClient::new(&env, &contract_id);
 
-    env.ledger().with_mut(|l| l.sequence_number = 10);
+    env.ledger().with_mut(|l| l.sequence_number = 1);
     let proposal = client.create_proposal(
         &String::from_str(&env, "P"),
         &String::from_str(&env, "d"),
-        &11,
+        &2,
     );
 
-    let approvals = one_approval(&env, &admin);
-    env.ledger().with_mut(|l| l.sequence_number = 12);
-
-    // Saturates to u32::MAX rather than wrapping to a small value.
+    // Voting closes at ledger 2. The earliest execution ledger must saturate
+    // rather than wrap around.
+    env.ledger().with_mut(|l| l.sequence_number = 3);
     assert_eq!(client.earliest_execution_ledger(&proposal.id), Ok(u32::MAX));
+
+    let approvals = one_approval(&env, &admin);
     assert_eq!(
         client.try_execute_proposal(&proposal.id, &approvals),
         Err(Ok(Error::ExecutionDelayNotElapsed))
     );
+}
+
+// --------------------------------------------------------------------------
+// Side-by-side contract version comparison
+// --------------------------------------------------------------------------
+
+/// A side-by-side comparison reports every field of two contract versions
+/// and flags the ones that differ.
+#[test]
+fn compare_versions_reports_differing_fields() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(GovernanceContract, ());
+    let admin = Address::generate(&env);
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &9, &false, &0);
+
+    let base = ContractVersion {
+        version: String::from_str(&env, "1.0.0"),
+        quorum: 9,
+        identity_required: false,
+        execution_delay_ledgers: 0,
+        description: String::from_str(&env, "Baseline"),
+    };
+    let next = ContractVersion {
+        version: String::from_str(&env, "1.1.0"),
+        quorum: 9,
+        identity_required: true,
+        execution_delay_ledgers: 50,
+        description: String::from_str(&env, "Baseline"),
+    };
+
+    let report = client.compare_versions(&base, &next);
+    assert_eq(report.left.version, base.version);
+    assert_eq(report.right.version, next.version);
+    assert_eq(report.differing_fields.len(), 3);
+    assert(report.differing_fields.contains(String::from_str(&env, "version")));
+    assert(report
+        .differing_fields
+        .contains(String::from_str(&env, "identity_required")));
+    assert(report
+        .differing_fields
+        .contains(String::from_str(&env, "execution_delay_ledgers")));
+    assert(!report.identical);
+}
+
+#[test]
+fn compare_identical_versions_reports_no_differences() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(GovernanceContract, ());
+    let admin = Address::generate(&env);
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &9, &false, &0);
+
+    let v = ContractVersion {
+        version: String::from_str(&env, "1.0.0"),
+        quorum: 9,
+        identity_required: false,
+        execution_delay_ledgers: 0,
+        description: String::from_str(&env, "Same"),
+    };
+
+    let report = client.compare_versions(&v.clone(), &v.clone());
+    assert(report.identical);
+    assert_eq(report.differing_fields.len(), 0);
+}
+
+#[test]
+fn compare_versions_reports_all_fields_side_by_side() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(GovernanceContract, ());
+    let admin = Address::generate(&env);
+    let client = GovernanceContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &9, &false, &0);
+
+    let left = ContractVersion {
+        version: String::from_str(&env, "1.0.0"),
+        quorum: 9,
+        identity_required: false,
+        execution_delay_ledgers: 0,
+        description: String::from_str(&env, "Left"),
+    };
+    let right = ContractVersion {
+        version: String::from_str(&env, "2.0.0"),
+        quorum: 12,
+        identity_required: true,
+        execution_delay_ledgers: 100,
+        description: String::from_str(&env, "Right"),
+    };
+
+    let report = client.compare_versions(&left, &right);
+    assert_eq(report.differing_fields.len(), 5);
+    for field in [
+        "version",
+        "quorum",
+        "identity_required",
+        "execution_delay_ledgers",
+        "description",
+    ] {
+        assert(report
+            .differing_fields
+            .contains(String::from_str(&env, field)));
+    }
+    assert(!report.identical);
 }

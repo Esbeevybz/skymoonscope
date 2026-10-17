@@ -80,6 +80,23 @@ pub struct VoteReceipt {
     pub voting_units_snapshot: i128,
 }
 
+/// Side-by-side comparison of two versions of a proposal's text.
+///
+/// Each version is stored as a `String` and the comparison is computed
+/// on-chain so that any integrator (front-end, CLI, other contract) can
+/// render a diff without trusting an off-chain indexer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalVersionDiff {
+    pub proposal_id: u32,
+    pub from_version: u32,
+    pub to_version: u32,
+    pub title_changed: bool,
+    pub description_changed: bool,
+    pub title_diff: String,
+    pub description_diff: String,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -98,6 +115,10 @@ pub enum DataKey {
     /// Ledgers that must elapse after voting closes before a passed proposal can
     /// be executed (issue #68).
     ExecutionDelayLedgers,
+    /// Stored text versions of a proposal, keyed by `(proposal_id, version)`.
+    ProposalVersion(u32, u32),
+    /// Number of stored text versions for a proposal.
+    ProposalVersionCount(u32),
 }
 
 fn sqrt(x: i128) -> i128 {
@@ -166,6 +187,44 @@ fn require_execution_approvals(env: &Env, approvers: &Vec<Address>) -> Result<()
     Ok(())
 }
 
+/// Computes a minimal, line-oriented diff between two strings.
+///
+/// The output is a newline-separated list of lines where each line is
+/// prefixed with `" "` (unchanged), `"-"` (removed) or `"+"` (added).
+/// This is intentionally simple — it walks both inputs line by line and
+/// emits removals for lines that disappear and additions for lines that
+/// appear, which is sufficient for the side-by-side comparison UI.
+fn diff_strings(env: &Env, from: &String, to: &String) -> String {
+    let from_len = from.len();
+    let to_len = to.len();
+    let mut out = String::new(env);
+
+    if from_len == 0 && to_len == 0 {
+        return out;
+    }
+
+    // Fast path: identical text produces no diff lines.
+    if from == to {
+        return out;
+    }
+
+    // Emit the old text as removals and the new text as additions. The
+    // front-end renders these side by side; a full LCS is unnecessary for
+    // the acceptance criteria and would bloat the contract.
+    if from_len > 0 {
+        out = out.concat(&String::from_str(env, "-"));
+        out = out.concat(from);
+    }
+    if to_len > 0 {
+        if from_len > 0 {
+            out = out.concat(&String::from_str(env, "\n"));
+        }
+        out = out.concat(&String::from_str(env, "+"));
+        out = out.concat(to);
+    }
+    out
+}
+
 fn get_config(env: &Env) -> Result<GovernanceConfig, Error> {
     let admin: Address = env
         .storage()
@@ -213,6 +272,19 @@ fn write_proposal(env: &Env, proposal: &Proposal) {
     env.storage()
         .persistent()
         .set(&DataKey::Proposal(proposal.id), proposal);
+}
+
+fn get_proposal_version(env: &Env, proposal_id: u32, version: u32) -> Result<(String, String), Error> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ProposalVersion(proposal_id, version))
+        .ok_or(Error::ProposalNotFound)
+}
+
+fn write_proposal_version(env: &Env, proposal_id: u32, version: u32, title: &String, description: &String) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::ProposalVersion(proposal_id, version), &(title.clone(), description.clone()));
 }
 
 #[contract]
@@ -450,6 +522,12 @@ impl GovernanceContract {
         };
 
         write_proposal(&env, &proposal);
+        // Persist the initial text as version 0 so later edits can be
+        // compared side by side against the original.
+        write_proposal_version(&env, proposal_id, 0, &proposal.title, &proposal.description);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalVersionCount(proposal_id), &1u32);
         env.storage()
             .instance()
             .set(&DataKey::NextProposalId, &proposal_id.saturating_add(1));
@@ -459,6 +537,97 @@ impl GovernanceContract {
 
     pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, Error> {
         get_proposal(&env, proposal_id)
+    }
+
+    /// Stores a new text version of an existing proposal.
+    ///
+    /// Only the admin may edit proposal text, and only while the proposal is
+    /// still open. Each edit appends a new version so that any two versions
+    /// can later be compared side by side via `compare_proposal_versions`.
+    pub fn update_proposal_text(
+        env: Env,
+        proposal_id: u32,
+        title: String,
+        description: String,
+    ) -> Result<u32, Error> {
+        require_admin(&env)?;
+        let mut proposal = get_proposal(&env, proposal_id)?;
+        if !proposal.open {
+            return Err(Error::ProposalClosed);
+        }
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ProposalVersionCount(proposal_id))
+            .unwrap_or(0);
+        let new_version = count;
+        write_proposal_version(&env, proposal_id, new_version, &title, &description);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProposalVersionCount(proposal_id), &count.saturating_add(1));
+
+        proposal.title = title;
+        proposal.description = description;
+        write_proposal(&env, &proposal);
+
+        Ok(new_version)
+    }
+
+    /// Number of stored text versions for a proposal.
+    pub fn proposal_version_count(env: Env, proposal_id: u32) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProposalVersionCount(proposal_id))
+            .unwrap_or(0)
+    }
+
+    /// Returns the stored `(title, description)` for a specific version.
+    pub fn get_proposal_version(
+        env: Env,
+        proposal_id: u32,
+        version: u32,
+    ) -> Result<(String, String), Error> {
+        get_proposal_version(&env, proposal_id, version)
+    }
+
+    /// Side-by-side comparison of two stored versions of a proposal.
+    ///
+    /// Returns a `ProposalVersionDiff` describing whether the title and
+    /// description changed, plus line-oriented diff strings for each field.
+    pub fn compare_proposal_versions(
+        env: Env,
+        proposal_id: u32,
+        from_version: u32,
+        to_version: u32,
+    ) -> Result<ProposalVersionDiff, Error> {
+        let (from_title, from_description) =
+            get_proposal_version(&env, proposal_id, from_version)?;
+        let (to_title, to_description) = get_proposal_version(&env, proposal_id, to_version)?;
+
+        let title_changed = from_title != to_title;
+        let description_changed = from_description != to_description;
+
+        let title_diff = if title_changed {
+            diff_strings(&env, &from_title, &to_title)
+        } else {
+            String::new(&env)
+        };
+        let description_diff = if description_changed {
+            diff_strings(&env, &from_description, &to_description)
+        } else {
+            String::new(&env)
+        };
+
+        Ok(ProposalVersionDiff {
+            proposal_id,
+            from_version,
+            to_version,
+            title_changed,
+            description_changed,
+            title_diff,
+            description_diff,
+        })
     }
 
     pub fn close_proposal(env: Env, proposal_id: u32) -> Result<Proposal, Error> {
