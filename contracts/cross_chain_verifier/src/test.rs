@@ -273,6 +273,34 @@ fn test_verify_message_replay_rejected() {
     assert!(replay.is_err());
 }
 
+#[test]
+fn test_nonce_is_shared_across_verification_entry_points() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let payload = make_payload(&env, 73);
+    let leaf = compute_leaf(&env, &payload);
+    let proof = Vec::new(&env);
+    let proof_flags = Vec::new(&env);
+
+    // An invalid proof must not consume the nonce.
+    assert!(!client.verify_message(&100, &payload, &proof, &proof_flags));
+    assert!(!client.is_nonce_processed(&73));
+
+    // Once verified through the payload API, the same nonce is unavailable
+    // through the raw-leaf API as well.
+    let root = BytesN::from_array(&env, &hash_leaf(&env, &leaf.to_array()));
+    client.update_root(&100, &root);
+    assert!(client.verify_message(&100, &payload, &proof, &proof_flags));
+    let replay = client.try_verify_message_and_consume(&100, &73, &leaf, &proof, &proof_flags);
+    assert!(replay.is_err());
+}
+
 // ============================================================================
 // Signature Verification Tests
 // ============================================================================
