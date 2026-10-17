@@ -42,15 +42,15 @@ Stores a Merkle state root for a given source-chain block height. Only the admin
 ### `get_root(block_height: u32) → Option<BytesN<32>>`
 Returns the stored state root for a block height, or `None` if not yet posted.
 
-### `verify_message(block_height, leaf, proof, proof_flags) → bool`
-Verifies a Binary Merkle Tree proof. Returns `true` if the `leaf` (message hash) is provably included in the state root at `block_height`. Does **not** consume the nonce — use `verify_message_and_consume` to prevent replays.
+### `verify_message(block_height, payload, proof, proof_flags) → bool`
+Verifies a `Payload` against the state root at `block_height`. On success, its nonce is consumed, so it cannot be verified again through another verification entry point. Reusing a nonce panics with `"Nonce already used"`.
 
 On a successful verification, emits a `verify` event (see [Events](#events)).
 
 | Parameter | Type | Description |
 |---|---|---|
 | `block_height` | `u32` | Source-chain block height to verify against |
-| `leaf` | `BytesN<32>` | SHA-256 hash of the cross-chain message |
+| `payload` | `Payload` | Message fields, including the nonce consumed on successful verification |
 | `proof` | `Vec<BytesN<32>>` | Ordered list of sibling hashes from leaf to root |
 
 ### `verify_batch(messages: Vec<BatchMessage>) → BatchVerificationResult`
@@ -87,6 +87,8 @@ pub struct BatchVerificationResult {
 ### `verify_signed_batch(messages: Vec<SignedBatchMessage>) → SignedBatchVerificationResult`
 Verifies multiple signed messages in a single batch call. Similar to `verify_batch` but for signed messages with signature verification.
 
+Successfully verified messages consume their nonce, shared with `verify_message` and `verify_batch`. A repeated nonce is reported as a failed batch item rather than aborting the batch.
+
 For each successfully verified message, emits a `verify` event (see [Events](#events)).
 
 | Parameter | Type | Description |
@@ -115,7 +117,7 @@ pub struct SignedBatchVerificationResult {
 | `proof_flags` | `Vec<bool>` | `true` = sibling is on the left, `false` = sibling is on the right |
 
 ### `verify_message_and_consume(block_height, nonce, leaf, proof, proof_flags) → bool`
-Like `verify_message` but also marks `nonce` as processed. Panics with `"nonce already processed"` if the same nonce is submitted a second time, providing built-in replay protection.
+Verifies a bare leaf and marks `nonce` as processed on success. The nonce is shared with the payload and signed-message verification entry points. Panics with `"nonce already processed"` if the same nonce is submitted a second time.
 
 On a successful verification, emits a `verify` event (see [Events](#events)).
 
@@ -124,7 +126,7 @@ On a successful verification, emits a `verify` event (see [Events](#events)).
 | `nonce` | `u64` | Unique identifier for this message; must not have been used before |
 
 ### `is_nonce_processed(nonce) → bool`
-Returns `true` if `nonce` has already been consumed by `verify_message_and_consume`.
+Returns `true` if `nonce` has already been consumed by any successful verification entry point.
 
 ### `add_authorized_signer(public_key, algorithm)`
 Registers a public key as an authorized cross-chain message signer. Only the admin can call this.
@@ -143,7 +145,7 @@ Removes a previously registered signer. Panics with `"Signer not found"` if the 
 Returns the number of currently authorized signers.
 
 ### `verify_signed_message(signed_message, block_height, proof, proof_flags) → bool`
-Verifies that a `SignedMessage` was both included in the Merkle tree at `block_height` and signed by a currently authorized signer. Returns `false` if either check fails.
+Verifies that a `SignedMessage` was both included in the Merkle tree at `block_height` and signed by a currently authorized signer. On success, its nonce is consumed across all verification entry points. Returns `false` if the proof or signature is invalid, or if the nonce has already been used.
 
 On a successful verification, emits a `verify` event (see [Events](#events)).
 
@@ -432,7 +434,7 @@ soroban contract invoke \
 - **Relayer trust**: The contract trusts whoever holds the admin key to post correct roots. In production, the admin should be a multi-sig account or a decentralized relayer network.
 - **Root history**: Only the latest root per block height is stored. If a relayer posts an incorrect root and then corrects it, the old root is overwritten. Consumers should verify the root matches the source chain before relying on it.
 - **Proof malleability**: The SHA-256 hash function used here is collision-resistant. Proofs cannot be forged without breaking SHA-256.
-- **Replay protection**: `verify_message` is a read-only view — it does not record which messages have been processed. Contracts consuming this verifier must track used nullifiers or message IDs themselves to prevent replay attacks.
+- **Replay protection**: successful payload, signed-message, and bare-leaf verification consumes the supplied nonce. Nonces are global to this verifier instance, so callers must ensure they are unique across all source chains and message types.
 - **Event observability**: Successful verifications emit a `verify` event, allowing off-chain indexers to track verification activity without polling contract state.
 
 ---

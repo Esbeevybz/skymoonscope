@@ -273,6 +273,34 @@ fn test_verify_message_replay_rejected() {
     assert!(replay.is_err());
 }
 
+#[test]
+fn test_nonce_is_shared_across_verification_entry_points() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register_contract(None, CrossChainVerifier);
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let payload = make_payload(&env, 73);
+    let leaf = compute_leaf(&env, &payload);
+    let proof = Vec::new(&env);
+    let proof_flags = Vec::new(&env);
+
+    // An invalid proof must not consume the nonce.
+    assert!(!client.verify_message(&100, &payload, &proof, &proof_flags));
+    assert!(!client.is_nonce_processed(&73));
+
+    // Once verified through the payload API, the same nonce is unavailable
+    // through the raw-leaf API as well.
+    let root = BytesN::from_array(&env, &hash_leaf(&env, &leaf.to_array()));
+    client.update_root(&100, &root);
+    assert!(client.verify_message(&100, &payload, &proof, &proof_flags));
+    let replay = client.try_verify_message_and_consume(&100, &73, &leaf, &proof, &proof_flags);
+    assert!(replay.is_err());
+}
+
 // ============================================================================
 // Signature Verification Tests
 // ============================================================================
@@ -602,11 +630,44 @@ fn test_verify_signed_message_success_ed25519() {
 
     let result = client.verify_signed_message(&signed_message, &block_height, &proof, &proof_flags);
     assert!(result);
+    assert!(client.is_nonce_processed(&1));
 
     // Second verification of the same signed message should fail due to replay protection.
     let replay_result =
         client.verify_signed_message(&signed_message, &block_height, &proof, &proof_flags);
     assert!(!replay_result);
+
+    // A different signed message cannot reuse a nonce already consumed above.
+    let replay_message = CrossChainMessage {
+        nonce: 1,
+        timestamp: 1001,
+        payload: Bytes::from_slice(&env, b"different payload"),
+        ..signed_message.message.clone()
+    };
+    let mut replay_data = Bytes::new(&env);
+    replay_data.append(&Bytes::from_slice(&env, b"CROSS_CHAIN_MESSAGE_V1"));
+    replay_data.append(&Bytes::from_slice(&env, &replay_message.source_chain.to_be_bytes()));
+    replay_data.append(&Bytes::from_slice(&env, &replay_message.destination_chain.to_be_bytes()));
+    replay_data.append(&Bytes::from_slice(&env, &replay_message.nonce.to_be_bytes()));
+    replay_data.append(&Bytes::from_slice(&env, &replay_message.timestamp.to_be_bytes()));
+    let replay_payload_hash = env.crypto().sha256(&replay_message.payload).to_array();
+    replay_data.append(&Bytes::from_slice(&env, &replay_payload_hash));
+    let replay_hash = env.crypto().sha256(&replay_data).to_array();
+    let replay_signature = signing_key.sign(&replay_hash);
+    let replay_signed_message = SignedMessage {
+        message: replay_message,
+        signature: BytesN::from_array(&env, &replay_signature.to_bytes()),
+        signer_public_key: BytesN::from_array(&env, &verifying_key.to_bytes()),
+        algorithm: SignatureAlgorithm::Ed25519,
+    };
+    let replay_root = BytesN::from_array(&env, &hash_leaf(&env, &replay_hash));
+    client.update_root(&101, &replay_root);
+    assert!(!client.verify_signed_message(
+        &replay_signed_message,
+        &101,
+        &Vec::new(&env),
+        &Vec::new(&env),
+    ));
 }
 
 #[test]
@@ -1349,14 +1410,14 @@ fn test_verify_signed_batch_success() {
 
     let block_height = 400;
     
-    // Create test data for 2 signed messages
+    // Include two distinct signed messages with the same nonce.
     let mut batch_messages = Vec::new(&env);
-    
-    for i in 0..2 {
+
+    for i in 0..3 {
         let message = CrossChainMessage {
             source_chain: 1,
             destination_chain: 2,
-            nonce: i as u64,
+            nonce: if i == 2 { 0 } else { i as u64 },
             payload: Bytes::from_slice(&env, &[i as u8; 32]),
             timestamp: 1000 + i as u64,
         };
@@ -1399,10 +1460,13 @@ fn test_verify_signed_batch_success() {
     }
     
     let result = client.verify_signed_batch(&batch_messages);
-    assert_eq!(result.total, 2);
+    assert_eq!(result.total, 3);
     assert_eq!(result.succeeded, 2);
-    assert_eq!(result.failed, 0);
-    assert_eq!(result.failed_indices.len(), 0);
+    assert_eq!(result.failed, 1);
+    assert_eq!(result.failed_indices.len(), 1);
+    assert_eq!(result.failed_indices.get(0).unwrap(), 2);
+    assert!(client.is_nonce_processed(&0));
+    assert!(client.is_nonce_processed(&1));
 }
 
 #[test]
