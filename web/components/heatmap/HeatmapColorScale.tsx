@@ -47,12 +47,26 @@ export interface HotspotColors {
   label: string;
 }
 
-export function hotspotColors(share: number): HotspotColors {
-  if (share >= 20) return { bg: 'bg-rose-500/75',   border: 'border-rose-400',   text: 'text-rose-100',   barHex: '#f43f5e', badge: 'bg-rose-900/80 text-rose-300',   label: 'CRITICAL' };
-  if (share >= 10) return { bg: 'bg-orange-500/65', border: 'border-orange-400', text: 'text-orange-100', barHex: '#f97316', badge: 'bg-orange-900/80 text-orange-300', label: 'HIGH'     };
-  if (share >=  5) return { bg: 'bg-amber-500/55',  border: 'border-amber-400',  text: 'text-amber-100',  barHex: '#eab308', badge: 'bg-amber-900/80 text-amber-300',   label: 'MEDIUM'   };
-  if (share >=  2) return { bg: 'bg-cyan-700/45',   border: 'border-cyan-500',   text: 'text-cyan-100',   barHex: '#06b6d4', badge: 'bg-cyan-900/80 text-cyan-300',     label: 'LOW'      };
-  return                  { bg: 'bg-slate-800/65',  border: 'border-slate-700',  text: 'text-slate-400',  barHex: '#475569', badge: 'bg-slate-800 text-slate-500',        label: 'TRACE'    };
+export interface ScaleBreakpoints {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+}
+
+export const DEFAULT_BREAKPOINTS: ScaleBreakpoints = {
+  critical: 20,
+  high: 10,
+  medium: 5,
+  low: 2,
+};
+
+export function hotspotColors(share: number, bp: ScaleBreakpoints = DEFAULT_BREAKPOINTS): HotspotColors {
+  if (share >= bp.critical) return { bg: 'bg-rose-500/75',   border: 'border-rose-400',   text: 'text-rose-100',   barHex: '#f43f5e', badge: 'bg-rose-900/80 text-rose-300',   label: 'CRITICAL' };
+  if (share >= bp.high)     return { bg: 'bg-orange-500/65', border: 'border-orange-400', text: 'text-orange-100', barHex: '#f97316', badge: 'bg-orange-900/80 text-orange-300', label: 'HIGH'     };
+  if (share >= bp.medium)   return { bg: 'bg-amber-500/55',  border: 'border-amber-400',  text: 'text-amber-100',  barHex: '#eab308', badge: 'bg-amber-900/80 text-amber-300',   label: 'MEDIUM'   };
+  if (share >= bp.low)      return { bg: 'bg-cyan-700/45',   border: 'border-cyan-500',   text: 'text-cyan-100',   barHex: '#06b6d4', badge: 'bg-cyan-900/80 text-cyan-300',     label: 'LOW'      };
+  return                           { bg: 'bg-slate-800/65',  border: 'border-slate-700',  text: 'text-slate-400',  barHex: '#475569', badge: 'bg-slate-800 text-slate-500',        label: 'TRACE'    };
 }
 
 export function statusColor(pct: number) {

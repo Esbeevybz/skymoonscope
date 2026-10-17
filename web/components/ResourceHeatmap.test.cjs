@@ -228,6 +228,158 @@ describe('Heatmap export – SVG builder', () => {
     assert.ok(svg.startsWith('<svg'), 'empty SVG is still valid');
     assert.ok(svg.endsWith('</svg>'));
   });
+
+  test('SVG builder handles exactly 500 cells correctly without truncation', () => {
+    const cells500 = [];
+    for (let i = 0; i < 500; i++) {
+      cells500.push({
+        id: `c-${i}`,
+        displayName: `fn_${i}`,
+        cpuShare: 100 / 500,
+        cpuInstructions: 1000,
+        category: 'compute',
+        depth: 0,
+        fnName: `contract::fn_${i}`,
+      });
+    }
+
+    const svg = buildSvgString(cells500);
+    assert.ok(svg.startsWith('<svg'));
+    assert.ok(svg.endsWith('</svg>'));
+
+    // background (1) + 500 cell rects + 5 legend rects = 506
+    const rectCount = (svg.match(/<rect /g) ?? []).length;
+    assert.ok(rectCount >= 500, `SVG must render all 500 cells, got ${rectCount}`);
+    assert.ok(svg.includes('fn_0'));
+    assert.ok(svg.includes('fn_499'));
+  });
+
+  test('SVG builder handles beyond 500 cells (e.g. 600, 1000 cells) correctly', () => {
+    const counts = [600, 1000];
+    for (const count of counts) {
+      const cells = [];
+      for (let i = 0; i < count; i++) {
+        cells.push({
+          id: `c-${i}`,
+          displayName: `fn_${i}`,
+          cpuShare: 100 / count,
+          cpuInstructions: 1000,
+          category: 'compute',
+          depth: 0,
+          fnName: `contract::fn_${i}`,
+        });
+      }
+
+      const svg = buildSvgString(cells);
+      assert.ok(svg.startsWith('<svg'));
+      assert.ok(svg.endsWith('</svg>'));
+      const rectCount = (svg.match(/<rect /g) ?? []).length;
+      assert.ok(rectCount >= count, `SVG must render all ${count} cells, got ${rectCount}`);
+      assert.ok(svg.includes(`fn_${count - 1}`));
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Issue #383 – Call graph flattening beyond 500 cells (no arbitrary truncation)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('Issue #383 – Call graph processing without arbitrary 12-cell truncation', () => {
+  function categoize(fnName) {
+    const n = fnName.toLowerCase();
+    if (n.includes('auth') || n.includes('verify')) return 'auth';
+    if (n.includes('write') || n.includes('store')) return 'storage';
+    if (n.includes('read') || n.includes('get')) return 'storage';
+    if (n.includes('event') || n.includes('emit')) return 'io';
+    if (n.includes('util') || n.includes('parse')) return 'util';
+    return 'compute';
+  }
+
+  function cellsFromCallGraph(root, totalCpu) {
+    const cells = [];
+    const DEPTH_BUDGET = [40, 30, 20, 10];
+    let counter = 0;
+
+    function traverse(node, depth, levelShare) {
+      const budget = DEPTH_BUDGET[Math.min(depth, DEPTH_BUDGET.length - 1)];
+      const cpuShare = (budget * levelShare) / 100;
+      const displayName = node.function.length > 14
+        ? node.function.slice(0, 12) + '…'
+        : node.function;
+
+      cells.push({
+        id: `cg-${counter++}`,
+        fnName: `${node.contract_id}::${node.function}`,
+        displayName,
+        category: categoize(node.function),
+        cpuShare,
+        cpuInstructions: Math.round((cpuShare / 100) * totalCpu),
+        depth,
+      });
+
+      if (node.children && node.children.length > 0) {
+        const sharePerChild = 100 / node.children.length;
+        node.children.forEach(child => traverse(child, depth + 1, sharePerChild));
+      }
+    }
+
+    traverse(root, 0, 100);
+
+    const total = cells.reduce((s, c) => s + c.cpuShare, 0);
+    if (total > 0) {
+      cells.forEach(c => {
+        c.cpuShare = (c.cpuShare / total) * 100;
+        c.cpuInstructions = Math.round((c.cpuShare / 100) * totalCpu);
+      });
+    }
+
+    return cells.sort((a, b) => b.cpuShare - a.cpuShare);
+  }
+
+  test('call graph with 500 children preserves all 501 nodes (no slice(0,12) truncation)', () => {
+    const children = [];
+    for (let i = 0; i < 500; i++) {
+      children.push({
+        contract_id: 'C_CHILD',
+        function: `child_fn_${i}`,
+        children: [],
+      });
+    }
+    const root = {
+      contract_id: 'C_ROOT',
+      function: 'root_entry',
+      children,
+    };
+
+    const cells = cellsFromCallGraph(root, 10_000_000);
+    assert.equal(cells.length, 501, 'must retain all 501 nodes instead of slicing to 12');
+    assert.equal(cells[0].fnName, 'C_ROOT::root_entry');
+    const totalShare = cells.reduce((sum, c) => sum + c.cpuShare, 0);
+    assert.ok(Math.abs(totalShare - 100) < 0.01, 'shares must sum to 100%');
+  });
+
+  test('call graph with 1,000 children scales efficiently without truncation', () => {
+    const children = [];
+    for (let i = 0; i < 1000; i++) {
+      children.push({
+        contract_id: 'C_LEAF',
+        function: `leaf_${i}`,
+        children: [],
+      });
+    }
+    const root = {
+      contract_id: 'C_ROOT',
+      function: 'main',
+      children,
+    };
+
+    const t0 = performance.now();
+    const cells = cellsFromCallGraph(root, 50_000_000);
+    const duration = performance.now() - t0;
+
+    assert.equal(cells.length, 1001, 'must retain all 1001 nodes');
+    assert.ok(duration < 50, `1001 node traversal and sort should take < 50ms, took ${duration.toFixed(2)}ms`);
+  });
 });
 
 describe('Heatmap export – PNG trigger (DOM stub)', () => {

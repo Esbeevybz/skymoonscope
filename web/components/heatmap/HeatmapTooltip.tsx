@@ -6,7 +6,7 @@ import {
   hotspotColors,
   CATEGORY_STYLE,
 } from './HeatmapColorScale';
-import type { CpuHotspotCell } from './HeatmapCell';
+import type { CpuHotspotCell, ScaleBreakpoints } from './HeatmapCell';
 
 export function fmtInstr(n: number): string {
   return new Intl.NumberFormat('en-US', { notation: 'compact', compactDisplay: 'short' }).format(n);
@@ -16,6 +16,7 @@ export interface HeatmapTooltipProps {
   hoveredCell: CpuHotspotCell | null;
   hotspotCells?: CpuHotspotCell[];
   isLiveData?: boolean;
+  breakpoints?: ScaleBreakpoints;
   className?: string;
 }
 
@@ -23,9 +24,11 @@ export function HeatmapTooltip({
   hoveredCell,
   hotspotCells = [],
   isLiveData = false,
+  breakpoints,
   className,
 }: HeatmapTooltipProps) {
   const top3Hotspots = hotspotCells.slice(0, 3);
+  const hoveredColors = hoveredCell ? hotspotColors(hoveredCell.cpuShare, breakpoints) : null;
 
   return (
     <div
@@ -39,7 +42,7 @@ export function HeatmapTooltip({
           HOTSPOT INSPECTOR
         </span>
 
-        {hoveredCell ? (
+        {hoveredCell && hoveredColors ? (
           <div className="mt-3 space-y-3">
             {/* Full qualified name */}
             <div>
@@ -85,7 +88,7 @@ export function HeatmapTooltip({
                     className="h-full rounded-full transition-all duration-700"
                     style={{
                       width: `${Math.min((hoveredCell.cpuInstructions / LIMITS.CPU) * 100, 100)}%`,
-                      backgroundColor: hotspotColors(hoveredCell.cpuShare).barHex,
+                      backgroundColor: hoveredColors.barHex,
                     }}
                   />
                 </div>
@@ -99,11 +102,11 @@ export function HeatmapTooltip({
             <div
               className={cn(
                 'rounded px-2 py-1 text-[9px] font-mono font-bold border text-center',
-                hotspotColors(hoveredCell.cpuShare).badge,
-                hotspotColors(hoveredCell.cpuShare).border,
+                hoveredColors.badge,
+                hoveredColors.border,
               )}
             >
-              SEVERITY: {hotspotColors(hoveredCell.cpuShare).label}
+              SEVERITY: {hoveredColors.label}
             </div>
           </div>
         ) : isLiveData ? (
@@ -117,7 +120,7 @@ export function HeatmapTooltip({
             <div className="mt-4 space-y-1.5">
               <span className="text-[9px] font-mono text-slate-500 uppercase block">Top Hotspots</span>
               {top3Hotspots.map((c, i) => {
-                const clr = hotspotColors(c.cpuShare);
+                const clr = hotspotColors(c.cpuShare, breakpoints);
                 return (
                   <div
                     key={c.id}

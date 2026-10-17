@@ -2,6 +2,7 @@ export {
   HeatmapCell,
   type CpuHotspotCell,
   type HeatmapCellProps,
+  type ScaleBreakpoints,
 } from './HeatmapCell';
 
 export {
