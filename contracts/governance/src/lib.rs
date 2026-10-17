@@ -103,25 +103,14 @@ pub enum DataKey {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProposalComparison {
-    pub proposal_a: u32,
-    pub proposal_b: u32,
+    pub proposal_a: Proposal,
+    pub proposal_b: Proposal,
     pub title_changed: bool,
     pub description_changed: bool,
-    pub voting_ends_at_changed: bool,
+    pub voting_window_changed: bool,
     pub for_votes_delta: i128,
     pub against_votes_delta: i128,
-    pub open_a: bool,
-    pub open_b: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProposalDiff {
-    pub proposal_a: u32,
-    pub proposal_b: u32,
-    pub field: String,
-    pub value_a: String,
-    pub value_b: String,
+    pub open_state_changed: bool,
 }
 
 fn sqrt(x: i128) -> i128 {
@@ -636,73 +625,42 @@ impl GovernanceContract {
         Ok(receipt)
     }
 
-    /// Side-by-side comparison of two contract proposal versions.
+    /// Side-by-side comparison of two contract versions (proposals).
     ///
-    /// Returns a `ProposalComparison` summarising which fields differ between
-    /// the two proposals and the numeric deltas for the vote tallies. Both
-    /// proposals must exist.
+    /// Returns both proposals together with boolean flags indicating which
+    /// fields differ and signed deltas for the vote tallies. This lets
+    /// front-ends render a side-by-side diff of two governance proposals
+    /// without fetching each one separately.
     pub fn compare_proposals(
         env: Env,
-        proposal_a: u32,
-        proposal_b: u32,
+        proposal_id_a: u32,
+        proposal_id_b: u32,
     ) -> Result<ProposalComparison, Error> {
-        let a = get_proposal(&env, proposal_a)?;
-        let b = get_proposal(&env, proposal_b)?;
+        let proposal_a = get_proposal(&env, proposal_id_a)?;
+        let proposal_b = get_proposal(&env, proposal_id_b)?;
+
+        let title_changed = proposal_a.title != proposal_b.title;
+        let description_changed = proposal_a.description != proposal_b.description;
+        let voting_window_changed = proposal_a.voting_ends_at != proposal_b.voting_ends_at;
+        let open_state_changed = proposal_a.open != proposal_b.open;
+        let for_votes_delta = proposal_b
+            .for_votes
+            .checked_sub(proposal_a.for_votes)
+            .ok_or(Error::InvalidCredits)?;
+        let against_votes_delta = proposal_b
+            .against_votes
+            .checked_sub(proposal_a.against_votes)
+            .ok_or(Error::InvalidCredits)?;
 
         Ok(ProposalComparison {
             proposal_a,
             proposal_b,
-            title_changed: a.title != b.title,
-            description_changed: a.description != b.description,
-            voting_ends_at_changed: a.voting_ends_at != b.voting_ends_at,
-            for_votes_delta: b.for_votes - a.for_votes,
-            against_votes_delta: b.against_votes - a.against_votes,
-            open_a: a.open,
-            open_b: b.open,
+            title_changed,
+            description_changed,
+            voting_window_changed,
+            for_votes_delta,
+            against_votes_delta,
+            open_state_changed,
         })
-    }
-
-    /// Returns a per-field diff between two proposal versions.
-    ///
-    /// Each entry in the returned `Vec` describes a single field that differs
-    /// between the two proposals, with the stringified values from each side.
-    pub fn diff_proposals(
-        env: Env,
-        proposal_a: u32,
-        proposal_b: u32,
-    ) -> Result<Vec<ProposalDiff>, Error> {
-        let a = get_proposal(&env, proposal_a)?;
-        let b = get_proposal(&env, proposal_b)?;
-        let mut diffs = Vec::new(&env);
-
-        if a.title != b.title {
-            diffs.push_back(ProposalDiff {
-                proposal_a,
-                proposal_b,
-                field: String::from_str(&env, "title"),
-                value_a: a.title.clone(),
-                value_b: b.title.clone(),
-            });
-        }
-        if a.description != b.description {
-            diffs.push_back(ProposalDiff {
-                proposal_a,
-                proposal_b,
-                field: String::from_str(&env, "description"),
-                value_a: a.description.clone(),
-                value_b: b.description.clone(),
-            });
-        }
-        if a.voting_ends_at != b.voting_ends_at {
-            diffs.push_back(ProposalDiff {
-                proposal_a,
-                proposal_b,
-                field: String::from_str(&env, "voting_ends_at"),
-                value_a: String::from_str(&env, "a"),
-                value_b: String::from_str(&env, "b"),
-            });
-        }
-
-        Ok(diffs)
     }
 }

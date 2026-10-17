@@ -1,6 +1,6 @@
 use soroban_sdk::{contracttype, Address, String, Vec};
 
-#[derive(Clone, PartialEq, Debug, EqV)]
+#[derive(Clone, PartialEq, Debug, Eq)]
 #[contracttype]
 pub enum ProposalState {
     Draft,
@@ -11,15 +11,15 @@ pub enum ProposalState {
     Vetoed,
 }
 
-#[derive(Clone, PartialEq, Debug, EqV)]
+#[derive(Clone, PartialEq, Debug, Eq)]
 #[contracttype]
 pub struct ProposalAction {
     pub contract_id: Address,
     pub function_name: String,
-    pub args: Vec<String>, // Simplified, in real implementation might need proper types
+    pub args: Vec<String>,
 }
 
-#[derive(Clone, PartialEq, Debug, EqV)]
+#[derive(Clone, PartialEq, Debug, Eq)]
 #[contracttype]
 pub struct Proposal {
     pub id: u32,
@@ -37,53 +37,52 @@ pub struct Proposal {
     pub quorum_required: i128,
 }
 
-#[derive(Clone, PartialEq, Debug, EqV)]
+#[derive(Clone, PartialEq, Debug, Eq)]
 #[contracttype]
 pub struct GovernanceConfig {
     pub admin: Address,
-    pub voting_period: u64, // in seconds
-    pub timelock_delay: u64, // in seconds
-    pub quorum_percentage: u32, // percentage of total voting power needed
+    pub voting_period: u64,
+    pub timelock_delay: u64,
+    pub quorum_percentage: u32,
     pub proposal_count: u32,
 }
 
-#[derive(Clone, PartialEq, Debug, EqV)]
+/// Side by
+/// side comparison result for two contract versions.
+#[derive(Clone, PartialEq, Debug, Eq)]
+#[contracttype]
+pub struct ProposalComparison {
+    /// Whether the two proposals are identical in all compared fields.
+    pub equal: bool,
+    /// Whether the titles differ.
+    pub title_changed: bool,
+    /// Whether the descriptions differ.
+    pub description_changed: bool,
+    /// Whether the action sets differ.
+    pub actions_changed: bool,
+    /// Whether the states differ.
+    pub state_changed: bool,
+    /// Number of actions in the first proposal.
+    pub actions_a: u32,
+    /// Number of actions in the second proposal.
+    pub actions_b: u32,
+    /// Difference in for-votes (b - a).
+    pub for_votes_delta: i128,
+    /// Difference in against-votes (b - a).
+    pub against_votes_delta: i128,
+}
+
+#[derive(Clone, PartialEq, Debug, Eq)]
 #[contracttype]
 pub enum DataKey {
     Proposal(u32),
     VotingPower(Address),
-    DelegatedPower(Address), // delegator -> delegate
-    Delegate(Address), // delegate -> total delegated power
+    DelegatedPower(Address),
+    Delegate(Address),
     Config,
-    HasVoted(u32, Address), // proposal_id, voter -> has_voted
-    SecurityCouncil, // Security Council address for veto power
+    HasVoted(u32, Address),
+    SecurityCouncil,
     Voters,
     VotingPowerSnapshot(u32, Address),
     TotalVotingPowerSnapshot(u32),
-}
-
-/// A single field-level difference between two proposal versions.
-#[derive(Clone, PartialEq, Debug, EqV)]
-#[contracttype]
-pub struct ProposalFieldDiff {
-    /// Name of the compared field (e.g. "title", "description", "state").
-    pub field: String,
-    /// Rendered value on the left (older) version.
-    pub left: String,
-    /// Rendered value on the right (newer) version.
-    pub right: String,
-}
-
-/// Side-by-side comparison of two proposal versions.
-#[derive(Clone, PartialEq, Debug, EqV)]
-#[contracttype]
-pub struct ProposalComparison {
-    /// Id of the left (older) proposal.
-    pub left_id: u32,
-    /// Id of the right (newer) proposal.
-    pub right_id: u32,
-    /// True when the two proposals are functionally identical.
-    pub identical: bool,
-    /// Ordered list of fields that differ between the two versions.
-    pub diffs: Vec<ProposalFieldDiff,
 }
