@@ -515,6 +515,43 @@ impl LiquidityPoolFactory {
         let threshold = EmergencyGuard::get_threshold(env);
         MultisigConfig { admins, threshold }
     }
+
+    /// Record a newly deployed pool instance and add it to the global list.
+    ///
+    /// This is called internally by `create_pair` immediately after deployment
+    /// so the factory can answer queries like "all instances" and "who created
+    /// this pool?".
+    fn register_instance(env: Env, instance: Address, creator: Address) -> Result<(), Error> {
+        let record = InstanceRecord {
+            creator: creator.clone(),
+            created_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Instance(instance.clone()), &record);
+        env.storage()
+            .instance()
+            .set(&DataKey::Creator(instance.clone()), &creator);
+
+        let mut all: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllInstances)
+            .unwrap_or_else(|| Vec::new(&env));
+        all.push_back(instance);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllInstances, &all);
+        Ok(())
+    }
+
+    /// Return every pool address that has been deployed through this factory.
+    pub fn get_all_instances(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllInstances)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
 }
 
 #[cfg(test)]

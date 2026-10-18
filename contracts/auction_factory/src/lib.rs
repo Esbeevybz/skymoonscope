@@ -63,7 +63,7 @@ fn collect_deployment_fee(env: &Env, seller: &Address) -> Result<(), FactoryErro
 fn load_deployed_auctions(env: &Env) -> Vec<Address> {
     env.storage()
         .instance()
-        .get(&DataKey::DeployedAuctions)
+        .get(&DataKey::Instances)
         .unwrap_or(Vec::new(env))
 }
 
@@ -110,7 +110,8 @@ impl AuctionFactory {
     /// Initialize the factory's admin committee via EmergencyGuard.
     /// Must be called once before any admin-gated operations.
     pub fn initialize(env: Env, admins: Vec<Address>, threshold: u32) -> Result<(), GuardError> {
-        EmergencyGuard::initialize(env, admins, threshold)
+        let guardian = admins.get(0).ok_or(GuardError::InvalidThreshold)?;
+        EmergencyGuard::initialize(env, admins, threshold, guardian)
     }
 
     /// Atomically rotate a factory admin: replace `old_admin` with `new_admin`.
