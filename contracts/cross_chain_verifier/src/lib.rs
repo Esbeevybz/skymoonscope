@@ -86,7 +86,7 @@ pub enum DataKey {
     SignerCount,
     /// Message hash already verified, for replay protection.
     ProcessedMessages(BytesN<32>),
-    /// Nonce already consumed, by either verification entry point.
+    /// Nonce already consumed by a successful verification entry point.
     ProcessedNonce(u64),
     /// Whether verification is paused.
     VerifyPaused,
@@ -253,6 +253,10 @@ impl CrossChainVerifier {
             panic!("verification paused");
         }
 
+        if Self::is_nonce_processed(env.clone(), signed_message.message.nonce) {
+            return false;
+        }
+
         if !Self::verify_signature(&env, &signed_message) {
             return false;
         }
@@ -268,6 +272,9 @@ impl CrossChainVerifier {
         }
 
         env.storage().persistent().set(&processed_key, &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProcessedNonce(signed_message.message.nonce), &true);
         env.events().publish(
             (symbol_short!("verified"), symbol_short!("signed")),
             (block_height, message_hash),
@@ -437,6 +444,11 @@ impl CrossChainVerifier {
 
         for i in 0..messages.len() {
             let msg = messages.get(i).unwrap();
+
+            if Self::is_nonce_processed(env.clone(), msg.signed_message.message.nonce) {
+                failed_indices.push_back(i);
+                continue;
+            }
             
             // Check signature
             if !Self::verify_signature(&env, &msg.signed_message) {
@@ -460,6 +472,10 @@ impl CrossChainVerifier {
 
             // Mark message as processed
             env.storage().persistent().set(&processed_key, &true);
+            env.storage().persistent().set(
+                &DataKey::ProcessedNonce(msg.signed_message.message.nonce),
+                &true,
+            );
             env.events().publish(
                 (symbol_short!("verified"), symbol_short!("signed_b")),
                 (msg.block_height, message_hash),
