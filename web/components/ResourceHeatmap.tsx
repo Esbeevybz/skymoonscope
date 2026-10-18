@@ -1,9 +1,11 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { Cpu, Database, Zap, Activity, Info, Sliders, Flame, AlertTriangle, MemoryStick } from 'lucide-react';
 import { cn } from '../lib/utils';
 import type { CallGraph, CallNode } from '../lib/sorobantypes';
 import { HeatmapCell } from './heatmap/HeatmapCell';
 import { HeatmapTooltip } from './heatmap/HeatmapTooltip';
+import { HeatmapFloatingTooltip } from './heatmap/HeatmapFloatingTooltip';
+import type { TooltipPosition } from './heatmap/HeatmapFloatingTooltip';
 import { computeVisibleRange } from '../lib/heatmapVirtualizer';
 
 // ── Scale Breakpoints (configurable legend thresholds) ───────────────────────
@@ -425,6 +427,7 @@ export function ResourceHeatmap({ resourceCost, callGraph, hotspotCells: customH
   type Tab = 'gauges' | 'ram' | 'hotspot' | 'footprint';
   const [activeTab, setActiveTab] = useState<Tab>('gauges');
   const [hoveredCellId, setHoveredCellId] = useState<string | null>(null);
+  const [tooltipPosition, setTooltipPosition] = useState<TooltipPosition | null>(null);
   const [hoveredRamId,      setHoveredRamId]      = useState<string | null>(null);
   const [hoveredSegmentId,  setHoveredSegmentId]  = useState<string | null>(null);
   const [hoveredKey,        setHoveredKey]         = useState<string | null>(null);
@@ -438,6 +441,7 @@ export function ResourceHeatmap({ resourceCost, callGraph, hotspotCells: customH
   useEffect(() => {
     setActiveTab('gauges');
     setHoveredCellId(null);
+    setTooltipPosition(null);
     setHoveredRamId(null);
     setHoveredSegmentId(null);
     setHoveredKey(null);
@@ -511,6 +515,11 @@ export function ResourceHeatmap({ resourceCost, callGraph, hotspotCells: customH
 
   const handleCellLeave = useCallback(() => {
     setHoveredCellId(null);
+    setTooltipPosition(null);
+  }, []);
+
+  const handleCellMouseMove = useCallback((x: number, y: number) => {
+    setTooltipPosition({ x, y });
   }, []);
 
   const gridScrollRef = useRef<HTMLDivElement>(null);
@@ -650,6 +659,13 @@ export function ResourceHeatmap({ resourceCost, callGraph, hotspotCells: customH
       <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/10 to-transparent pointer-events-none" />
       {/* Dot-grid background */}
       <div className="absolute inset-0 opacity-[0.02] bg-[radial-gradient(#38bdf8_1px,transparent_1px)] [background-size:16px_16px] pointer-events-none" />
+
+      {/* ── Floating tooltip — renders via fixed position near cursor ──────── */}
+      <HeatmapFloatingTooltip
+        cell={hoveredCell}
+        position={tooltipPosition}
+        breakpoints={breakpoints}
+      />
 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800/80 pb-5 mb-6 z-10 relative">
@@ -1065,6 +1081,7 @@ export function ResourceHeatmap({ resourceCost, callGraph, hotspotCells: customH
                             breakpoints={breakpoints}
                             onHover={handleCellHover}
                             onLeave={handleCellLeave}
+                            onMouseMove={handleCellMouseMove}
                           />
                         );
                       })}

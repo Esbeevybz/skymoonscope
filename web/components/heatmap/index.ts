@@ -12,6 +12,13 @@ export {
 } from './HeatmapTooltip';
 
 export {
+  HeatmapFloatingTooltip,
+  type HeatmapFloatingTooltipProps,
+  type TooltipPosition,
+  fmtInstrFull,
+} from './HeatmapFloatingTooltip';
+
+export {
   HeatmapColorScale,
   type HeatmapColorScaleProps,
   type ColorScaleItem,
