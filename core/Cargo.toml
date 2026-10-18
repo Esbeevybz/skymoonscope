@@ -58,6 +58,7 @@ rayon = "1.8"
 # and RAM utilisation for the local process. Default features include
 # everything we need: `system`, `process`, and the CPU usage diff.
 sysinfo = "0.32"
+nanoid = "0.4"
 # gRPC event streaming (Issue #583)
 #
 # The `tls` feature pulls in rustls so the gRPC server can terminate TLS and

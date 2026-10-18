@@ -23,6 +23,9 @@ mod routing;
 pub mod rpc_provider;
 mod rpc_throttle;
 mod runner;
+mod shared_results_domain;
+mod shared_results_handlers;
+mod shared_results_store;
 mod simulation;
 mod simulation_service;
 mod task_queue;
@@ -46,6 +49,10 @@ use crate::insights::InsightsEngine;
 use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
 use crate::merkle_tree::MerkleTree;
 use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
+use crate::shared_results_handlers::{
+    check_share_exists, create_share, delete_share, get_share, SharedResultsState,
+};
+use crate::shared_results_store::SharedResultsStore;
 use crate::simulation::{SimulationEngine, SimulationMode, SimulationResult};
 use crate::ws::SimulationBus;
 use crate::worker_pool::EventWorkerPool;
@@ -2607,6 +2614,7 @@ async fn main() {
     let metrics = Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics"));
 
     let fee_store = Arc::new(FeeStore::new(db_pool.clone()));
+    let shared_results_store = Arc::new(SharedResultsStore::new(db_pool.clone()));
     let fee_analytics_engine = FeeAnalyticsEngine::new();
     let job_queue_config = JobQueueConfig {
         job_timeout_secs: config.job_timeout_secs,
@@ -2873,6 +2881,11 @@ async fn main() {
         .route("/fees/recommend", get(fee_recommend))
         .route("/fees/history", get(fee_history))
         .route("/fees/analytics", get(fee_analytics))
+        // Shared results routes (public access - links to view results)
+        .route("/api/shares", post(create_share))
+        .route("/api/shares/:share_id", get(get_share))
+        .route("/api/shares/:share_id/exists", get(check_share_exists))
+        .route("/api/shares/:share_id", axum::routing::delete(delete_share))
         // WebSocket streaming (Issue #105) authenticates during the upgrade.
         .route("/ws/jobs/:job_id", get(ws::ws_handler))
         // Inbound webhooks signature validation (Issue #582)
@@ -2883,6 +2896,10 @@ async fn main() {
             config.inbound_webhook_secret.clone(),
         ))))
         .layer(Extension(webhook_validation::InboundWebhookNonceCache::default()))
+        .layer(Extension(SharedResultsState {
+            store: shared_results_store,
+            base_url: format!("http://0.0.0.0:{}", config.server_port),
+        }))
         // GraphQL contract execution history + token metadata query layer.
         .route(
             "/graphql",

@@ -28,6 +28,11 @@ pub enum AppError {
 
     #[error("Too many requests: {0}")]
     TooManyRequests(String),
+
+    /// HTTP 410 Gone — the resource existed but has been permanently removed
+    /// (e.g. an expired share link).
+    #[error("Gone: {0}")]
+    Gone(String),
 }
 
 /// RFC 7807 "Problem Details for HTTP APIs" response body.
@@ -57,6 +62,7 @@ impl AppError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::Gone(_) => StatusCode::GONE,
         }
     }
 
@@ -67,6 +73,7 @@ impl AppError {
             Self::BadRequest(_) => "bad-request",
             Self::Unauthorized(_) => "unauthorized",
             Self::TooManyRequests(_) => "too-many-requests",
+            Self::Gone(_) => "gone",
         }
     }
 
@@ -77,6 +84,7 @@ impl AppError {
             Self::BadRequest(_) => "Bad Request",
             Self::Unauthorized(_) => "Unauthorized",
             Self::TooManyRequests(_) => "Too Many Requests",
+            Self::Gone(_) => "Gone",
         }
     }
 }
