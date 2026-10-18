@@ -1,4 +1,5 @@
 import React from 'react';
+import { debugError } from '../lib/debugUtils';
 
 export type ErrorBoundaryProps = {
   children: React.ReactNode;
@@ -48,7 +49,7 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
 
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
     this.setState({ errorInfo });
-    console.error('Unhandled UI error:', error, errorInfo);
+    debugError('Unhandled UI error:', error, errorInfo);
   }
 
   reset = () => {

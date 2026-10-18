@@ -104,6 +104,18 @@ impl SimulationCache {
         hex::encode(digest)
     }
 
+    pub fn generate_key_with_network(
+        contract_id: &str,
+        function_name: &str,
+        args: &[String],
+        network: &str,
+    ) -> String {
+        let args_json = serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string());
+        let input = format!("{}{}{}{}", contract_id, function_name, args_json, network);
+        let digest = Sha256::digest(input.as_bytes());
+        hex::encode(digest)
+    }
+
     pub async fn get(&self, key: &str) -> Option<SimulationResult> {
         if let Some(result) = self.l1.get(key).await {
             self.touch(key);
@@ -328,6 +340,69 @@ mod tests {
 
         assert!(bounded.get("old").await.is_none());
         assert!(bounded.get("new").await.is_some());
+    }
+
+    #[test]
+    fn cache_key_generation_is_deterministic() {
+        let contract_id = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let function_name = "transfer";
+        let args = vec!["arg1".to_string(), "arg2".to_string()];
+
+        let key1 = SimulationCache::generate_key(contract_id, function_name, &args);
+        let key2 = SimulationCache::generate_key(contract_id, function_name, &args);
+
+        assert_eq!(key1, key2, "Same inputs should produce same cache key");
+    }
+
+    #[test]
+    fn cache_key_includes_all_parameters() {
+        let contract_id = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let function_name = "transfer";
+        let args = vec!["arg1".to_string()];
+
+        let key1 = SimulationCache::generate_key(contract_id, function_name, &args);
+        let key2 = SimulationCache::generate_key("DIFFERENT_CONTRACT", function_name, &args);
+        let key3 = SimulationCache::generate_key(contract_id, "different_function", &args);
+        let key4 = SimulationCache::generate_key(contract_id, function_name, &[]);
+
+        assert_ne!(key1, key2, "Different contract IDs should produce different keys");
+        assert_ne!(key1, key3, "Different function names should produce different keys");
+        assert_ne!(key1, key4, "Different args should produce different keys");
+    }
+
+    #[test]
+    fn cache_key_with_network_differentiates_networks() {
+        let contract_id = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let function_name = "transfer";
+        let args = vec!["arg1".to_string()];
+        let testnet = "Test SDF Network ; September 2015";
+        let mainnet = "Public Global Stellar Network ; September 2015";
+
+        let key_testnet =
+            SimulationCache::generate_key_with_network(contract_id, function_name, &args, testnet);
+        let key_mainnet =
+            SimulationCache::generate_key_with_network(contract_id, function_name, &args, mainnet);
+
+        assert_ne!(
+            key_testnet, key_mainnet,
+            "Different networks should produce different cache keys"
+        );
+    }
+
+    #[test]
+    fn cache_key_with_network_is_deterministic() {
+        let contract_id = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let function_name = "transfer";
+        let args = vec!["arg1".to_string()];
+        let network = "Test SDF Network ; September 2015";
+
+        let key1 = SimulationCache::generate_key_with_network(contract_id, function_name, &args, network);
+        let key2 = SimulationCache::generate_key_with_network(contract_id, function_name, &args, network);
+
+        assert_eq!(
+            key1, key2,
+            "Same inputs with same network should produce same cache key"
+        );
     }
 }
 

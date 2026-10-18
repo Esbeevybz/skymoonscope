@@ -55,6 +55,12 @@ export interface InvocationResult {
   error?: string;
   /** Error type from backend (e.g., BAD_REQUEST, INTERNAL_SERVER_ERROR) */
   errorType?: string;
+  /**
+   * The original `.wasm` filename that was uploaded for this invocation.
+   * Stored alongside the result so the UI can display it after a page refresh,
+   * when the in-memory `File` object is no longer available.
+   */
+  wasmFileName?: string;
   /** Primary `/analyze` response payload for the latest invocation. */
   analysisReport?: ResourceReport;
   /** Backward-compatible alias for older stored history entries. */

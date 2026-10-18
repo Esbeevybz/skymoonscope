@@ -1,4 +1,3 @@
-```rust
 #![allow(dead_code)]
 
 mod auth;
@@ -6,6 +5,7 @@ mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
+mod error_middleware;
 mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
@@ -18,6 +18,7 @@ mod jobs;
 mod leader_lock;
 mod merkle_tree;
 mod parser;
+mod profiling_webhooks;
 mod routing;
 pub mod rpc_provider;
 mod rpc_throttle;
@@ -197,6 +198,15 @@ struct AppConfig {
     /// When empty, defaults to `*` (allow all origins).
     #[serde(default = "default_allowed_origins")]
     allowed_origins: String,
+    /// Minimum number of seconds between two alerts for the same host
+    /// resource (issue #24).
+    ///
+    /// The system resource alarm monitor is edge-triggered, so without a
+    /// window a resource oscillating around the alarm threshold alerts on
+    /// every sampling interval. `0` disables rate limiting.
+    /// Env: `ALARM_DEDUP_WINDOW_SECS`. Default 60.
+    #[serde(default = "default_alarm_dedup_window_secs")]
+    alarm_dedup_window_secs: u64,
 }
 
 fn default_health_check_interval() -> u64 {
@@ -267,6 +277,16 @@ fn default_max_cache_size_mb() -> u64 {
 
 fn default_event_bus_capacity() -> usize {
     256
+}
+
+/// Default alert deduplication window in seconds (issue #24).
+///
+/// Mirrors `config::default_alarm_dedup_window_secs()` so the binary and the
+/// library config surface agree on a single default.
+fn default_alarm_dedup_window_secs() -> u64 {
+    60
+}
+
 fn default_allowed_origins() -> String {
     // Empty string means: fall back to allow-all (*).
     // Operators set ALLOWED_ORIGINS=http://localhost:3000,https://app.example.com
@@ -327,6 +347,12 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("max_cache_size_mb", 100)?
         .set_default("cors_allowed_origins", "")?
         .set_default("event_bus_capacity", 256)?
+        // Issue #24: alert deduplication window, resolved at alarm-manager
+        // initialisation below.
+        .set_default(
+            "alarm_dedup_window_secs",
+            default_alarm_dedup_window_secs(),
+        )?
         .set_default("log_format_json", false)?
         .set_default("allowed_origins", "")?
         .build()?;
@@ -516,6 +542,8 @@ pub struct AppState {
     metrics: Arc<AppMetrics>,
     /// WebSocket event bus for simulation jobs.
     simulation_bus: Arc<SimulationBus>,
+    /// Stellar network passphrase (used for cache key generation)
+    network_passphrase: String,
 }
 
 #[derive(Clone)]
@@ -868,6 +896,12 @@ pub struct ProfileWasmRequest {
     /// Optional function arguments.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Optional webhook configuration for profiling result notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<crate::profiling_webhooks::ProfileWebhookConfig>,
+    /// Optional request ID for correlation with webhook delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// Response body for the WASM profiling endpoint.
@@ -1030,8 +1064,12 @@ async fn analyze(
     tracing::info!("Received analyze request");
 
     let args = payload.args.clone().unwrap_or_default();
-    let cache_key =
-        SimulationCache::generate_key(&payload.contract_id, &payload.function_name, &args);
+    let cache_key = SimulationCache::generate_key_with_network(
+        &payload.contract_id,
+        &payload.function_name,
+        &args,
+        &state.network_passphrase,
+    );
 
     // Track simulation latency
     let start_time = std::time::Instant::now();
@@ -1312,12 +1350,15 @@ async fn metrics_handler(
 
 async fn analyze_wasm_profile(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<ProfileWasmRequest>,
+    Json(mut payload): Json<ProfileWasmRequest>,
 ) -> Result<Json<ProfileResponse>, AppError> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
+    let request_id = payload.request_id.clone();
+
     tracing::info!(
         function_name = %payload.function_name,
+        request_id = ?request_id,
         "Received WASM profile request"
     );
 
@@ -1355,8 +1396,42 @@ async fn analyze_wasm_profile(
     .map_err(|e| AppError::BadRequest(format!("Profiling failed: {}", e)))?;
 
     let (resources, profile) = result;
+    let response = ProfileResponse { profile, resources };
 
-    Ok(Json(ProfileResponse { profile, resources }))
+    // Deliver webhook asynchronously if configured.
+    if let Some(webhook_config) = payload.webhook.take() {
+        let profile_result = serde_json::to_value(&response.profile)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let webhook_payload = crate::profiling_webhooks::ProfilingWebhookPayload {
+            request_id,
+            function_name: payload.function_name.clone(),
+            result: profile_result,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let client = state.http_client.clone();
+        tokio::spawn(async move {
+            match crate::profiling_webhooks::deliver_profiling_webhook(&client, &webhook_config, webhook_payload).await {
+                Ok(_) => {
+                    tracing::info!(
+                        function_name = %payload.function_name,
+                        request_id = ?request_id,
+                        "Profiling webhook delivered successfully"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        function_name = %payload.function_name,
+                        request_id = ?request_id,
+                        error = %e,
+                        "Failed to deliver profiling webhook"
+                    );
+                }
+            }
+        });
+    }
+
+    Ok(Json(response))
 }
 
 // ── WASM branch analysis handler (Issue #101) ─────────────────────────────────
@@ -1484,6 +1559,7 @@ pub struct CompareApiResponse {
     responses(
         (status = 200, description = "Comparison report", body = CompareApiResponse),
         (status = 400, description = "Invalid request"),
+        (status = 404, description = "Baseline snapshot not found"),
         (status = 500, description = "Comparison failed")
     ),
     tag = "Analysis"
@@ -1601,9 +1677,10 @@ async fn compare_handler(
         }
     };
 
-    let report = comparison::run_comparison(&state.engine, compare_mode)
-        .await
-        .map_err(|e| AppError::Internal(format!("Comparison failed: {}", e)))?;
+    // `?` converts `ComparisonError` into `AppError` via the crate's `From`
+    // impl, so a missing baseline snapshot surfaces as `404 Not Found` instead
+    // of a generic `500`.
+    let report = comparison::run_comparison(&state.engine, compare_mode).await?;
 
     Ok(Json(CompareApiResponse { report }))
 }
@@ -2253,7 +2330,7 @@ async fn main() {
                 comparison::print_report(&report);
             }
             Err(e) => {
-                eprintln!("Error: Comparison failed: {}", e);
+                eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
@@ -2715,6 +2792,7 @@ async fn main() {
         metrics: Arc::clone(&app_metrics),
         metrics,
         simulation_bus,
+        network_passphrase: config.network_passphrase.clone(),
     });
 
     // ── Issue #592: System Resource Alarm Monitor ────────────────────────
@@ -2725,11 +2803,20 @@ async fn main() {
     // triggered hysteresis so a sustained saturation produces exactly
     // one breach notification (plus a recovery notification when the
     // resource drops back below threshold).
-    let alarm_config = crate::sys_alarms::SysAlarmConfig::from_env();
+    //
+    // Issue #24: the edge trigger fires on *every* crossing, so a resource
+    // flapping around the threshold would alert once per sample. The
+    // deduplication window (config: `alarm_dedup_window_secs`) caps that at
+    // one alert per resource per window.
+    let alarm_config = crate::sys_alarms::SysAlarmConfig::from_env()
+        .with_dedup_window_secs(config.alarm_dedup_window_secs);
     let alarm_monitor = crate::sys_alarms::SysAlarmMonitor::new(alarm_config)
         .with_metrics(Arc::clone(&app_metrics));
     if let Some(_alarm_handle) = alarm_monitor.spawn() {
-        tracing::info!("System resource alarm monitor spawned (issue #592)");
+        tracing::info!(
+            alarm_dedup_window_secs = config.alarm_dedup_window_secs,
+            "System resource alarm monitor spawned (issue #592)"
+        );
     }
     // Clone the bus Arc before app_state is moved into the router, so the gRPC
     // server can subscribe to the same broadcast channel.
@@ -2822,6 +2909,10 @@ async fn main() {
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
+        // ── Error sanitization middleware (#error-security) ─────────────────
+        // Replaces 5xx error details with opaque messages while logging
+        // full Debug details server-side to prevent information leakage.
+        .layer(middleware::from_fn(error_middleware::error_sanitization_middleware))
         // ── x-request-id (#572) ───────────────────────────────────────
         // Assigns a UUID to every inbound request under the `x-request-id`
         // header and propagates it to outbound responses so clients can
@@ -3112,10 +3203,18 @@ mod tests {
         let event_pool = Arc::new(EventWorkerPool::new(4).unwrap());
         let app_state = Arc::new(AppState {
             engine: SimulationEngine::new("https://test.example.com".to_string()),
+            provider_registry: Arc::new(ProviderRegistry::new(Default::default())),
             cache: SimulationCache::new(),
             insights_engine: InsightsEngine::new(),
+            gas_golfing_analyzer: GasGolfingAnalyzer::new(),
             simulation_timeout: std::time::Duration::from_secs(30),
+            job_queue: JobQueue::new(10),
             event_worker_pool: Arc::clone(&event_pool),
+            fee_analytics_engine: FeeAnalyticsEngine::new(),
+            fee_store: Arc::new(FeeStore::new()),
+            metrics: Arc::new(AppMetrics::new().unwrap()),
+            simulation_bus: Arc::new(SimulationBus::new(100)),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
         });
         let auth_state = Arc::new(auth::AuthState::new(
             "test-secret".to_string(),
@@ -3284,5 +3383,3 @@ async fn analyze_simulation(
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
 }
-
-```

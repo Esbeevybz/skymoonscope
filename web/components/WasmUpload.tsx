@@ -20,7 +20,9 @@ import { createUserFriendlyMessage, formatError } from "../lib/errorHandling";
 import { arrayBufferToBase64 } from "../lib/utils";
 import { useWasmValidationWorker } from "../hooks/useWasmValidationWorker";
 import { extractContractFunctions } from "../lib/wasmValidation";
+import { debugLog } from "../lib/debugUtils";
 import type { WasmValidationReport } from "../lib/wasmValidation";
+import WasmSectionSummaryPanel from "./WasmSectionSummary";
 
 // Utility for cleaner tailwind classes
 function cn(...inputs: ClassValue[]) {
@@ -41,8 +43,8 @@ interface WasmFile {
   validation?: WasmValidationReport;
 }
 
-// Maximum allowed WASM file size (2 MB) — enforced on both client and server.
-const MAX_WASM_SIZE = 2 * 1024 * 1024; // 2 MB
+const MAX_WASM_SIZE_MB = 50;
+const MAX_WASM_SIZE = MAX_WASM_SIZE_MB * 1024 * 1024;
 
 // WASM magic-number: the four bytes \0asm (0x00 0x61 0x73 0x6D).
 const WASM_MAGIC = 0x0061736d;
@@ -50,7 +52,7 @@ const WASM_MAGIC = 0x0061736d;
 interface WasmUploadProps {
   onUploadComplete?: (files: WasmFile[]) => void;
   onFileSelect?: (files: File[]) => void;
-  maxFileSize?: number; // in bytes, default 2 MB
+  maxFileSize?: number; // in bytes, default 50 MB
   maxFiles?: number;
   className?: string;
 }
@@ -84,10 +86,11 @@ const generateHash = async (file: File): Promise<string> => {
 export default function WasmUpload({
   onUploadComplete,
   onFileSelect,
-  maxFileSize = MAX_WASM_SIZE,
+  maxFileSize: configuredMaxFileSize = MAX_WASM_SIZE,
   maxFiles = 5,
   className,
 }: WasmUploadProps) {
+  const maxFileSize = Math.min(configuredMaxFileSize, MAX_WASM_SIZE);
   const [files, setFiles] = useState<WasmFile[]>([]);
   const [isDragActive, setIsDragActive] = useState(false);
   const { validate } = useWasmValidationWorker();
@@ -99,17 +102,15 @@ export default function WasmUpload({
         return "Validation Error: File must be a .wasm file";
       }
       if (file.size > maxFileSize) {
-        return `File too large (max ${(maxFileSize / 1024 / 1024).toFixed(1)}MB)`;
+        return `File too large: ${(file.size / 1024 / 1024).toFixed(2)} MB exceeds the ${(maxFileSize / 1024 / 1024).toFixed(0)} MB limit`;
+      }
       if (file.size === 0) {
         return "File is empty";
+      }
       return null;
     },
     [maxFileSize]
   );
-  //validate WASM file (synchronous checks: extension, size, empty)
-  const validateWasm = useCallback((file: File): string | null => {
-      return `File too large: ${(file.size / 1024 / 1024).toFixed(2)} MB exceeds the ${(maxFileSize / 1024 / 1024).toFixed(0)} MB limit`;
-  }, [maxFileSize]);
 
   // Async magic-bytes check: reads the first 8 bytes and verifies \0asm + version 1.
   const validateWasmMagic = useCallback(async (file: File): Promise<string | null> => {
@@ -142,9 +143,21 @@ export default function WasmUpload({
 
   // Submit WASM to backend simulation engine.
   const uploadFile = useCallback(async (wasmFile: WasmFile) => {
+    const validationError = validateWasm(wasmFile.file);
+    if (validationError) {
+      setFiles((prev) =>
+        prev.map((file) =>
+          file.id === wasmFile.id
+            ? { ...file, status: "error", error: validationError }
+            : file
+        )
+      );
+      return;
+    }
+
     setFiles((prev) =>
       prev.map((f) =>
-        f.id === wasmFile.id ? { ...f, status: "uploading" } : f
+        f.id === wasmFile.id ? { ...f, status: "validating" } : f
       )
     );
 
@@ -155,16 +168,20 @@ export default function WasmUpload({
       // Decode/validate in the Web Worker first. The worker takes ownership of
       // `buffer` (transferable), so base64 encoding uses its own copy.
       const encodeBuffer = buffer.slice(0);
-        prev.map((f) => (f.id === wasmFile.id ? { ...f, status: "validating" } : f))
       const validation = await validate(buffer, maxFileSize);
       setUploadProgress(wasmFile.id, 40);
 
       if (!validation.valid) {
         throw new Error(
           validation.errors[0] || "Validation Error: WASM module could not be decoded"
+        );
       }
 
+      setFiles((prev) =>
+        prev.map((f) =>
           f.id === wasmFile.id ? { ...f, status: "uploading", validation } : f
+        )
+      );
 
       const wasmBytesBase64 = arrayBufferToBase64(encodeBuffer);
       setUploadProgress(wasmFile.id, 80);
@@ -178,89 +195,45 @@ export default function WasmUpload({
       const hash = await generateHash(wasmFile.file);
       setUploadProgress(wasmFile.id, 100);
 
-  // Submit WASM to backend simulation engine
-  const uploadFile = useCallback(
-    async (wasmFile: WasmFile) => {
       setFiles((prev) =>
         prev.map((f) =>
-          f.id === wasmFile.id ? { ...f, status: "uploading" } : f
+          f.id === wasmFile.id
+            ? { ...f, status: "success", progress: 100, hash, simulationResult }
+            : f
         )
       );
+    } catch (err) {
+      let errorMessage = "Upload failed. Please try again.";
 
-      try {
-        setUploadProgress(wasmFile.id, 20);
-        const buffer = await wasmFile.file.arrayBuffer();
-        setUploadProgress(wasmFile.id, 50);
-
-        const wasmBytesBase64 = arrayBufferToBase64(buffer);
-        setUploadProgress(wasmFile.id, 80);
-
-        const simulationResult = await analyzeService.analyzeWasm({
-          wasm_bytes: wasmBytesBase64,
-          function_name: "main",
-          args: [],
-        });
-
-        const hash = await generateHash(wasmFile.file);
-        setUploadProgress(wasmFile.id, 100);
-
-        setFiles((prev) =>
-          prev.map((f) =>
-            f.id === wasmFile.id
-              ? { ...f, status: "success", progress: 100, hash, simulationResult }
-              : f
-          )
-        );
-      } catch (err) {
-        let errorMessage = "Upload failed. Please try again.";
-
-        if (err instanceof ApiError) {
-          const body =
-            typeof err.body === "object" && err.body !== null
-              ? (err.body as { error?: unknown; message?: unknown })
-              : undefined;
-          const backendError = {
-            error:
-              typeof body?.error === "string"
-                ? body.error
-                : statusToErrorType(err.status),
-            message:
-              typeof body?.message === "string" ? body.message : err.message,
-            statusCode: err.status,
-          };
-          errorMessage = createUserFriendlyMessage(backendError);
-        } else {
-          const formatted = formatError(err);
-          errorMessage = formatted.message;
-        }
-
-        setFiles((prev) =>
-          prev.map((f) =>
-            f.id === wasmFile.id
-              ? {
-                  ...f,
-                  status: "error",
-                  error: errorMessage,
-                }
-              : f
-          )
-        );
+      if (err instanceof ApiError) {
+        const body =
+          typeof err.body === "object" && err.body !== null
+            ? (err.body as { error?: unknown; message?: unknown })
+            : undefined;
+        const backendError = {
+          error:
+            typeof body?.error === "string"
+              ? body.error
+              : statusToErrorType(err.status),
+          message:
+            typeof body?.message === "string" ? body.message : err.message,
+          statusCode: err.status,
+        };
+        errorMessage = createUserFriendlyMessage(backendError);
+      } else {
+        const formatted = formatError(err);
+        errorMessage = formatted.message;
       }
 
       setFiles((prev) =>
         prev.map((f) =>
           f.id === wasmFile.id
-            ? {
-                ...f,
-                status: "error",
-                error: errorMessage,
-              }
+            ? { ...f, status: "error", error: errorMessage }
             : f
         )
       );
-  }, [maxFileSize, setUploadProgress, validate]);
-    },
-    [setUploadProgress]
+    }
+  }, [maxFileSize, setUploadProgress, validate, validateWasm]);
 
   const onDrop = useCallback(
     async (acceptedFiles: File[]) => {
@@ -311,7 +284,6 @@ export default function WasmUpload({
       setFiles((prev) => [...prev, ...magicValidFiles, ...invalidFiles]);
       onFileSelect?.(magicValidFiles.map((f) => f.file));
 
-      validFiles.forEach((f) => uploadFile(f));
       //auto-upload valid files (after magic-bytes check passes)
       magicValidFiles.forEach((f) => uploadFile(f));
     },
@@ -324,7 +296,6 @@ export default function WasmUpload({
       "application/wasm": [".wasm"],
     },
     maxFiles,
-    maxSize: maxFileSize,
     onDragEnter: () => setIsDragActive(true),
     onDragLeave: () => setIsDragActive(false),
     onDropAccepted: () => setIsDragActive(false),
@@ -356,7 +327,6 @@ export default function WasmUpload({
   const uploadingCount = files.filter(
     (f) => f.status === "uploading" || f.status === "validating"
   ).length;
-  const uploadingCount = files.filter((f) => f.status === "uploading").length;
   const successCount = files.filter((f) => f.status === "success").length;
 
   const rootProps = getRootProps() as Omit<
@@ -452,8 +422,8 @@ export default function WasmUpload({
 
             {/* File Items */}
             {files.map((wasmFile) => (
+              <React.Fragment key={wasmFile.id}>
               <motion.div
-                key={wasmFile.id}
                 layout
                 initial={{ opacity: 0, scale: 0.95 }}
                 animate={{ opacity: 1, scale: 1 }}
@@ -503,27 +473,25 @@ export default function WasmUpload({
                       </span>
                     </div>
 
-                    {/* progress bar */}
+                    {/* Progress Bar */}
                     {(wasmFile.status === "uploading" ||
                       wasmFile.status === "validating") && (
-                    {/* Progress Bar */}
-                    {wasmFile.status === "uploading" && (
-                      <div className="mt-2">
-                        <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                          <motion.div
-                            className="h-full bg-indigo-500 rounded-full"
-                            initial={{ width: 0 }}
-                            animate={{ width: `${wasmFile.progress}%` }}
-                            transition={{ duration: 0.3 }}
-                          />
+                        <div className="mt-2">
+                          <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                            <motion.div
+                              className="h-full bg-indigo-500 rounded-full"
+                              initial={{ width: 0 }}
+                              animate={{ width: `${wasmFile.progress}%` }}
+                              transition={{ duration: 0.3 }}
+                            />
+                          </div>
+                          <p className="text-xs text-slate-400 mt-1">
+                            {wasmFile.status === "validating"
+                              ? "Decoding WASM module..."
+                              : `Uploading... ${wasmFile.progress}%`}
+                          </p>
                         </div>
-                        <p className="text-xs text-slate-400 mt-1">
-                          {wasmFile.status === "validating"
-                            ? "Decoding WASM module..."
-                            : `Uploading... ${wasmFile.progress}%`}
-                        </p>
-                      </div>
-                    )}
+                      )}
 
                     {/* Success State */}
                     {wasmFile.status === "success" && wasmFile.hash && (
@@ -545,8 +513,6 @@ export default function WasmUpload({
                         functions &bull; decoded in {wasmFile.validation.durationMs}ms
                       </p>
                     )}
-
-                    {/* error state */}
                     {/* Error State */}
                     {wasmFile.status === "error" && wasmFile.error && (
                       <div className="mt-1.5 flex items-center gap-2">
@@ -568,7 +534,7 @@ export default function WasmUpload({
                     {wasmFile.status === "success" && (
                       <button
                         onClick={() => {
-                          console.log("Analyze WASM:", wasmFile.hash);
+                          debugLog("Analyze WASM:", wasmFile.hash);
                         }}
                         className="p-1.5 text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"
                         title="Analyze contract"
@@ -586,6 +552,15 @@ export default function WasmUpload({
                   </div>
                 </div>
               </motion.div>
+              {/* Section Summary Panel — shown for successfully decoded files */}
+              {wasmFile.status === "success" && wasmFile.validation && (
+                <WasmSectionSummaryPanel
+                  report={wasmFile.validation}
+                  defaultOpen={false}
+                  className="mt-2"
+                />
+              )}
+              </React.Fragment>
             ))}
 
             {/* Analyze All Button */}

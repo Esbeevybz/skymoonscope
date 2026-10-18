@@ -4051,6 +4051,7 @@ dependencies = [
  "soroban-sdk",
  "sqlx",
  "stellar-strkey",
+ "subtle",
  "sysinfo",
  "tempfile",
  "thiserror 1.0.69",

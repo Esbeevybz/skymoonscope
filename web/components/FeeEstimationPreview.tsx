@@ -17,7 +17,7 @@ export function FeeEstimationPreview({
   loading = false,
   onFeeBumpChange,
 }: FeeEstimationPreviewProps) {
-  const { network } = useNetwork();
+  const { network, networkId } = useNetwork();
   const [feeEstimate, setFeeEstimate] = useState<FeeEstimate | null>(null);
   const [selectedBump, setSelectedBump] = useState<string>('low');
   const [fetching, setFetching] = useState(false);
@@ -42,6 +42,12 @@ export function FeeEstimationPreview({
       setFetching(false);
     }
   }, [costStroops, network.rpcUrl]);
+
+  // Reset fee estimate state when network changes
+  useEffect(() => {
+    setFeeEstimate(null);
+    setSelectedBump('low');
+  }, [networkId]);
 
   useEffect(() => {
     loadFeeEstimate();

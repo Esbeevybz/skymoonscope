@@ -1,0 +1,77 @@
+# Semgrep configuration for Sky Moon Scope
+# Runs OWASP and JavaScript security rulesets
+
+rules:
+  # OWASP Top 10 security patterns
+  - id: owasp-rules
+    pattern-either:
+      # A1: Injection - SQL Injection patterns
+      - patterns:
+          - pattern: $QUERY + $VAR
+          - metavariable-regex:
+              metavariable: $QUERY
+              regex: .*(SELECT|INSERT|UPDATE|DELETE|DROP).*
+      # A2: Broken Authentication - Exposed credentials
+      - patterns:
+          - pattern: |
+              password = "..."
+          - metavariable-regex:
+              metavariable: "..."
+              regex: .+
+      - patterns:
+          - pattern: |
+              token = "..."
+          - metavariable-regex:
+              metavariable: "..."
+              regex: .+
+      # A3: Sensitive Data Exposure - Logging sensitive info
+      - pattern: |
+          console.log($MSG)
+          where: $MSG.contains("password|token|secret|key|credential|api_key")
+      # A4: XML External Entity (XXE) - Not applicable to JS commonly
+      # A5: Broken Access Control - Missing auth checks
+      - pattern: |
+          fetch($URL)
+          where: $URL.contains("/admin") && no_auth_check()
+      # A6: Security Misconfiguration - CORS misconfiguration
+      - pattern: |
+          Access-Control-Allow-Origin: "*"
+      # A7: Cross-Site Scripting (XSS) - Unsafe DOM manipulation
+      - pattern: |
+          innerHTML = $VAR
+      - pattern: |
+          dangerouslySetInnerHTML = {{ __html: $VAR }}
+      # A8: Insecure Deserialization
+      - pattern: |
+          JSON.parse($UNTRUSTED_INPUT)
+      # A9: Using Components with Known Vulnerabilities
+      - pattern: |
+          require("$PKG")
+          where: $PKG in known_vulnerable_packages()
+      # A10: Insufficient Logging & Monitoring
+      - pattern: |
+          try { ... } catch(e) { ... }
+          where: no_logging()
+
+  # JavaScript-specific security rules
+  - id: javascript-security
+    patterns:
+      # Unsafe eval usage
+      - pattern-either:
+          - pattern: eval(...)
+          - pattern: Function(...)
+          - pattern: setTimeout("code", ...)
+          - pattern: setInterval("code", ...)
+      # Missing input validation
+      - pattern: |
+          $FUNC($USER_INPUT)
+          where: $FUNC in ["fetch", "XMLHttpRequest"] && no_validation($USER_INPUT)
+      # Hardcoded secrets
+      - pattern-either:
+          - pattern: |
+              const $VAR = "..."
+              where: $VAR matches regex ".*secret.*|.*key.*|.*token.*|.*password.*" && "..." matches regex ".{8,}"
+      # Missing Content Security Policy checks
+      - pattern: |
+          <script src=$SRC />
+          where: no_csp_validation($SRC)

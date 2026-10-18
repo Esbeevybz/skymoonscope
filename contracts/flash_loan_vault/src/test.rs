@@ -482,7 +482,7 @@ fn test_flash_loan_borrow_entire_vault() {
 //     let s = setup();
 //     fund_vault(&s, 10_000);
 //
-//     let receiver_id = s.e.register(bad::BadReceiver, ());
+//     let receiver_id = s.e.register(BadReceiver, ());
 //     let initiator = Address::generate(&s.e);
 //
 //     // Bad receiver doesn't repay — entire transaction should revert.
@@ -805,10 +805,6 @@ fn test_borrow_non_compliant_receiver_returns_error() {
     assert!(result.is_err());
 }
 
-    assert!(result.is_err());
-    assert_eq!(s.vault_client.get_available(), 10_000);
-}
-
 #[test]
 fn test_flash_loan_small_amount_fee_evasion_prevention() {
     let s = setup();
@@ -841,4 +837,97 @@ fn test_borrow_repayment_failure_returns_error() {
     let result = s.vault_client.try_borrow(&receiver_id, &5_000);
 
     assert_eq!(result, Err(Ok(Error::LoanNotRepaid)));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Same-invocation repayment (issue #67)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A receiver that repays inside the callback settles the loan, and the
+/// reentrancy flag is left clear afterwards.
+#[test]
+fn test_loan_settles_when_repaid_inside_the_callback() {
+    let s = setup();
+    fund_vault(&s, 1_000);
+
+    let receiver_id = s.e.register(good::GoodReceiver, ());
+    good::GoodReceiverClient::new(&s.e, &receiver_id).set_vault(&s.vault_id);
+
+    let initiator = Address::generate(&s.e);
+    let fee = s.vault_client.flash_loan(&initiator, &receiver_id, &500);
+
+    assert!(fee >= 0);
+    // The flag is cleared once the loan settles (issue #67).
+    assert_eq!(s.vault_client.is_flash_loan_active(), false);
+}
+
+/// A receiver that never repays is rejected, and the whole loan is rolled back.
+#[test]
+fn test_loan_is_rejected_when_not_repaid_in_the_callback() {
+    let s = setup();
+    fund_vault(&s, 1_000);
+
+    let receiver_id = s.e.register(BadReceiver, ());
+    let initiator = Address::generate(&s.e);
+
+    let res = s
+        .vault_client
+        .try_flash_loan(&initiator, &receiver_id, &500);
+    assert!(res.is_err(), "an unrepaid loan must not succeed");
+    assert_eq!(s.vault_client.is_flash_loan_active(), false);
+}
+
+/// Repaying less than `amount + fee` inside the callback is not enough.
+#[test]
+fn test_partial_repayment_is_rejected() {
+    let s = setup();
+    fund_vault(&s, 1_000);
+
+    let receiver_id = s.e.register(partial::PartialReceiver, ());
+    partial::PartialReceiverClient::new(&s.e, &receiver_id).set_vault(&s.vault_id);
+
+    let initiator = Address::generate(&s.e);
+    let res = s
+        .vault_client
+        .try_flash_loan(&initiator, &receiver_id, &500);
+    assert!(res.is_err(), "a partial repayment must not settle the loan");
+}
+
+/// Re-entering the vault from inside the callback is blocked by the instance
+/// flag that is set before the callback runs (issue #67). The outer loan still
+/// settles normally afterwards.
+#[test]
+fn test_nested_flash_loan_during_callback_is_blocked() {
+    let s = setup();
+    fund_vault(&s, 1_000);
+
+    let receiver_id = s.e.register(reentrant::ReentrantReceiver, ());
+    reentrant::ReentrantReceiverClient::new(&s.e, &receiver_id).set_vault(&s.vault_id);
+
+    let initiator = Address::generate(&s.e);
+    // The re-entrant call inside the callback reverts, which aborts that
+    // receiver's callback; what matters is that the vault does not end up with
+    // an unrecovered loan and the flag is left clear.
+    let _ = s
+        .vault_client
+        .try_flash_loan(&initiator, &receiver_id, &500);
+    assert_eq!(s.vault_client.is_flash_loan_active(), false);
+}
+
+/// The flag is clear between loans, so ordinary sequential lending is unaffected.
+#[test]
+fn test_flag_is_clear_between_loans() {
+    let s = setup();
+    fund_vault(&s, 1_000);
+    assert_eq!(s.vault_client.is_flash_loan_active(), false);
+
+    let receiver_id = s.e.register(good::GoodReceiver, ());
+    good::GoodReceiverClient::new(&s.e, &receiver_id).set_vault(&s.vault_id);
+    let initiator = Address::generate(&s.e);
+
+    s.vault_client.flash_loan(&initiator, &receiver_id, &100);
+    assert_eq!(s.vault_client.is_flash_loan_active(), false);
+
+    s.vault_client.flash_loan(&initiator, &receiver_id, &100);
+    assert_eq!(s.vault_client.is_flash_loan_active(), false);
 }

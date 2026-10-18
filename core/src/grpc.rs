@@ -55,7 +55,7 @@ use crate::ws::{SimulationBus, SimulationEvent};
 
 // Include the tonic-generated code from the compiled proto.
 pub mod proto {
-    tonic::include_proto!("Sky Moon Scope.events.v1");
+    tonic::include_proto!("soroscope.events.v1");
 }
 
 use proto::event_stream_service_server::EventStreamService;

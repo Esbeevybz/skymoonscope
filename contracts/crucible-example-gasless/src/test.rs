@@ -7,7 +7,10 @@ use soroban_sdk::{
     token, Address, Env, IntoVal, Symbol, TryFromVal,
 };
 
-use crate::{make_meta_tx, DataKey, Gasless, GaslessClient, MetaTx, MAX_NONCE_ADVANCE};
+use crate::{
+    make_meta_tx, make_meta_tx_with_epoch, DataKey, Gasless, GaslessClient, MetaTx,
+    MAX_NONCE_ADVANCE,
+};
 
 const AMOUNT: i128 = 1_000_000;
 const BASE_TIME: u64 = 1_000_000;
@@ -70,6 +73,19 @@ impl Ctx {
             self.token.clone(),
             AMOUNT,
             nonce,
+            DEADLINE,
+        )
+    }
+
+    fn meta_tx_epoch(&self, nonce: u64, epoch: u64) -> MetaTx {
+        make_meta_tx_with_epoch(
+            &self.env,
+            self.alice.clone(),
+            self.bob.clone(),
+            self.token.clone(),
+            AMOUNT,
+            nonce,
+            epoch,
             DEADLINE,
         )
     }
@@ -524,4 +540,199 @@ fn test_reentrant_token_cannot_replay() {
     ReentrantTokenClient::new(&ctx.env, &evil).setup(&ctx.id, &ctx.relayer, &meta_tx);
 
     ctx.client().execute(&ctx.relayer, &meta_tx);
+}
+
+// ---------------------------------------------------------------------------
+// Epoch / cross-epoch replay prevention
+//
+// Every MetaTx now carries an epoch field that must match the account's stored
+// epoch. Rotating the epoch via `rotate_epoch` increments the epoch counter and
+// resets the nonce to 0, invalidating every outstanding signature from the
+// previous epoch — even those whose nonces are still in the valid range.
+// ---------------------------------------------------------------------------
+
+/// A fresh account starts at epoch 0.
+#[test]
+fn test_epoch_starts_at_zero() {
+    let ctx = Ctx::setup();
+    assert_eq!(ctx.client().epoch(&ctx.alice), 0);
+    assert_eq!(ctx.client().epoch(&ctx.bob), 0);
+}
+
+/// A meta-tx signed at epoch 0 succeeds while the stored epoch is 0.
+#[test]
+fn test_meta_tx_with_correct_epoch_succeeds() {
+    let ctx = Ctx::setup();
+    // epoch 0 is the default, meta_tx() already uses epoch 0.
+    ctx.client().execute(&ctx.relayer, &ctx.meta_tx(0));
+    assert_eq!(ctx.balance(&ctx.bob), AMOUNT);
+}
+
+/// A meta-tx whose epoch field differs from the stored epoch is rejected.
+/// This covers the cross-epoch replay scenario: after a rotation, any
+/// signature carrying the old epoch cannot be submitted.
+#[test]
+#[should_panic(expected = "invalid epoch")]
+fn test_meta_tx_with_wrong_epoch_reverts() {
+    let ctx = Ctx::setup();
+    // Rotate once so stored epoch becomes 1.
+    ctx.client().rotate_epoch(&ctx.alice);
+
+    // A meta-tx that still carries epoch 0 must be rejected even though
+    // nonce 0 is now the next expected nonce after the reset.
+    ctx.client().execute(&ctx.relayer, &ctx.meta_tx_epoch(0, 0));
+}
+
+/// After rotating, a meta-tx signed with the new epoch and nonce 0 succeeds.
+#[test]
+fn test_meta_tx_with_new_epoch_succeeds_after_rotation() {
+    let ctx = Ctx::setup();
+    ctx.client().rotate_epoch(&ctx.alice);
+
+    // New epoch is 1; nonce restarted at 0.
+    ctx.client()
+        .execute(&ctx.relayer, &ctx.meta_tx_epoch(0, 1));
+    assert_eq!(ctx.balance(&ctx.bob), AMOUNT);
+}
+
+/// `rotate_epoch` increments the epoch counter.
+#[test]
+fn test_rotate_epoch_increments_epoch() {
+    let ctx = Ctx::setup();
+    assert_eq!(ctx.client().epoch(&ctx.alice), 0);
+
+    let (new_epoch, new_nonce) = ctx.client().rotate_epoch(&ctx.alice);
+    assert_eq!(new_epoch, 1);
+    assert_eq!(new_nonce, 0);
+    assert_eq!(ctx.client().epoch(&ctx.alice), 1);
+}
+
+/// `rotate_epoch` resets the nonce to 0, regardless of how many txs have
+/// been executed in the previous epoch.
+#[test]
+fn test_rotate_epoch_resets_nonce_to_zero() {
+    let ctx = Ctx::setup();
+
+    // Execute a few transactions to advance the nonce.
+    ctx.client().execute(&ctx.relayer, &ctx.meta_tx(0));
+    ctx.client().execute(&ctx.relayer, &ctx.meta_tx(1));
+    ctx.client().execute(&ctx.relayer, &ctx.meta_tx(2));
+    assert_eq!(ctx.client().nonce(&ctx.alice), 3);
+
+    // Rotate — nonce must restart at 0.
+    ctx.client().rotate_epoch(&ctx.alice);
+    assert_eq!(ctx.client().nonce(&ctx.alice), 0);
+}
+
+/// A cross-epoch replay: execute nonce 0 in epoch 0, rotate, then attempt to
+/// replay the same nonce 0 meta-tx (still carrying epoch 0). Must fail.
+#[test]
+#[should_panic(expected = "invalid epoch")]
+fn test_cross_epoch_replay_is_rejected() {
+    let ctx = Ctx::setup();
+
+    // Legitimate execution in epoch 0.
+    let meta_tx_epoch0 = ctx.meta_tx_epoch(0, 0);
+    ctx.client().execute(&ctx.relayer, &meta_tx_epoch0.clone());
+
+    // Rotate to epoch 1.
+    ctx.client().rotate_epoch(&ctx.alice);
+    assert_eq!(ctx.client().epoch(&ctx.alice), 1);
+    // Nonce is back to 0, so numerically the old nonce 0 would pass the
+    // nonce check — but the epoch check must fire first and reject it.
+    assert_eq!(ctx.client().nonce(&ctx.alice), 0);
+
+    // Attempt to replay the old meta-tx (epoch 0, nonce 0).
+    ctx.client().execute(&ctx.relayer, &meta_tx_epoch0);
+}
+
+/// Multiple rotations accumulate correctly.
+#[test]
+fn test_multiple_rotations_accumulate() {
+    let ctx = Ctx::setup();
+    ctx.client().rotate_epoch(&ctx.alice);
+    ctx.client().rotate_epoch(&ctx.alice);
+    ctx.client().rotate_epoch(&ctx.alice);
+    assert_eq!(ctx.client().epoch(&ctx.alice), 3);
+    assert_eq!(ctx.client().nonce(&ctx.alice), 0);
+}
+
+/// Rotation is per-account; it does not affect other users.
+#[test]
+fn test_rotate_epoch_is_per_account() {
+    let ctx = Ctx::setup();
+    ctx.client().rotate_epoch(&ctx.alice);
+
+    assert_eq!(ctx.client().epoch(&ctx.alice), 1);
+    assert_eq!(ctx.client().epoch(&ctx.bob), 0, "bob is unaffected");
+}
+
+/// `rotate_epoch` requires the user's own authorization.
+#[test]
+fn test_rotate_epoch_requires_user_auth() {
+    let ctx = Ctx::setup();
+    ctx.client().rotate_epoch(&ctx.alice);
+
+    let auths = ctx.env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| addr == &ctx.alice),
+        "rotate_epoch must require alice's authorization"
+    );
+}
+
+/// Nobody can rotate another account's epoch without their signature.
+#[test]
+#[should_panic]
+fn test_rotate_epoch_without_user_auth_reverts() {
+    let ctx = Ctx::setup();
+    ctx.env.mock_auths(&[]);
+    ctx.client().rotate_epoch(&ctx.alice);
+}
+
+/// `rotate_epoch` emits an `epoch_rotated` event.
+#[test]
+fn test_rotate_epoch_emits_event() {
+    let ctx = Ctx::setup();
+    ctx.client().rotate_epoch(&ctx.alice);
+    assert!(
+        ctx.emitted("epoch_rotated"),
+        "expected 'epoch_rotated' event"
+    );
+}
+
+/// After rotating and executing in the new epoch the nonce still increments
+/// correctly from 0.
+#[test]
+fn test_nonce_increments_correctly_after_rotation() {
+    let ctx = Ctx::setup();
+    ctx.client().rotate_epoch(&ctx.alice);
+
+    ctx.client().execute(&ctx.relayer, &ctx.meta_tx_epoch(0, 1));
+    assert_eq!(ctx.client().nonce(&ctx.alice), 1);
+
+    ctx.client().execute(&ctx.relayer, &ctx.meta_tx_epoch(1, 1));
+    assert_eq!(ctx.client().nonce(&ctx.alice), 2);
+}
+
+/// A meta-tx carrying a *future* epoch (higher than stored) is also rejected.
+#[test]
+#[should_panic(expected = "invalid epoch")]
+fn test_meta_tx_with_future_epoch_reverts() {
+    let ctx = Ctx::setup();
+    // Stored epoch is 0; sending epoch 1 must be rejected.
+    ctx.client().execute(&ctx.relayer, &ctx.meta_tx_epoch(0, 1));
+}
+
+/// `invalidate_nonces` still works within an epoch and does not affect the
+/// epoch counter.
+#[test]
+fn test_invalidate_nonces_does_not_change_epoch() {
+    let ctx = Ctx::setup();
+    ctx.client().rotate_epoch(&ctx.alice);
+    assert_eq!(ctx.client().epoch(&ctx.alice), 1);
+
+    ctx.client().invalidate_nonces(&ctx.alice, &5);
+    // Epoch must remain 1 after nonce invalidation.
+    assert_eq!(ctx.client().epoch(&ctx.alice), 1);
+    assert_eq!(ctx.client().nonce(&ctx.alice), 5);
 }

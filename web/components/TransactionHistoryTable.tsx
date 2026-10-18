@@ -113,9 +113,24 @@ export function TransactionHistoryTable({
   const [isFetchingMore, setIsFetchingMore] = useState(false);
   const [isInfiniteMode, setIsInfiniteMode] = useState(enableInfiniteScroll);
 
+  const [localFunctionName, setLocalFunctionName] = useState(filter.functionName);
+
+  useEffect(() => {
+    setLocalFunctionName(filter.functionName);
+  }, [filter.functionName]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (localFunctionName !== filter.functionName) {
+        onFunctionFilterChange?.(localFunctionName);
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [localFunctionName, filter.functionName, onFunctionFilterChange]);
+
   const filteredTransactions = useMemo(
-    () => filterTransactions(transactions, filter),
-    [transactions, filter],
+    () => filterTransactions(transactions, { ...filter, functionName: localFunctionName }),
+    [transactions, filter, localFunctionName],
   );
 
   // Jump back to the first page/batch whenever the filter itself changes.
@@ -124,7 +139,7 @@ export function TransactionHistoryTable({
   useEffect(() => {
     setPage(1);
     setVisibleLimit(PER_PAGE);
-  }, [filter]);
+  }, [filter, localFunctionName]);
 
   const { items: pageItems, page: currentPage, totalPages, total } = useMemo(
     () => paginate(filteredTransactions, page, PER_PAGE),
@@ -184,8 +199,17 @@ export function TransactionHistoryTable({
   const exportToJSON = useCallback(() => {
     const jsonContent = JSON.stringify(transactions, null, 2);
     const blob = new Blob([jsonContent], { type: 'application/json;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
     link.setAttribute('download', `telemetry_events_${Date.now()}.json`);
-  const hasActiveFilter = filter.status !== 'all' || filter.functionName.trim().length > 0;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }, [transactions]);
+
+  const hasActiveFilter = filter.status !== 'all' || localFunctionName.trim().length > 0;
 
   const filterControls = (onStatusFilterChange || onFunctionFilterChange) && (
     <div className="flex flex-col gap-2 border-b border-[#30363d] px-4 py-3 sm:flex-row sm:items-center">
@@ -193,8 +217,8 @@ export function TransactionHistoryTable({
         <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#8b949e]" />
         <input
           type="text"
-          value={filter.functionName}
-          onChange={(e) => onFunctionFilterChange?.(e.target.value)}
+          value={localFunctionName}
+          onChange={(e) => setLocalFunctionName(e.target.value)}
           placeholder="Filter by function name..."
           aria-label="Filter by function name"
           className="w-full rounded border border-[#30363d] bg-[#161b22] py-1.5 pl-8 pr-2 text-xs text-[#c9d1d9] placeholder:text-[#6e7681] focus:outline-none focus:ring-1 focus:ring-cyan-500/50"
@@ -211,6 +235,7 @@ export function TransactionHistoryTable({
         <option value="failed">Failed</option>
         <option value="pending">Pending</option>
       </select>
+    </div>
   );
 
   if (!loading && transactions.length === 0) {

@@ -8,8 +8,11 @@ const assert = require('node:assert/strict');
 
 // Inline paginate function (TypeScript module requires transpilation)
 function paginate(items, page, perPage) {
+  if (perPage <= 0) {
+    throw new RangeError('pageSize must be positive');
+  }
   const total = items.length;
-  const totalPages = perPage > 0 ? Math.max(1, Math.ceil(total / perPage)) : 1;
+  const totalPages = Math.max(1, Math.ceil(total / perPage));
   const clampedPage = Math.max(1, Math.min(page, totalPages));
   const start = (clampedPage - 1) * perPage;
   const end = start + perPage;
@@ -62,6 +65,20 @@ test('paginate: handles empty array', () => {
 test('paginate: returns totalPages of 1 for empty array', () => {
   const result = paginate([], 1, 10);
   assert.equal(result.totalPages, 1);
+});
+
+test('paginate: throws RangeError when pageSize is zero', () => {
+  assert.throws(
+    () => paginate([1, 2, 3], 1, 0),
+    { name: 'RangeError', message: 'pageSize must be positive' },
+  );
+});
+
+test('paginate: throws RangeError when pageSize is negative', () => {
+  assert.throws(
+    () => paginate([1, 2, 3], 1, -5),
+    { name: 'RangeError', message: 'pageSize must be positive' },
+  );
 });
 
 

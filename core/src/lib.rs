@@ -5,9 +5,11 @@ pub mod benchmarks;
 pub mod cache;
 pub mod call_trace_parser;
 pub mod comparison;
+pub mod config;
 pub mod contract_registry;
 pub mod cors;
 pub mod engine;
+pub mod error_middleware;
 pub mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
@@ -21,6 +23,7 @@ pub mod leader_lock;
 pub mod merkle_tree;
 pub mod parser;
 pub mod routing;
+pub mod soroban_meta_decoder;
 pub mod rpc_provider;
 pub mod rpc_throttle;
 pub mod runner;
@@ -40,6 +43,7 @@ pub mod ws;
 pub mod xdr_decoder;
 
 pub use errors::AppError;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct AppState {

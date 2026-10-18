@@ -1,8 +1,6 @@
 #![no_std]
 
-use emergency_guard::{
-    DefaultEmergencyGuard, EmergencyGuard, EmergencyGuardTrait, GuardDataKey, GuardError, PauseType,
-};
+use emergency_guard::{EmergencyGuard, GuardDataKey, GuardError, PauseType};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, IntoVal,
     Vec,
@@ -288,6 +286,7 @@ fn map_guard_err(err: GuardError) -> Error {
         | GuardError::Unauthorized
         | GuardError::AdminNotFound => Error::Unauthorized,
         GuardError::Paused => Error::Paused,
+        GuardError::TooManyGuardians | GuardError::GuardianNotFound => Error::Unauthorized,
     }
 }
 
@@ -367,9 +366,10 @@ impl LiquidityPoolFactory {
         env.storage().instance().set(&DataKey::Admin, &admin);
 
         let mut admins = Vec::new(&env);
-        admins.push_back(admin);
+        admins.push_back(admin.clone());
 
-        EmergencyGuard::initialize(env, admins, 1).map_err(|_| Error::Unauthorized)
+        EmergencyGuard::initialize(env, admins, 1, admin.clone())
+            .map_err(|_| Error::Unauthorized)
     }
 
     /// Convenience initializer for a multisig guard configuration.
@@ -378,7 +378,8 @@ impl LiquidityPoolFactory {
         admins: Vec<Address>,
         threshold: u32,
     ) -> Result<(), GuardError> {
-        EmergencyGuard::initialize(env, admins, threshold)
+        let guardian = admins.get(0).unwrap().clone();
+        EmergencyGuard::initialize(env, admins, threshold, guardian)
     }
 
     pub fn add_guard_admin(

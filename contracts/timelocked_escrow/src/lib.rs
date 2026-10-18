@@ -9,3 +9,8 @@ mod storage_types;
 mod test;
 
 pub use crate::contract::{TimelockEscrow, TimelockEscrowClient};
+pub use crate::guardian::DEFAULT_ROTATION_DELAY_LEDGERS;
+pub use crate::storage_types::{
+    DataKey, Error, EscrowConfig, GuardianRotationCancelledEvent, GuardianRotationEvent,
+    GuardianRotationProposedEvent, PendingGuardianRotation,
+};

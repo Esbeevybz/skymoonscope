@@ -9,8 +9,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 soroban-sdk.workspace = true
-Sky Moon Scope-math = { path = "../math" }
-Sky Moon Scope-error-codes = { path = "../error_codes" }
+math = { path = "../math" }
+error-codes = { path = "../error_codes" }
 emergency_guard = { path = "../emergency_guard" }
 
 [dev-dependencies]

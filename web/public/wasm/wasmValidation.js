@@ -139,6 +139,61 @@
     return exports;
   }
 
+  /**
+   * Skip the descriptor bytes following an import kind byte.
+   *
+   * Each import kind has a different descriptor shape in the binary format:
+   *   0 (function): one LEB128 type index
+   *   1 (table):    reftype byte + limits (flag byte + min LEB128 [+ max LEB128])
+   *   2 (memory):   limits (flag byte + min LEB128 [+ max LEB128])
+   *   3 (global):   valtype byte + mutability byte
+   *
+   * We only need the kind and names for the summary panel, so we skip all of
+   * the descriptor bytes without interpreting them.
+   */
+  function skipImportDescriptor(bytes, cursor, kindByte, end) {
+    if (kindByte === 0) {
+      // function: type index (LEB128)
+      const r = readVarUint32(bytes, cursor);
+      return r.next;
+    }
+    if (kindByte === 1) {
+      // table: reftype (1 byte) + limits
+      cursor += 1; // skip reftype
+      return skipLimits(bytes, cursor, end);
+    }
+    if (kindByte === 2) {
+      // memory: limits only
+      return skipLimits(bytes, cursor, end);
+    }
+    if (kindByte === 3) {
+      // global: valtype (1 byte) + mutability (1 byte)
+      cursor += 2;
+      return cursor;
+    }
+    // Unknown kind — cannot reliably skip. Stop parsing further imports.
+    return null;
+  }
+
+  /**
+   * Skip a WASM limits block: flag byte + min [+ max].
+   * flag 0x00 = no max, flag 0x01 = with max.
+   */
+  function skipLimits(bytes, cursor, end) {
+    if (cursor >= end) {
+      throw new WasmDecodeError('Truncated limits block', cursor);
+    }
+    const flag = bytes[cursor];
+    cursor += 1;
+    const min = readVarUint32(bytes, cursor);
+    cursor = min.next;
+    if (flag === 0x01) {
+      const max = readVarUint32(bytes, cursor);
+      cursor = max.next;
+    }
+    return cursor;
+  }
+
   function parseImportSection(bytes, start, end) {
     const imports = [];
     let cursor = start;
@@ -162,14 +217,132 @@
         kind: EXTERNAL_KINDS[kindByte] || `unknown(${kindByte})`,
       });
 
-      // Import descriptors have variable shapes; only the function form carries a
-      // single type index we can cheaply skip. Anything else ends the scan.
-      if (kindByte !== 0) break;
-      const typeIndex = readVarUint32(bytes, cursor);
-      cursor = typeIndex.next;
+      // Skip the descriptor bytes so we can continue to the next import entry.
+      const nextCursor = skipImportDescriptor(bytes, cursor, kindByte, end);
+      if (nextCursor === null) {
+        // Unknown descriptor kind; we cannot determine how many bytes to skip.
+        break;
+      }
+      cursor = nextCursor;
     }
 
     return imports;
+  }
+
+  /**
+   * Parse the data section (id = 11).
+   *
+   * The WASM binary format has two data segment variants relevant here:
+   *   - Active (kind = 0): memory index 0 (implicit), offset expression, init bytes
+   *   - Active (kind = 2): explicit memory index, offset expression, init bytes
+   *   - Passive (kind = 1): no memory reference, just init bytes
+   *
+   * We record the index, kind string, byte length of the initialiser data, and
+   * the offset constant when the segment is active with a simple i32.const.
+   * We intentionally do not store the raw bytes — that would balloon the JSON
+   * report that crosses the worker message channel for large modules.
+   */
+  function parseDataSection(bytes, start, end) {
+    const segments = [];
+    let cursor = start;
+
+    const { value: count, next } = readVarUint32(bytes, cursor);
+    cursor = next;
+
+    for (let i = 0; i < count && cursor < end; i += 1) {
+      const { value: segmentKind, next: afterKind } = readVarUint32(bytes, cursor);
+      cursor = afterKind;
+
+      let memoryIndex = 0;
+      let offsetValue = null;
+
+      if (segmentKind === 0) {
+        // Active, implicit memory 0. Offset expression follows.
+        const offset = readConstExprI32(bytes, cursor, end);
+        offsetValue = offset.value;
+        cursor = offset.next;
+      } else if (segmentKind === 2) {
+        // Active, explicit memory index. Memory index then offset expression.
+        const memIdx = readVarUint32(bytes, cursor);
+        memoryIndex = memIdx.value;
+        cursor = memIdx.next;
+        const offset = readConstExprI32(bytes, cursor, end);
+        offsetValue = offset.value;
+        cursor = offset.next;
+      } else if (segmentKind === 1) {
+        // Passive — no memory reference or offset.
+        memoryIndex = null;
+      } else {
+        // Unknown segment kind; record what we have and stop parsing further.
+        segments.push({
+          index: i,
+          kind: `unknown(${segmentKind})`,
+          memoryIndex: null,
+          offsetValue: null,
+          byteLength: 0,
+        });
+        break;
+      }
+
+      // Init vector: LEB128 length + that many bytes.
+      const { value: dataLen, next: afterLen } = readVarUint32(bytes, cursor);
+      cursor = afterLen;
+
+      if (cursor + dataLen > end) {
+        throw new WasmDecodeError(
+          `Data segment ${i} claims ${dataLen} bytes but only ${end - cursor} remain`,
+          cursor,
+        );
+      }
+      cursor += dataLen;
+
+      segments.push({
+        index: i,
+        kind: segmentKind === 1 ? 'passive' : 'active',
+        memoryIndex: segmentKind === 1 ? null : memoryIndex,
+        offsetValue,
+        byteLength: dataLen,
+      });
+    }
+
+    return segments;
+  }
+
+  /**
+   * Read a simple constant expression of the form `i32.const <imm> end`.
+   *
+   * WASM constant expressions in practice for data segment offsets are almost
+   * always a single `i32.const` opcode (0x41) followed by a signed LEB128
+   * immediate and an `end` opcode (0x0b). We handle that case and skip
+   * gracefully otherwise.
+   */
+  function readConstExprI32(bytes, cursor, end) {
+    if (cursor >= end) {
+      throw new WasmDecodeError('Truncated constant expression', cursor);
+    }
+    const opcode = bytes[cursor];
+    cursor += 1;
+
+    let value = null;
+    if (opcode === 0x41) {
+      // i32.const: signed LEB128
+      const r = readVarUint32(bytes, cursor);
+      value = r.value;
+      cursor = r.next;
+    } else {
+      // Non-i32.const opcode (e.g., global.get). We do not decode the value but
+      // still need to advance past the expression up to the `end` (0x0b) byte.
+      while (cursor < end && bytes[cursor] !== 0x0b) {
+        cursor += 1;
+      }
+    }
+
+    // Expect the `end` (0x0b) opcode that closes every const expression.
+    if (cursor < end && bytes[cursor] === 0x0b) {
+      cursor += 1;
+    }
+
+    return { value, next: cursor };
   }
 
   /**
@@ -236,6 +409,7 @@
       sections: [],
       exports: [],
       imports: [],
+      dataSegments: [],
       errors: [error.message],
       warnings,
       durationMs: Date.now() - started,
@@ -248,6 +422,7 @@
     sections: [],
     exports: [],
     imports: [],
+    dataSegments: [],
     warnings,
     durationMs: 0,
   };
@@ -277,6 +452,7 @@
   let sections = [];
   let exports = [];
   let imports = [];
+  let dataSegments = [];
 
   try {
     sections = parseWasmSections(bytes);
@@ -288,6 +464,10 @@
     if (importSection) {
       imports = parseImportSection(bytes, importSection.start, importSection.end);
     }
+    const dataSection = sections.find((section) => section.id === 11);
+    if (dataSection) {
+      dataSegments = parseDataSection(bytes, dataSection.start, dataSection.end);
+    }
   } catch (error) {
     errors.push(error.message);
     return {
@@ -297,6 +477,7 @@
       sections,
       exports,
       imports,
+      dataSegments,
       errors,
       durationMs: Date.now() - started,
     };
@@ -309,6 +490,34 @@
     warnings.push('Module has no code section');
   }
 
+  let sorobanMeta = undefined;
+  try {
+    const sorobanMetaApi =
+      typeof require !== 'undefined'
+        ? (function () {
+            try {
+              return require('./sorobanMeta');
+            } catch {
+              return null;
+            }
+          })()
+        : typeof SkyMoonScopeSorobanMeta !== 'undefined'
+        ? SkyMoonScopeSorobanMeta
+        : null;
+    if (sorobanMetaApi && typeof sorobanMetaApi.decodeSorobanMeta === 'function') {
+      const decoded = sorobanMetaApi.decodeSorobanMeta(bytes);
+      if (
+        decoded.contractMeta.length > 0 ||
+        decoded.specFunctions.length > 0 ||
+        decoded.specTypes.length > 0
+      ) {
+        sorobanMeta = decoded;
+      }
+    }
+  } catch {
+    // non-fatal
+  }
+
   return {
     valid: true,
     byteLength: bytes.length,
@@ -316,6 +525,8 @@
     sections: sections.map(({ id, name, size }) => ({ id, name, size })),
     exports,
     imports,
+    dataSegments,
+    sorobanMeta,
     errors,
     warnings,
     durationMs: Date.now() - started,
@@ -340,6 +551,7 @@ function extractContractFunctions(report) {
     hasWasmMagic,
     readVarUint32,
     parseWasmSections,
+    parseDataSection,
     validateWasmModule,
     extractContractFunctions,
   };

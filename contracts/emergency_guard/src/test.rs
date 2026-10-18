@@ -1,6 +1,6 @@
 extern crate std;
 
-use crate::{EmergencyGuard, EmergencyGuardClient, GuardError, PauseType};
+use crate::{DefaultEmergencyGuard, EmergencyGuard, EmergencyGuardClient, GuardError, PauseType};
 use soroban_sdk::{testutils::Address as _, vec, Address, Env, Vec as SorobanVec};
 use std::vec::Vec;
 
@@ -33,8 +33,8 @@ fn setup(
 // ── PauseType bitmask unit tests ──────────────────────────────────────────────
 fn setup_with_roles(
     threshold: u32,
-    admins: Vec<Address>,
-    guardians: Vec<Address>,
+    admins: SorobanVec<Address>,
+    guardians: SorobanVec<Address>,
 ) -> (Env, EmergencyGuardClient<'static>) {
     let env = Env::default();
     env.mock_all_auths();
@@ -153,7 +153,7 @@ fn test_initialize_with_distinct_guardians_and_admins() {
     let guardians = vec![&env, Address::generate(&env)];
     client.initialize_with_roles(&admins, &guardians, &1);
 
-    assert!(client.is_admin(&admins.get(0).unwrap()));
+    assert!(client.is_admin_public(&admins.get(0).unwrap()));
     assert!(client.is_guardian(&guardians.get(0).unwrap()));
     assert!(!client.is_guardian(&admins.get(0).unwrap()));
 }
@@ -194,8 +194,18 @@ fn test_initialize_cannot_be_called_twice() {
 
 #[test]
 fn test_guardian_can_trigger_emergency_pause() {
-    let (_env, client, _admins, guardian) = setup(2, 3);
-    client.emergency_pause(&guardian);
+    let (env, client, admins, guardian) = setup(2, 3);
+
+    // Add two more guardians so the guardian set has 3 members; threshold is 2.
+    let g2 = Address::generate(&env);
+    let g3 = Address::generate(&env);
+    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
+    client.add_guardian(&approvers, &g2);
+    client.add_guardian(&approvers, &g3);
+
+    // Two guardians meet the threshold of 2.
+    let approvers = vec![&env, guardian.clone(), g2.clone()];
+    client.emergency_pause(&approvers);
     for op in [
         PauseType::SWAP,
         PauseType::DEPOSIT,
@@ -252,7 +262,7 @@ fn test_guardian_cannot_manage_roles() {
 fn test_non_guardian_non_admin_cannot_emergency_pause() {
     let (env, client, _admins, _guardian) = setup(1, 2);
     let outsider = Address::generate(&env);
-    let result = client.try_emergency_pause(&outsider);
+    let result = client.try_emergency_pause(&vec![&env, outsider.clone()]);
     assert_eq!(result, Err(Ok(GuardError::Unauthorized)));
 }
 
@@ -272,8 +282,8 @@ fn test_admin_can_pause_and_unpause_specific_operation() {
 
 #[test]
 fn test_admin_cannot_trigger_emergency_pause() {
-    let (_env, client, admins, _guardian) = setup(1, 2);
-    let result = client.try_emergency_pause(&admins[0]);
+    let (env, client, admins, _guardian) = setup(1, 2);
+    let result = client.try_emergency_pause(&vec![&env, admins[0].clone()]);
     assert_eq!(result, Err(Ok(GuardError::Unauthorized)));
 }
 
@@ -282,7 +292,18 @@ fn test_resume_requires_multi_sig() {
     let (env, client, admins, guardian) = setup(2, 3);
 
     // Guardian triggers pause
-    client.emergency_pause(&guardian);
+    // Add two more guardians so the guardian set has 3 members; threshold is 2.
+    let g2 = Address::generate(&env);
+    let g3 = Address::generate(&env);
+    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
+    client.add_guardian(&approvers, &g2);
+    client.add_guardian(&approvers, &g3);
+
+    // Two guardians meet the threshold of 2.
+    let pause_approvers = vec![&env, guardian.clone(), g2.clone()];
+    client.emergency_pause(&pause_approvers);
+    assert!(client.is_paused(&PauseType::SWAP));
+
 
     // Single admin tries to resume — should fail
     let approvers1 = vec![&env, admins[0].clone()];
@@ -368,7 +389,7 @@ fn test_removed_guardian_cannot_pause() {
     client.remove_guardian(&approvers, &guardian);
 
     // Removed guardian tries to emergency pause — should fail
-    let result = client.try_emergency_pause(&guardian);
+    let result = client.try_emergency_pause(&vec![&env, guardian.clone()]);
     assert_eq!(result, Err(Ok(GuardError::Unauthorized)));
 }
 
@@ -380,7 +401,9 @@ fn test_newly_added_guardian_can_pause() {
     let approvers = vec![&env, admins[0].clone()];
     client.add_guardian(&approvers, &new_guardian);
 
-    client.emergency_pause(&new_guardian);
+    // Threshold is 1, so a single guardian can emergency-pause.
+    let approvers = vec![&env, new_guardian.clone()];
+    client.emergency_pause(&approvers);
     assert!(client.is_paused(&PauseType::SWAP));
 }
 
@@ -398,11 +421,13 @@ fn test_guardian_can_pause_but_admin_cannot_pause() {
     let guardians = vec![&env, guardian.clone()];
     client.initialize_with_roles(&admins, &guardians, &1);
 
-    client.set_pause(&guardian, &PauseType::SWAP, &true);
-    assert!(client.is_paused(&PauseType::SWAP));
-
-    let result = client.try_set_pause(&admin, &PauseType::DEPOSIT, &true);
+    // set_pause is admin-only: guardian cannot pause specific operations
+    let result = client.try_set_pause(&guardian, &PauseType::SWAP, &true);
     assert_eq!(result, Err(Ok(GuardError::Unauthorized)));
+
+    // Admin can pause specific operations
+    client.set_pause(&admin, &PauseType::DEPOSIT, &true);
+    assert!(client.is_paused(&PauseType::DEPOSIT));
 }
 
 #[test]
@@ -519,7 +544,7 @@ fn test_remove_admin_fails_when_would_drop_below_threshold() {
 
 #[test]
 fn test_unauthorized_admin_removal() {
-    let (env, client, admins) = setup(1, 2);
+    let (env, client, admins, _guardian) = setup(1, 2);
     let outsider = Address::generate(&env);
     let approvers = vec![&env, outsider];
     let result = client.try_remove_admin(&approvers, &admins[1]);
@@ -528,26 +553,6 @@ fn test_unauthorized_admin_removal() {
 }
 
 // â”€â”€â”€ Full rotation cycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-#[test]
-fn test_full_admin_rotation_add_then_remove_old() {
-    let (env, client, admins) = setup(2, 3);
-    let new_admin = Address::generate(&env);
-
-    // Step 1: add new admin
-    let approvers = vec![&env, admins[0].clone(), admins[1].clone()];
-    client.add_admin(&approvers, &new_admin);
-    assert_eq!(client.get_admins().len(), 4);
-
-    // Step 2: remove one of the original admins using new quorum
-    let approvers2 = vec![&env, admins[0].clone(), new_admin.clone()];
-    client.remove_admin(&approvers2, &admins[2]);
-
-    let stored: Vec<Address> = client.get_admins().iter().collect();
-    assert_eq!(stored.len(), 3);
-    assert!(!stored.contains(&admins[2]));
-    assert!(stored.contains(&new_admin));
-}
 
 #[test]
 fn test_rotate_admin() {
@@ -596,7 +601,7 @@ fn test_removed_admin_cannot_approve_operations() {
 
 #[test]
 fn test_newly_added_admin_can_approve_operations() {
-    let (env, client, admins) = setup(1, 2);
+    let (env, client, admins, _guardian) = setup(1, 2);
     let new_admin = Address::generate(&env);
 
     // Add new_admin
@@ -612,7 +617,7 @@ fn test_newly_added_admin_can_approve_operations() {
 
 #[test]
 fn test_get_admins_returns_all_admins() {
-    let (_env, client, admins) = setup(1, 3);
+    let (_env, client, admins, _guardian) = setup(1, 3);
     let stored: Vec<Address> = client.get_admins().iter().collect();
     assert_eq!(stored.len(), 3);
     for a in &admins {
@@ -622,7 +627,7 @@ fn test_get_admins_returns_all_admins() {
 
 #[test]
 fn test_get_threshold_returns_correct_value() {
-    let (_env, client, _admins) = setup(2, 4);
+    let (_env, client, _admins, _guardian) = setup(2, 4);
     assert_eq!(client.get_threshold(), 2);
 }
 
@@ -630,7 +635,7 @@ fn test_get_threshold_returns_correct_value() {
 
 #[test]
 fn test_set_pause_by_single_admin() {
-    let (_env, client, admins) = setup(1, 2);
+    let (_env, client, admins, _guardian) = setup(1, 2);
     client.set_pause(&admins[0], &PauseType::DEPOSIT, &true);
     assert!(client.is_paused(&PauseType::DEPOSIT));
     assert!(!client.is_paused(&PauseType::SWAP));
@@ -638,7 +643,7 @@ fn test_set_pause_by_single_admin() {
 
 #[test]
 fn test_set_pause_rejected_for_non_admin() {
-    let (env, client, _admins) = setup(1, 2);
+    let (env, client, _admins, _guardian) = setup(1, 2);
     let outsider = Address::generate(&env);
     let result = client.try_set_pause(&outsider, &PauseType::SWAP, &true);
     assert_eq!(result, Err(Ok(GuardError::Unauthorized)));
@@ -664,10 +669,106 @@ fn test_full_admin_rotation_add_then_remove_old() {
 
 #[test]
 fn test_unpause_requires_admin() {
-    let (env, _client, _admins) = setup(1, 2);
+    let (env, _client, _admins, _guardian) = setup(1, 2);
     let outsider = Address::generate(&env);
 
     // Call DefaultEmergencyGuard::unpause
     let result = DefaultEmergencyGuard::unpause(&env, outsider.clone(), PauseType::SWAP);
     assert_eq!(result, Err(GuardError::Unauthorized));
+}
+
+// ── Guardian set cap (issue #77) ─────────────────────────────────────────────
+
+/// Build a guard with `n` admins at threshold 1, plus the single admin address
+/// used to co-sign privileged calls.
+fn setup_capped(n_admins: u32) -> (Env, EmergencyGuardClient<'static>, Address) {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EmergencyGuard, ());
+    let client = EmergencyGuardClient::new(&env, &contract_id);
+    let admins = make_addresses(&env, n_admins);
+    let guardian = admins.get(0).unwrap().clone();
+    client.initialize(&admins, &1, &guardian);
+    let signer = admins.get(0).unwrap();
+    (env, client, signer)
+}
+
+#[test]
+fn test_guardian_capacity_reflects_headroom() {
+    let (_env, client, _signer) = setup_capped(3);
+
+    assert_eq!(client.get_admins().len(), 3);
+    assert_eq!(client.guardian_capacity(), crate::MAX_GUARDIANS - 3);
+    assert!(!client.is_guardian_set_full());
+}
+
+#[test]
+fn test_add_guardian_is_rejected_at_the_cap() {
+    let (env, client, signer) = setup_capped(2);
+
+    // Fill the set up to the cap.
+    let approvers = vec![&env, signer.clone()];
+    for _ in 2..crate::MAX_GUARDIANS {
+        client.add_guardian(&approvers, &Address::generate(&env));
+    }
+
+    assert_eq!(client.get_admins().len(), crate::MAX_GUARDIANS);
+    assert_eq!(client.guardian_capacity(), 0);
+    assert!(client.is_guardian_set_full());
+
+    // One more must be refused rather than growing storage without bound.
+    let extra = Address::generate(&env);
+    let err = client.try_add_guardian(&approvers, &extra);
+    assert_eq!(err, Err(Ok(GuardError::TooManyGuardians)));
+
+    // The set is unchanged and the rejected guardian was not recorded.
+    assert_eq!(client.get_admins().len(), crate::MAX_GUARDIANS);
+    assert!(!client.get_admins().iter().any(|a| a == extra));
+}
+
+#[test]
+fn test_add_admin_is_also_capped() {
+    let (env, client, signer) = setup_capped(2);
+
+    let approvers = vec![&env, signer.clone()];
+    for _ in 2..crate::MAX_GUARDIANS {
+        client.add_admin(&approvers, &Address::generate(&env));
+    }
+
+    let err = client.try_add_admin(&approvers, &Address::generate(&env));
+    assert_eq!(err, Err(Ok(GuardError::TooManyGuardians)));
+    assert_eq!(client.get_admins().len(), crate::MAX_GUARDIANS);
+}
+
+#[test]
+fn test_adding_an_existing_guardian_at_the_cap_is_idempotent() {
+    let (env, client, signer) = setup_capped(crate::MAX_GUARDIANS);
+
+    assert!(client.is_guardian_set_full());
+
+    // Re-adding a guardian that is already in the set is a no-op, not an error:
+    // the cap only blocks genuinely new entries.
+    let approvers = vec![&env, signer.clone()];
+    assert!(client.try_add_guardian(&approvers, &signer).is_ok());
+    assert_eq!(client.get_admins().len(), crate::MAX_GUARDIANS);
+}
+
+#[test]
+fn test_initialize_rejects_an_oversized_guardian_set() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EmergencyGuard, ());
+    let client = EmergencyGuardClient::new(&env, &contract_id);
+
+    let too_many = make_addresses(&env, crate::MAX_GUARDIANS + 1);
+    let guardian = Address::generate(&env);
+    let err = client.try_initialize(&too_many, &1, &guardian);
+    assert_eq!(err, Err(Ok(GuardError::TooManyGuardians)));
+
+    // Exactly at the cap is fine.
+    let at_cap = make_addresses(&env, crate::MAX_GUARDIANS);
+    let contract_id2 = env.register(EmergencyGuard, ());
+    let client2 = EmergencyGuardClient::new(&env, &contract_id2);
+    assert!(client2.try_initialize(&at_cap, &1, &guardian).is_ok());
+    assert!(client2.is_guardian_set_full());
 }

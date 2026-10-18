@@ -1,5 +1,5 @@
 [package]
-name = "Sky Moon Scope-governance-contract"
+name = "governance-contract"
 version = "0.1.0"
 edition = "2021"
 publish = false
