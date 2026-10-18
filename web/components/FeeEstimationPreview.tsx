@@ -20,7 +20,7 @@ export function FeeEstimationPreview({
 }: FeeEstimationPreviewProps) {
   const { network, networkId, NETWORKS } = useNetwork();
   const [feeEstimate, setFeeEstimate] = useState<FeeEstimate | null>(null);
-  const [selectedBump, setSelectedBump] = useState<string>('low');
+  const [selectedBump, setSelectedBump] = useState<string>('economy');
   const [fetching, setFetching] = useState(false);
   const [rpcAvailable, setRpcAvailable] = useState(true);
   const [showComparison, setShowComparison] = useState(false);
@@ -70,7 +70,7 @@ export function FeeEstimationPreview({
   // Reset fee estimate state when network changes
   useEffect(() => {
     setFeeEstimate(null);
-    setSelectedBump('low');
+    setSelectedBump('economy');
     setFeeComparison(null);
     setShowComparison(false);
   }, [networkId]);
@@ -88,9 +88,9 @@ export function FeeEstimationPreview({
   const handleBumpSelect = (bump: FeeBumpOption) => {
     setSelectedBump(bump.label);
     if (onFeeBumpChange) {
-      const level = bump.label.toLowerCase().includes('low') ? 'low'
-        : bump.label.toLowerCase().includes('high') ? 'high'
-        : 'medium';
+      const level = bump.label.toLowerCase().includes('economy') ? 'economy'
+        : bump.label.toLowerCase().includes('fast') ? 'fast'
+        : 'standard';
       onFeeBumpChange(level, bump.feeStroops);
     }
   };
@@ -170,7 +170,7 @@ export function FeeEstimationPreview({
           )}
 
           <div>
-            <div className="text-[10px] text-slate-500 uppercase mb-2">Fee Bump Options</div>
+            <div className="text-[10px] text-slate-500 uppercase mb-2">Fee Recommendation Tiers</div>
             <div className="grid grid-cols-3 gap-2">
               {feeEstimate.feeBumps.map((bump) => {
                 const isSelected = selectedBump === bump.label;
@@ -193,7 +193,7 @@ export function FeeEstimationPreview({
                       {bump.feeXlm} XLM
                     </div>
                     <div className="text-[9px] text-slate-500 mt-0.5">
-                      {bump.feeStroops.toLocaleString()} stroops
+                      {bump.estimatedTime || 'Standard speed'}
                     </div>
                   </button>
                 );

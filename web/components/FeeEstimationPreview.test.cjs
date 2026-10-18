@@ -14,7 +14,7 @@ const assert = require('node:assert/strict');
 function createFeeEstimationManager(networkId = 'testnet') {
   let currentNetworkId = networkId;
   let feeEstimate = null;
-  let selectedBump = 'low';
+  let selectedBump = 'economy';
   let costStroops = 0;
   const cache = new Map(); // Simulates cache keyed by networkId
 
@@ -58,7 +58,7 @@ function createFeeEstimationManager(networkId = 'testnet') {
         currentNetworkId = newNetworkId;
         // ✓ Cache invalidation: reset state on network change
         feeEstimate = null;
-        selectedBump = 'low';
+        selectedBump = 'economy';
       }
     },
 
@@ -94,7 +94,7 @@ function createFeeEstimationManager(networkId = 'testnet') {
 test('FeeEstimationPreview: initializes with null fee estimate', () => {
   const manager = createFeeEstimationManager('testnet');
   assert.equal(manager.feeEstimate, null);
-  assert.equal(manager.selectedBump, 'low');
+  assert.equal(manager.selectedBump, 'economy');
 });
 
 test('FeeEstimationPreview: stores fee estimate for current network', () => {
@@ -139,7 +139,7 @@ test('FeeEstimationPreview: switching networks invalidates cache (MAIN FIX)', ()
 
   // ✓ MAIN FIX: fee estimate should be cleared on network change
   assert.equal(manager.feeEstimate, null, 'Fee estimate must be null after network switch');
-  assert.equal(manager.selectedBump, 'low', 'Selected bump must reset to "low" after network switch');
+  assert.equal(manager.selectedBump, 'economy', 'Selected bump must reset to "economy" after network switch');
 });
 
 test('FeeEstimationPreview: switching to same network does not invalidate cache', () => {
@@ -166,7 +166,7 @@ test('FeeEstimationPreview: fee bump state resets on network switch', () => {
   manager.switchNetwork('mainnet');
 
   // ✓ Bump state should reset
-  assert.equal(manager.selectedBump, 'low', 'Selected bump state must reset on network switch');
+  assert.equal(manager.selectedBump, 'economy', 'Selected bump state must reset on network switch');
 });
 
 test('FeeEstimationPreview: full workflow with network switching and cache invalidation', () => {
@@ -187,7 +187,7 @@ test('FeeEstimationPreview: full workflow with network switching and cache inval
 
   // ✓ FIXED: old estimates should not leak
   assert.equal(manager.feeEstimate, null, 'Must invalidate estimate on switch');
-  assert.equal(manager.selectedBump, 'low', 'Must reset bump on switch');
+  assert.equal(manager.selectedBump, 'economy', 'Must reset bump on switch');
 
   // 4. Load new estimate for mainnet with different costs
   manager.setCostStroops(8000);
