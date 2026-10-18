@@ -248,6 +248,7 @@ export interface FeeBumpOption {
   feeStroops: number;
   feeXlm: string;
   description: string;
+  estimatedTime?: string;
 }
 
 export interface FeeEstimate {
@@ -257,14 +258,14 @@ export interface FeeEstimate {
   totalFeeXlm: string;
   feeBumps: FeeBumpOption[];
   networkFees: {
-    low: number;
-    medium: number;
-    high: number;
+    economy: number;
+    standard: number;
+    fast: number;
   };
   surgeMultiplier: number;
 }
 
-export type FeeBumpLevel = 'low' | 'medium' | 'high';
+export type FeeBumpLevel = 'economy' | 'standard' | 'fast';
 
 export interface NetworkFeeComparison {
   testnet: FeeEstimate;
