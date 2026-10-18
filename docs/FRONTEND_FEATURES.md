@@ -259,7 +259,52 @@ the new contract.
 
 ---
 
-## 7. Heatmap virtualization and performance optimization (issue #383)
+## 7. Heatmap floating tooltip with exact values (issue #382)
+
+Hovering any cell in the **CPU Hotspot** grid now shows a small floating tooltip
+pinned near the cursor with the full exact values for that function — not just
+the abbreviated numbers displayed inside the cell itself.
+
+| File | Role |
+| --- | --- |
+| `components/heatmap/HeatmapFloatingTooltip.tsx` | The tooltip component — fixed-position overlay, viewport-aware |
+| `components/heatmap/HeatmapCell.tsx` | `onMouseMove` prop added to forward cursor coordinates |
+| `components/ResourceHeatmap.tsx` | `tooltipPosition` state, `handleCellMouseMove` callback, tooltip rendered at root |
+| `components/heatmap/index.ts` | `HeatmapFloatingTooltip`, `TooltipPosition`, `fmtInstrFull` re-exported |
+| `components/heatmap.test.cjs` | 18 unit tests covering position logic, value formatting, and cell data integrity |
+
+### What the tooltip shows
+
+| Field | Value |
+| --- | --- |
+| Severity label | `CRITICAL` / `HIGH` / `MEDIUM` / `LOW` / `TRACE` (colour-coded) |
+| Category badge | `AUTH`, `STORAGE`, `COMPUTE`, `I/O`, `UTIL` |
+| Full function name | Complete `contract::function` identifier (not the truncated display name) |
+| CPU share | Exact percentage to 2 decimal places (e.g. `24.50%`) |
+| Call-graph depth | Integer depth from entry point (0 = root) |
+| Instruction count (exact) | Full comma-formatted integer (e.g. `24,500,000`) — not the compact `24.5M` |
+| Budget usage | Percentage of the 100M Soroban CPU limit to 3 decimal places, with a proportional fill bar |
+
+### Positioning
+
+The tooltip is rendered with `position: fixed` so it escapes any
+`overflow: hidden` ancestor. Viewport-aware clamping logic runs on each
+`mousemove` event:
+
+- Default: tooltip appears 14 px right and below the cursor.
+- **Right-edge flip**: if the tooltip would overflow the viewport right edge by
+  more than 8 px, it is placed to the left of the cursor instead.
+- **Bottom-edge flip**: if the tooltip would overflow the viewport bottom edge,
+  it is placed above the cursor instead.
+- Both axes clamp to a minimum of 8 px from the edge, so the tooltip is always
+  fully visible.
+
+The tooltip is `pointer-events-none`, so it never interferes with hovering the
+cells underneath it.
+
+---
+
+## 8. Heatmap virtualization and performance optimization (issue #383)
 
 For contracts with large call graphs or high function counts (>500 cells), the
 resource heatmap virtualizes row rendering to eliminate DOM layout thrashing and

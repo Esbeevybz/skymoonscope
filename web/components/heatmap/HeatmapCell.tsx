@@ -34,6 +34,8 @@ export interface HeatmapCellProps {
   onLeave?: () => void;
   onMouseEnter?: () => void;
   onMouseLeave?: () => void;
+  /** Called with viewport-relative cursor coordinates on each mousemove */
+  onMouseMove?: (x: number, y: number) => void;
   onClick?: () => void;
   className?: string;
   style?: React.CSSProperties;
@@ -48,6 +50,7 @@ function HeatmapCellComponent({
   onLeave,
   onMouseEnter,
   onMouseLeave,
+  onMouseMove,
   onClick,
   className,
   style,
@@ -76,6 +79,12 @@ function HeatmapCellComponent({
     }
   }, [onLeave, onMouseLeave]);
 
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (onMouseMove) {
+      onMouseMove(e.clientX, e.clientY);
+    }
+  }, [onMouseMove]);
+
   // Pre-compose static and dynamic class names efficiently
   const baseButtonClass =
     'group relative flex flex-col justify-between rounded-lg border p-2.5 text-left transition-transform duration-200 cursor-crosshair';
@@ -90,6 +99,7 @@ function HeatmapCellComponent({
       onClick={onClick}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
+      onMouseMove={handleMouseMove}
       className={className ? cn(baseButtonClass, clr.bg, clr.border, hoverEffectClass, className) : `${baseButtonClass} ${clr.bg} ${clr.border} ${hoverEffectClass}`}
       style={{ minHeight: '84px', ...style }}
     >
