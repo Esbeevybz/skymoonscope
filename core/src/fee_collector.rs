@@ -40,6 +40,9 @@ pub struct FeeCollectorConfig {
     pub batch_size: u64,
     /// Request timeout
     pub request_timeout: Duration,
+    /// How long to reuse the most recent `getLatestLedger` RPC result.
+    /// A zero duration disables caching.
+    pub market_data_cache_ttl: Duration,
 }
 
 impl Default for FeeCollectorConfig {
@@ -48,6 +51,7 @@ impl Default for FeeCollectorConfig {
             collection_interval_secs: 5, // Stellar ledgers close every ~5 seconds
             batch_size: 10,
             request_timeout: Duration::from_secs(10),
+            market_data_cache_ttl: Duration::from_secs(1),
         }
     }
 }
@@ -177,6 +181,7 @@ pub struct FeeCollector {
     store: Arc<FeeStore>,
     client: Client,
     config: FeeCollectorConfig,
+    latest_ledger_cache: Mutex<Option<(u64, Instant)>>,
     last_collected_sequence: std::sync::atomic::AtomicU64,
     metrics: Arc<AppMetrics>,
     /// Leader-election lease. Only the instance holding it persists ledger
@@ -216,6 +221,7 @@ impl FeeCollector {
                 .build()
                 .expect("Failed to create HTTP client"),
             config,
+            latest_ledger_cache: Mutex::new(None),
             last_collected_sequence: std::sync::atomic::AtomicU64::new(0),
             write_policy: FeeWritePolicy::default(),
             alarm_config: SysAlarmConfig::from_env(),
@@ -295,8 +301,7 @@ impl FeeCollector {
 
     /// Reset the consecutive-failure counter after a successful write.
     fn note_store_success(&self) {
-        self.consecutive_store_failures
-            .store(0, Ordering::Relaxed);
+        self.consecutive_store_failures.store(0, Ordering::Relaxed);
     }
 
     /// Push a permanently-failed sample onto the bounded dead-letter
@@ -576,6 +581,12 @@ impl FeeCollector {
 
     /// Get the latest ledger sequence from RPC
     async fn get_latest_ledger_sequence(&self) -> Result<u64, FeeCollectorError> {
+        if let Some(sequence) =
+            cached_latest_ledger(&self.latest_ledger_cache, self.config.market_data_cache_ttl)
+        {
+            return Ok(sequence);
+        }
+
         let providers = self.registry.healthy_providers().await;
         if providers.is_empty() {
             return Err(FeeCollectorError::NoHealthyProviders);
@@ -618,6 +629,14 @@ impl FeeCollector {
         let sequence = json["result"]["sequence"].as_u64().ok_or_else(|| {
             FeeCollectorError::ParseError("Missing sequence in response".to_string())
         })?;
+
+        if !self.config.market_data_cache_ttl.is_zero() {
+            *self
+                .latest_ledger_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((sequence, Instant::now()));
+        }
 
         Ok(sequence)
     }
@@ -834,9 +853,34 @@ impl FeeCollector {
     }
 }
 
+fn cached_latest_ledger(cache: &Mutex<Option<(u64, Instant)>>, ttl: Duration) -> Option<u64> {
+    if ttl.is_zero() {
+        return None;
+    }
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(_, fetched_at)| fetched_at.elapsed() < ttl)
+        .map(|(sequence, _)| *sequence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_ledger_cache_obeys_ttl_and_zero_disables_it() {
+        let cache = Mutex::new(Some((42, Instant::now())));
+        assert_eq!(
+            cached_latest_ledger(&cache, Duration::from_secs(1)),
+            Some(42)
+        );
+        assert_eq!(cached_latest_ledger(&cache, Duration::ZERO), None);
+
+        *cache.lock().unwrap() = Some((42, Instant::now() - Duration::from_secs(2)));
+        assert_eq!(cached_latest_ledger(&cache, Duration::from_secs(1)), None);
+    }
 
     #[test]
     fn test_default_config() {
@@ -874,6 +918,7 @@ mod tests {
                 collection_interval_secs: 60,
                 batch_size: 1,
                 request_timeout: Duration::from_millis(50),
+                market_data_cache_ttl: Duration::from_secs(1),
             },
             metrics,
             leader_lock,
@@ -897,13 +942,15 @@ mod tests {
     }
 
     fn test_registry() -> Arc<ProviderRegistry> {
-        Arc::new(ProviderRegistry::new(vec![crate::rpc_provider::RpcProvider {
-            name: "test".to_string(),
-            url: "http://127.0.0.1:9".to_string(),
-            auth_header: None,
-            auth_value: None,
-            advertise: None,
-        }]))
+        Arc::new(ProviderRegistry::new(vec![
+            crate::rpc_provider::RpcProvider {
+                name: "test".to_string(),
+                url: "http://127.0.0.1:9".to_string(),
+                auth_header: None,
+                auth_value: None,
+                advertise: None,
+            },
+        ]))
     }
 
     fn test_leader_lock() -> Arc<RedisLeaderLock> {

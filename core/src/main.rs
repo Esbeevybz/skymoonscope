@@ -158,6 +158,9 @@ struct AppConfig {
     /// Fee data collection interval in seconds (default 5).
     #[serde(default = "default_fee_collection_interval")]
     fee_collection_interval_secs: u64,
+    /// TTL in seconds for cached latest-ledger fee market RPC data (default 1).
+    #[serde(default = "default_fee_market_cache_ttl")]
+    fee_market_cache_ttl_secs: u64,
     /// Fee data retention period in days (default 30).
     #[serde(default = "default_fee_retention_days")]
     fee_retention_days: u32,
@@ -247,6 +250,10 @@ fn default_event_worker_threads() -> usize {
 
 fn default_fee_collection_interval() -> u64 {
     5
+}
+
+fn default_fee_market_cache_ttl() -> u64 {
+    1
 }
 
 fn default_fee_retention_days() -> u32 {
@@ -339,6 +346,7 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("max_concurrent_jobs", 10)?
         .set_default("event_worker_threads", 4)?
         .set_default("fee_collection_interval_secs", 5)?
+        .set_default("fee_market_cache_ttl_secs", 1)?
         .set_default("fee_retention_days", 30)?
         .set_default("fee_analysis_enabled", true)?
         .set_default("emergency_verification_paused", false)?
@@ -2495,6 +2503,7 @@ async fn main() {
             collection_interval_secs: 5,
             batch_size: 50,
             request_timeout: std::time::Duration::from_secs(30),
+            market_data_cache_ttl: std::time::Duration::from_secs(config.fee_market_cache_ttl_secs),
         };
 
         let collector = Arc::new(FeeCollector::new(
@@ -2703,6 +2712,7 @@ async fn main() {
             collection_interval_secs: config.fee_collection_interval_secs,
             batch_size: 10,
             request_timeout: std::time::Duration::from_secs(10),
+            market_data_cache_ttl: std::time::Duration::from_secs(config.fee_market_cache_ttl_secs),
         };
 
         let leader_redis_client = redis::Client::open(config.redis_url.as_str())
