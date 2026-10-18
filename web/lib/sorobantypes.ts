@@ -265,3 +265,10 @@ export interface FeeEstimate {
 }
 
 export type FeeBumpLevel = 'low' | 'medium' | 'high';
+
+export interface NetworkFeeComparison {
+  testnet: FeeEstimate;
+  mainnet: FeeEstimate;
+  percentageDifference: number;
+  testnetHigher: boolean;
+}

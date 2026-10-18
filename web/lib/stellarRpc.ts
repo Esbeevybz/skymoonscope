@@ -186,3 +186,37 @@ export function estimateFees(
     surgeMultiplier,
   };
 }
+
+/**
+ * Fetch fee stats from both testnet and mainnet simultaneously
+ * and return a comparison of the estimated fees
+ */
+export async function fetchFeeComparison(
+  resourceCostStroops: number,
+  testnetRpcUrl: string,
+  mainnetRpcUrl: string,
+): Promise<import('./sorobantypes').NetworkFeeComparison> {
+  const [testnetStats, mainnetStats] = await Promise.allSettled([
+    fetchFeeStats(testnetRpcUrl),
+    fetchFeeStats(mainnetRpcUrl),
+  ]);
+
+  const testnetFeeStats = testnetStats.status === 'fulfilled' ? testnetStats.value : null;
+  const mainnetFeeStats = mainnetStats.status === 'fulfilled' ? mainnetStats.value : null;
+
+  const testnetEstimate = estimateFees(resourceCostStroops, testnetFeeStats);
+  const mainnetEstimate = estimateFees(resourceCostStroops, mainnetFeeStats);
+
+  // Calculate percentage difference (mainnet relative to testnet)
+  const percentageDifference =
+    testnetEstimate.totalFeeStroops > 0
+      ? ((mainnetEstimate.totalFeeStroops - testnetEstimate.totalFeeStroops) / testnetEstimate.totalFeeStroops) * 100
+      : 0;
+
+  return {
+    testnet: testnetEstimate,
+    mainnet: mainnetEstimate,
+    percentageDifference,
+    testnetHigher: testnetEstimate.totalFeeStroops > mainnetEstimate.totalFeeStroops,
+  };
+}

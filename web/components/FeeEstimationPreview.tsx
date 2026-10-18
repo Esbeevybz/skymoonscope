@@ -1,10 +1,11 @@
 'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { Fuel, Zap, TrendingUp, Gauge, DollarSign } from 'lucide-react';
+import { Fuel, Zap, TrendingUp, Gauge, DollarSign, ArrowRight, ArrowUp, ArrowDown } from 'lucide-react';
 import type { FeeEstimate, FeeBumpOption } from '../lib/sorobantypes';
 import { useNetwork } from '../context/NetworkContext';
-import { fetchFeeStats, estimateFees, stroopsToXlm } from '../lib/stellarRpc';
+import { fetchFeeStats, estimateFees, stroopsToXlm, fetchFeeComparison } from '../lib/stellarRpc';
+import type { NetworkFeeComparison } from '../lib/sorobantypes';
 
 interface FeeEstimationPreviewProps {
   costStroops?: number;
@@ -17,11 +18,14 @@ export function FeeEstimationPreview({
   loading = false,
   onFeeBumpChange,
 }: FeeEstimationPreviewProps) {
-  const { network, networkId } = useNetwork();
+  const { network, networkId, NETWORKS } = useNetwork();
   const [feeEstimate, setFeeEstimate] = useState<FeeEstimate | null>(null);
   const [selectedBump, setSelectedBump] = useState<string>('low');
   const [fetching, setFetching] = useState(false);
   const [rpcAvailable, setRpcAvailable] = useState(true);
+  const [showComparison, setShowComparison] = useState(false);
+  const [feeComparison, setFeeComparison] = useState<NetworkFeeComparison | null>(null);
+  const [comparisonFetching, setComparisonFetching] = useState(false);
 
   const loadFeeEstimate = useCallback(async () => {
     if (costStroops <= 0) {
@@ -43,15 +47,43 @@ export function FeeEstimationPreview({
     }
   }, [costStroops, network.rpcUrl]);
 
+  const loadFeeComparison = useCallback(async () => {
+    if (costStroops <= 0) {
+      setFeeComparison(null);
+      return;
+    }
+    setComparisonFetching(true);
+    try {
+      const comparison = await fetchFeeComparison(
+        costStroops,
+        NETWORKS.testnet.rpcUrl,
+        NETWORKS.mainnet.rpcUrl,
+      );
+      setFeeComparison(comparison);
+    } catch {
+      setFeeComparison(null);
+    } finally {
+      setComparisonFetching(false);
+    }
+  }, [costStroops, NETWORKS.testnet.rpcUrl, NETWORKS.mainnet.rpcUrl]);
+
   // Reset fee estimate state when network changes
   useEffect(() => {
     setFeeEstimate(null);
     setSelectedBump('low');
+    setFeeComparison(null);
+    setShowComparison(false);
   }, [networkId]);
 
   useEffect(() => {
     loadFeeEstimate();
   }, [loadFeeEstimate]);
+
+  useEffect(() => {
+    if (showComparison) {
+      loadFeeComparison();
+    }
+  }, [showComparison, loadFeeComparison]);
 
   const handleBumpSelect = (bump: FeeBumpOption) => {
     setSelectedBump(bump.label);
@@ -65,6 +97,7 @@ export function FeeEstimationPreview({
 
   const isBusy = loading || fetching;
   const hasFees = feeEstimate && feeEstimate.totalFeeStroops > 0;
+  const hasComparison = feeComparison && feeComparison.testnet && feeComparison.mainnet;
 
   return (
     <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 font-mono">
@@ -171,16 +204,145 @@ export function FeeEstimationPreview({
           <div className="border-t border-slate-800 pt-3">
             <div className="flex items-center justify-between text-[10px] text-slate-500">
               <span>Surge multiplier: {feeEstimate.surgeMultiplier}x</span>
-              <button
-                type="button"
-                onClick={loadFeeEstimate}
-                disabled={isBusy}
-                className="text-cyan-400 hover:text-cyan-300 transition-colors cursor-pointer"
-              >
-                Refresh
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setShowComparison(!showComparison)}
+                  disabled={isBusy}
+                  className="text-cyan-400 hover:text-cyan-300 transition-colors cursor-pointer"
+                >
+                  {showComparison ? 'Hide Comparison' : 'Compare Networks'}
+                </button>
+                <button
+                  type="button"
+                  onClick={loadFeeEstimate}
+                  disabled={isBusy}
+                  className="text-cyan-400 hover:text-cyan-300 transition-colors cursor-pointer"
+                >
+                  Refresh
+                </button>
+              </div>
             </div>
           </div>
+
+          {showComparison && (
+            <div className="mt-4 border-t border-slate-800 pt-4">
+              <div className="flex items-center gap-2 mb-3">
+                <ArrowRight className="h-4 w-4 text-cyan-400" />
+                <h4 className="text-xs font-bold text-slate-100 uppercase tracking-wider">
+                  Testnet vs Mainnet Comparison
+                </h4>
+              </div>
+
+              {comparisonFetching ? (
+                <div className="flex items-center justify-center py-6">
+                  <div className="h-5 w-5 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin" />
+                </div>
+              ) : hasComparison ? (
+                <div className="space-y-3">
+                  {/* Comparison Summary */}
+                  <div className="flex items-center justify-center gap-2 rounded-lg bg-slate-950/60 border border-slate-800 p-3">
+                    {feeComparison.percentageDifference > 0 ? (
+                      <>
+                        <ArrowUp className="h-4 w-4 text-amber-400" />
+                        <span className="text-sm font-semibold text-amber-400">
+                          Mainnet fees are {feeComparison.percentageDifference.toFixed(1)}% higher
+                        </span>
+                      </>
+                    ) : feeComparison.percentageDifference < 0 ? (
+                      <>
+                        <ArrowDown className="h-4 w-4 text-emerald-400" />
+                        <span className="text-sm font-semibold text-emerald-400">
+                          Mainnet fees are {Math.abs(feeComparison.percentageDifference).toFixed(1)}% lower
+                        </span>
+                      </>
+                    ) : (
+                      <span className="text-sm font-semibold text-slate-300">
+                        Fees are the same on both networks
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Side-by-side Comparison */}
+                  <div className="grid grid-cols-2 gap-3">
+                    {/* Testnet Card */}
+                    <div className="rounded-lg border border-cyan-500/30 bg-cyan-500/5 p-3">
+                      <div className="flex items-center gap-2 mb-2">
+                        <div className="h-2 w-2 rounded-full bg-cyan-400" />
+                        <span className="text-xs font-bold text-cyan-400 uppercase">Testnet</span>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="flex justify-between text-[10px]">
+                          <span className="text-slate-500">Total Fee</span>
+                          <span className="text-cyan-400 font-semibold">
+                            {feeComparison.testnet.totalFeeXlm} XLM
+                          </span>
+                        </div>
+                        <div className="flex justify-between text-[10px]">
+                          <span className="text-slate-500">Low Bump</span>
+                          <span className="text-slate-300">
+                            {feeComparison.testnet.feeBumps[0].feeXlm} XLM
+                          </span>
+                        </div>
+                        <div className="flex justify-between text-[10px]">
+                          <span className="text-slate-500">High Bump</span>
+                          <span className="text-slate-300">
+                            {feeComparison.testnet.feeBumps[2].feeXlm} XLM
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Mainnet Card */}
+                    <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3">
+                      <div className="flex items-center gap-2 mb-2">
+                        <div className="h-2 w-2 rounded-full bg-emerald-400" />
+                        <span className="text-xs font-bold text-emerald-400 uppercase">Mainnet</span>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="flex justify-between text-[10px]">
+                          <span className="text-slate-500">Total Fee</span>
+                          <span className="text-emerald-400 font-semibold">
+                            {feeComparison.mainnet.totalFeeXlm} XLM
+                          </span>
+                        </div>
+                        <div className="flex justify-between text-[10px]">
+                          <span className="text-slate-500">Low Bump</span>
+                          <span className="text-slate-300">
+                            {feeComparison.mainnet.feeBumps[0].feeXlm} XLM
+                          </span>
+                        </div>
+                        <div className="flex justify-between text-[10px]">
+                          <span className="text-slate-500">High Bump</span>
+                          <span className="text-slate-300">
+                            {feeComparison.mainnet.feeBumps[2].feeXlm} XLM
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Surge Comparison */}
+                  <div className="grid grid-cols-2 gap-3 text-[10px]">
+                    <div className="flex items-center justify-between bg-slate-950/40 rounded px-2 py-1.5">
+                      <span className="text-slate-500">Testnet Surge</span>
+                      <span className="text-cyan-400">{feeComparison.testnet.surgeMultiplier}x</span>
+                    </div>
+                    <div className="flex items-center justify-between bg-slate-950/40 rounded px-2 py-1.5">
+                      <span className="text-slate-500">Mainnet Surge</span>
+                      <span className="text-emerald-400">{feeComparison.mainnet.surgeMultiplier}x</span>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-center py-4">
+                  <p className="text-xs text-slate-500">
+                    Unable to fetch comparison data
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       ) : (
         <div className="text-center py-6">
