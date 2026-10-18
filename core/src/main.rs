@@ -663,6 +663,36 @@ impl AppMetrics {
     }
 }
 
+/// Fee calculation mode for a simulation request.
+///
+/// When absent (or set to `"simulated"`), the engine computes the fee
+/// automatically from the measured Soroban resource consumption using the
+/// standard formula:
+///
+/// ```text
+/// cost_stroops = cpu_instructions / 10_000
+///              + ram_bytes / 1_024
+///              + (ledger_read_bytes + ledger_write_bytes) / 1_024
+/// ```
+///
+/// When set to `"custom"`, the caller supplies an explicit `cost_stroops`
+/// value that completely replaces the simulated figure. This is useful for
+/// what-if analysis (e.g. "what would this call cost at mainnet fee levels?")
+/// without having to run a separate simulation.
+#[derive(Debug, Clone, Deserialize, ToSchema, PartialEq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum FeeMode {
+    /// Derive the fee automatically from the simulation result (default).
+    Simulated,
+    /// Override the simulated fee with a caller-supplied value.
+    Custom {
+        /// The exact fee to report in the response, in stroops (1 XLM = 10 000 000 stroops).
+        /// Must be greater than zero.
+        #[schema(example = 5000)]
+        cost_stroops: u64,
+    },
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AnalyzeRequest {
     #[schema(example = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC")]
@@ -681,6 +711,13 @@ pub struct AnalyzeRequest {
     #[serde(default)]
     #[schema(example = false)]
     pub include_merkle_tree: Option<bool>,
+    /// Fee calculation mode.
+    ///
+    /// Omit (or set to `{"mode":"simulated"}`) to compute the fee from the
+    /// simulation result. Set to `{"mode":"custom","cost_stroops":<value>}` to
+    /// override the simulated fee with a caller-supplied stroop amount.
+    #[serde(default)]
+    pub fee_mode: Option<FeeMode>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -700,9 +737,17 @@ pub struct ResourceReport {
     /// Transaction size in bytes
     #[schema(example = 450)]
     pub transaction_size_bytes: u64,
-    /// Estimated cost in stroops
+    /// Estimated cost in stroops.
+    ///
+    /// Reflects the simulated resource cost when `fee_override_active` is
+    /// `false`, or the caller-supplied value from a `Custom` fee mode when
+    /// `fee_override_active` is `true`.
     #[schema(example = 1000)]
     pub cost_stroops: u64,
+    /// Whether the fee was overridden by a caller-supplied `FeeMode::Custom`
+    /// value rather than computed from the simulation.
+    #[schema(example = false)]
+    pub fee_override_active: bool,
     /// Report showing which data was injected vs live
     pub state_dependency: Option<Vec<StateDependencyReport>>,
     /// TTL status for touched ledger entries and extension suggestions.
@@ -962,6 +1007,7 @@ fn to_report(
     result: &SimulationResult,
     insights_engine: &InsightsEngine,
     merkle_tree_root: Option<String>,
+    fee_override_active: bool,
 ) -> ResourceReport {
     let insights_report = insights_engine.analyze(&result.resources);
 
@@ -972,6 +1018,7 @@ fn to_report(
         ledger_write_bytes: result.resources.ledger_write_bytes,
         transaction_size_bytes: result.resources.transaction_size_bytes,
         cost_stroops: result.cost_stroops,
+        fee_override_active,
         state_dependency: result.state_dependency.as_ref().map(|deps| {
             deps.iter()
                 .map(|d| StateDependencyReport {
@@ -1185,6 +1232,27 @@ async fn analyze(
         None
     };
 
+    // Apply fee mode override: if the caller supplied a Custom fee mode,
+    // replace the simulated cost_stroops with the provided value.
+    let (result, fee_override_active) = match payload.fee_mode {
+        Some(FeeMode::Custom { cost_stroops }) => {
+            if cost_stroops == 0 {
+                return Err(AppError::BadRequest(
+                    "fee_mode.cost_stroops must be greater than zero".to_string(),
+                ));
+            }
+            tracing::info!(
+                simulated_cost_stroops = result.cost_stroops,
+                custom_cost_stroops = cost_stroops,
+                "Applying custom fee mode override"
+            );
+            let mut overridden = result;
+            overridden.cost_stroops = cost_stroops;
+            (overridden, true)
+        }
+        _ => (result, false),
+    };
+
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static("x-sky-moon-scope-cache"),
@@ -1198,7 +1266,7 @@ async fn analyze(
 
     Ok((
         headers,
-        Json(to_report(&result, &state.insights_engine, merkle_tree_root)),
+        Json(to_report(&result, &state.insights_engine, merkle_tree_root, fee_override_active)),
     ))
 }
 
@@ -1320,7 +1388,7 @@ async fn analyze_wasm(
         protocol_version: payload.protocol_version.unwrap_or(20),
     };
 
-    let report = to_report(&sim_result, &state.insights_engine, None);
+    let report = to_report(&sim_result, &state.insights_engine, None, false);
     state
         .metrics
         .resource_utilization_percent
@@ -1904,7 +1972,7 @@ async fn fee_analytics(
     ),
     components(schemas(
         AnalyzeRequest, AnalyzeWasmRequest, AnalyzeWasmBranchesRequest,
-        WasmBranchAnalysisResponse, ResourceReport,
+        WasmBranchAnalysisResponse, ResourceReport, FeeMode,
         OptimizeLimitsRequest, OptimizeLimitsResponse,
         CompareApiResponse, RegressionReport, ResourceDelta, RegressionFlag,
         crate::wasm_branch_analysis::BranchInfo,
@@ -3138,7 +3206,7 @@ mod tests {
         };
 
         let insights_engine = InsightsEngine::new();
-        let report = to_report(&sim_result, &insights_engine, None);
+        let report = to_report(&sim_result, &insights_engine, None, false);
 
         assert_eq!(report.cost_stroops, 5000);
         assert_eq!(report.cpu_instructions, 1000000);
@@ -3373,6 +3441,121 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── FeeMode unit tests ────────────────────────────────────────────────────
+
+    /// to_report propagates cost_stroops from the SimulationResult unchanged
+    /// when fee_override_active=false (the default simulated path).
+    #[test]
+    fn test_to_report_no_fee_override_preserves_simulated_cost() {
+        let sim_result = SimulationResult {
+            resources: SorobanResources {
+                cpu_instructions: 500_000,
+                ram_bytes: 1_024,
+                ledger_read_bytes: 256,
+                ledger_write_bytes: 128,
+                transaction_size_bytes: 512,
+            },
+            transaction_hash: None,
+            latest_ledger: 100,
+            cost_stroops: 9_999,
+            state_dependency: None,
+            ttl_analysis: None,
+            transaction_data: "AAA".to_string(),
+            call_graph: None,
+            state_snapshot: None,
+            protocol_version: 20,
+        };
+
+        let insights_engine = InsightsEngine::new();
+        let report = to_report(&sim_result, &insights_engine, None, false);
+
+        assert_eq!(report.cost_stroops, 9_999);
+        assert!(!report.fee_override_active, "fee_override_active should be false");
+    }
+
+    /// to_report sets fee_override_active=true when the caller passes true,
+    /// signalling that the cost_stroops was already replaced in the handler.
+    #[test]
+    fn test_to_report_with_fee_override_flag() {
+        let mut sim_result = SimulationResult {
+            resources: SorobanResources {
+                cpu_instructions: 1_000_000,
+                ram_bytes: 2_048,
+                ledger_read_bytes: 512,
+                ledger_write_bytes: 256,
+                transaction_size_bytes: 1_024,
+            },
+            transaction_hash: None,
+            latest_ledger: 200,
+            cost_stroops: 5_000, // simulated value
+            state_dependency: None,
+            ttl_analysis: None,
+            transaction_data: "AAA".to_string(),
+            call_graph: None,
+            state_snapshot: None,
+            protocol_version: 21,
+        };
+
+        // Simulate the override that the analyze() handler performs before calling to_report.
+        let custom_stroops: u64 = 12_345;
+        sim_result.cost_stroops = custom_stroops;
+
+        let insights_engine = InsightsEngine::new();
+        let report = to_report(&sim_result, &insights_engine, None, true);
+
+        assert_eq!(report.cost_stroops, custom_stroops);
+        assert!(report.fee_override_active, "fee_override_active should be true");
+    }
+
+    /// FeeMode::Simulated deserialises from JSON.
+    #[test]
+    fn test_fee_mode_simulated_deserializes() {
+        let json = r#"{"mode":"simulated"}"#;
+        let mode: FeeMode = serde_json::from_str(json).expect("should deserialise");
+        assert_eq!(mode, FeeMode::Simulated);
+    }
+
+    /// FeeMode::Custom with a cost_stroops field deserialises from JSON.
+    #[test]
+    fn test_fee_mode_custom_deserializes() {
+        let json = r#"{"mode":"custom","cost_stroops":7500}"#;
+        let mode: FeeMode = serde_json::from_str(json).expect("should deserialise");
+        assert_eq!(mode, FeeMode::Custom { cost_stroops: 7_500 });
+    }
+
+    /// AnalyzeRequest with fee_mode omitted deserialises correctly
+    /// (fee_mode defaults to None).
+    #[test]
+    fn test_analyze_request_fee_mode_defaults_to_none() {
+        let json = r#"{"contract_id":"CTEST","function_name":"hello"}"#;
+        let req: AnalyzeRequest = serde_json::from_str(json).expect("should deserialise");
+        assert!(req.fee_mode.is_none());
+    }
+
+    /// AnalyzeRequest with an explicit Custom fee_mode deserialises the value.
+    #[test]
+    fn test_analyze_request_fee_mode_custom_round_trips() {
+        let json = r#"{
+            "contract_id": "CTEST",
+            "function_name": "hello",
+            "fee_mode": {"mode": "custom", "cost_stroops": 99000}
+        }"#;
+        let req: AnalyzeRequest = serde_json::from_str(json).expect("should deserialise");
+        assert_eq!(req.fee_mode, Some(FeeMode::Custom { cost_stroops: 99_000 }));
+    }
+
+    /// AnalyzeRequest with FeeMode::Simulated deserialises correctly.
+    #[test]
+    fn test_analyze_request_fee_mode_simulated_round_trips() {
+        let json = r#"{
+            "contract_id": "CTEST",
+            "function_name": "hello",
+            "fee_mode": {"mode": "simulated"}
+        }"#;
+        let req: AnalyzeRequest = serde_json::from_str(json).expect("should deserialise");
+        assert_eq!(req.fee_mode, Some(FeeMode::Simulated));
     }
 }
 
