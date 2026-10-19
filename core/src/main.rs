@@ -703,6 +703,8 @@ pub struct ResourceReport {
     pub nutrition: NutritionReport,
     /// Cross-contract call graph
     pub call_graph: Option<crate::simulation::CallGraph>,
+    /// Maximum contract-to-contract call nesting depth (root = 1)
+    pub max_call_depth: Option<usize>,
     /// Call graph in Mermaid format
     pub call_graph_mermaid: Option<String>,
     /// Snapshot of the ledger state used/touched during simulation
@@ -1007,6 +1009,7 @@ fn to_report(
                 .collect(),
         },
         call_graph: result.call_graph.clone(),
+        max_call_depth: result.call_graph.as_ref().map(|graph| graph.max_depth()),
         call_graph_mermaid: result.call_graph.as_ref().map(|g| g.to_mermaid()),
         state_snapshot: result.state_snapshot.clone(),
         protocol_version: result.protocol_version,
