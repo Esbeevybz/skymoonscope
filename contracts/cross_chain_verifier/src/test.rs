@@ -1558,3 +1558,173 @@ fn test_verify_batch_large_batch() {
     assert_eq!(result.failed, 0);
     assert_eq!(result.failed_indices.len(), 0);
 }
+
+// ============================================================================
+// Odd-Numbered Leaf Count Merkle Tree Tests (Issue #349)
+// ============================================================================
+
+#[test]
+fn test_verify_message_odd_leaf_count_three_leaves() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    // 3 leaves in tree: L0, L1, L2
+    let p0 = make_payload(&env, 10);
+    let p1 = make_payload(&env, 11);
+    let p2 = make_payload(&env, 12);
+
+    let l0 = compute_leaf(&env, &p0);
+    let l1 = compute_leaf(&env, &p1);
+    let l2 = compute_leaf(&env, &p2);
+
+    let h0 = hash_leaf(&env, &l0.to_array());
+    let h1 = hash_leaf(&env, &l1.to_array());
+    let h2 = hash_leaf(&env, &l2.to_array());
+
+    // Level 0 -> Level 1
+    let n0 = merkle_hash_pair(&env, &h0, &h1);
+    let n1 = merkle_hash_pair(&env, &h2, &h2); // Odd leaf duplicated and hashed with itself
+
+    // Level 1 -> Root
+    let root = merkle_hash_pair(&env, &n0, &n1);
+    let root_bytes = BytesN::from_array(&env, &root);
+
+    let block_height = 300;
+    client.update_root(&block_height, &root_bytes);
+
+    // Verify leaf 0 (index 0)
+    let mut proof0 = Vec::new(&env);
+    proof0.push_back(BytesN::from_array(&env, &h1));
+    proof0.push_back(BytesN::from_array(&env, &n1));
+    let mut flags0 = Vec::new(&env);
+    flags0.push_back(false);
+    flags0.push_back(false);
+    assert!(client.verify_message(&block_height, &p0, &proof0, &flags0));
+
+    // Verify leaf 1 (index 1)
+    let mut proof1 = Vec::new(&env);
+    proof1.push_back(BytesN::from_array(&env, &h0));
+    proof1.push_back(BytesN::from_array(&env, &n1));
+    let mut flags1 = Vec::new(&env);
+    flags1.push_back(true);
+    flags1.push_back(false);
+    assert!(client.verify_message(&block_height, &p1, &proof1, &flags1));
+
+    // Verify leaf 2 (index 2 - the odd padded leaf)
+    let mut proof2 = Vec::new(&env);
+    proof2.push_back(BytesN::from_array(&env, &h2)); // Sibling is itself
+    proof2.push_back(BytesN::from_array(&env, &n0));
+    let mut flags2 = Vec::new(&env);
+    flags2.push_back(false);
+    flags2.push_back(true);
+    assert!(client.verify_message(&block_height, &p2, &proof2, &flags2));
+}
+
+#[test]
+fn test_verify_message_odd_leaf_count_five_leaves() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    // 5 leaves in tree: L0, L1, L2, L3, L4
+    let payloads: [Payload; 5] = [
+        make_payload(&env, 20),
+        make_payload(&env, 21),
+        make_payload(&env, 22),
+        make_payload(&env, 23),
+        make_payload(&env, 24),
+    ];
+
+    let leaf_hashes: [[u8; 32]; 5] = [
+        hash_leaf(&env, &compute_leaf(&env, &payloads[0]).to_array()),
+        hash_leaf(&env, &compute_leaf(&env, &payloads[1]).to_array()),
+        hash_leaf(&env, &compute_leaf(&env, &payloads[2]).to_array()),
+        hash_leaf(&env, &compute_leaf(&env, &payloads[3]).to_array()),
+        hash_leaf(&env, &compute_leaf(&env, &payloads[4]).to_array()),
+    ];
+
+    // Level 0 -> Level 1
+    let n0 = merkle_hash_pair(&env, &leaf_hashes[0], &leaf_hashes[1]);
+    let n1 = merkle_hash_pair(&env, &leaf_hashes[2], &leaf_hashes[3]);
+    let n2 = merkle_hash_pair(&env, &leaf_hashes[4], &leaf_hashes[4]); // Odd leaf duplicated
+
+    // Level 1 -> Level 2
+    let m0 = merkle_hash_pair(&env, &n0, &n1);
+    let m1 = merkle_hash_pair(&env, &n2, &n2); // Odd internal node duplicated
+
+    // Level 2 -> Root
+    let root = merkle_hash_pair(&env, &m0, &m1);
+    let root_bytes = BytesN::from_array(&env, &root);
+
+    let block_height = 500;
+    client.update_root(&block_height, &root_bytes);
+
+    // Verify leaf 4 (the odd padded leaf at both levels)
+    let mut proof4 = Vec::new(&env);
+    proof4.push_back(BytesN::from_array(&env, &leaf_hashes[4]));
+    proof4.push_back(BytesN::from_array(&env, &n2));
+    proof4.push_back(BytesN::from_array(&env, &m0));
+    let mut flags4 = Vec::new(&env);
+    flags4.push_back(false);
+    flags4.push_back(false);
+    flags4.push_back(true);
+    assert!(client.verify_message(&block_height, &payloads[4], &proof4, &flags4));
+
+    // Verify leaf 0
+    let mut proof0 = Vec::new(&env);
+    proof0.push_back(BytesN::from_array(&env, &leaf_hashes[1]));
+    proof0.push_back(BytesN::from_array(&env, &n1));
+    proof0.push_back(BytesN::from_array(&env, &m1));
+    let mut flags0 = Vec::new(&env);
+    flags0.push_back(false);
+    flags0.push_back(false);
+    flags0.push_back(false);
+    assert!(client.verify_message(&block_height, &payloads[0], &proof0, &flags0));
+}
+
+#[test]
+fn test_verify_message_and_consume_odd_leaf_count_tree() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(CrossChainVerifier, ());
+    let client = CrossChainVerifierClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let leaf0 = BytesN::from_array(&env, &[101u8; 32]);
+    let leaf1 = BytesN::from_array(&env, &[102u8; 32]);
+    let leaf2 = BytesN::from_array(&env, &[103u8; 32]);
+
+    let h0 = hash_leaf(&env, &leaf0.to_array());
+    let h1 = hash_leaf(&env, &leaf1.to_array());
+    let h2 = hash_leaf(&env, &leaf2.to_array());
+
+    let n0 = merkle_hash_pair(&env, &h0, &h1);
+    let n1 = merkle_hash_pair(&env, &h2, &h2);
+    let root = merkle_hash_pair(&env, &n0, &n1);
+
+    let block_height = 700;
+    client.update_root(&block_height, &BytesN::from_array(&env, &root));
+
+    // Consume leaf 2 (odd leaf)
+    let mut proof2 = Vec::new(&env);
+    proof2.push_back(BytesN::from_array(&env, &h2));
+    proof2.push_back(BytesN::from_array(&env, &n0));
+    let mut flags2 = Vec::new(&env);
+    flags2.push_back(false);
+    flags2.push_back(true);
+
+    assert!(client.verify_message_and_consume(&block_height, &42u64, &leaf2, &proof2, &flags2));
+    assert!(client.is_nonce_processed(&42u64));
+}
+
