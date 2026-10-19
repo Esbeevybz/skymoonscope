@@ -593,7 +593,35 @@ impl FeeCollector {
         }
 
         // Try the first healthy provider
-        let provider = &providers[0];
+                let provider = &providers[0];
+
+        // Use the RPC fee statistics for real-time fee tracking.
+        if let Ok(fee_stats) = self.fetch_fee_stats(provider).await {
+            if let Some(p50) = fee_stats["p50"].as_str().and_then(|v| v.parse::<i64>().ok()) {
+                let p95 = fee_stats["p95"]
+                    .as_str()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(p50);
+
+                let transaction_count = fee_stats["transactionCount"]
+                    .as_str()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(0);
+
+                return Ok(LedgerFeeSample {
+                    ledger_sequence: sequence as i64,
+                    collected_at: Utc::now(),
+                    base_reserve: 0,
+                    base_fee: p50,
+                    max_fee: p95,
+                    fee_charged: 0,
+                    transaction_count,
+                    ledger_close_time: Utc::now(),
+                });
+            }
+        }
+
+        
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -642,26 +670,42 @@ impl FeeCollector {
     }
 
     /// Fetch detailed fee data for a specific ledger
-    async fn fetch_ledger_fee_data(
+        /// Fetch real-time fee statistics from Stellar RPC.
+    async fn fetch_fee_stats(
         &self,
-        sequence: u64,
-    ) -> Result<LedgerFeeSample, FeeCollectorError> {
-        let providers = self.registry.healthy_providers().await;
-        if providers.is_empty() {
-            return Err(FeeCollectorError::NoHealthyProviders);
+        provider: &crate::rpc_provider::RpcProvider,
+    ) -> Result<serde_json::Value, FeeCollectorError> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getFeeStats",
+            "params": null
+        });
+
+        let mut req = self.client.post(&provider.url).json(&body);
+
+        if let (Some(header), Some(value)) = (&provider.auth_header, &provider.auth_value) {
+            req = req.header(header.as_str(), value.as_str());
         }
 
-        let provider = &providers[0];
+        let response = req
+            .send()
+            .await
+            .map_err(|e| FeeCollectorError::RpcRequestFailed(e.to_string()))?;
 
-        // Try getLedgers endpoint first (if available)
-        // Fallback to parsing from getTransactions if needed
-        match self.fetch_from_get_ledgers(provider, sequence).await {
-            Ok(sample) => Ok(sample),
-            Err(e) => {
-                tracing::warn!(error = %e, "getLedgers not available, using fallback");
-                self.fetch_from_get_transactions(provider, sequence).await
-            }
+        if !response.status().is_success() {
+            return Err(FeeCollectorError::RpcRequestFailed(format!(
+                "HTTP {}",
+                response.status()
+            )));
         }
+
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| FeeCollectorError::ParseError(e.to_string()))?;
+
+        Ok(json["result"]["inclusionFee"].clone())
     }
 
     /// Fetch fee data using getLedgers RPC method
