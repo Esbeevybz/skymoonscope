@@ -849,6 +849,15 @@ impl CallGraph {
         mermaid
     }
 
+    /// Maximum contract-call nesting depth, with the root at depth 1.
+    pub fn max_depth(&self) -> usize {
+        fn node_depth(node: &CallNode) -> usize {
+            1 + node.children.iter().map(node_depth).max().unwrap_or(0)
+        }
+
+        node_depth(&self.root)
+    }
+
     fn append_mermaid_nodes(&self, node: &CallNode, mermaid: &mut String, id_gen: &mut usize) {
         let current_id = *id_gen;
         mermaid.push_str(&format!(
@@ -3500,6 +3509,27 @@ pub fn profile_contract_with_flamegraph(
 mod tests {
     use super::*;
     use crate::cache::SimulationCache;
+
+    #[test]
+    fn test_call_graph_max_depth() {
+        let graph = CallGraph {
+            root: CallNode {
+                contract_id: "root".to_string(),
+                function: "invoke".to_string(),
+                children: vec![CallNode {
+                    contract_id: "child".to_string(),
+                    function: "transfer".to_string(),
+                    children: vec![CallNode {
+                        contract_id: "grandchild".to_string(),
+                        function: "authorize".to_string(),
+                        children: Vec::new(),
+                    }],
+                }],
+            },
+        };
+
+        assert_eq!(graph.max_depth(), 3);
+    }
 
     #[test]
     fn test_soroban_resources_default() {

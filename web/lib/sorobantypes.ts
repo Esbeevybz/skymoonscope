@@ -142,6 +142,7 @@ export interface ResourceReport extends SorobanResources {
   ttl_analysis: TtlAnalysisApiReport | null;
   nutrition: NutritionReport;
   call_graph: CallGraph | null;
+  max_call_depth: number | null;
   call_graph_mermaid: string | null;
   state_snapshot: SimulationStateSnapshot | null;
   protocol_version: number;
