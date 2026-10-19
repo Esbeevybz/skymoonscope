@@ -26,9 +26,9 @@ pub enum Error {
     NotSecurityCouncil = 13,
     CannotVeto = 14,
     SecurityCouncilNotSet = 15,
-    InvalidExecutionThreshold = 13,
-    DuplicateAdmin = 14,
-    InsufficientApprovals = 15,
+    InvalidExecutionThreshold = 17,
+    DuplicateAdmin = 18,
+    InsufficientApprovals = 19,
     /// `execute_proposal` was called before `execution_delay_ledgers` had
     /// elapsed since voting closed (issue #68).
     ExecutionDelayNotElapsed = 16,
@@ -197,7 +197,7 @@ fn require_execution_approvals(env: &Env, approvers: &Vec<Address>) -> Result<()
 fn diff_strings(env: &Env, from: &String, to: &String) -> String {
     let from_len = from.len();
     let to_len = to.len();
-    let mut out = String::new(env);
+    let mut out = String::from_str(env, "");
 
     if from_len == 0 && to_len == 0 {
         return out;
@@ -611,12 +611,12 @@ impl GovernanceContract {
         let title_diff = if title_changed {
             diff_strings(&env, &from_title, &to_title)
         } else {
-            String::new(&env)
+            String::from_str(&env, "")
         };
         let description_diff = if description_changed {
             diff_strings(&env, &from_description, &to_description)
         } else {
-            String::new(&env)
+            String::from_str(&env, "")
         };
 
         Ok(ProposalVersionDiff {
