@@ -1,3 +1,5 @@
+import { loadMockContractConfig } from './mockContractConfig';
+
 export type SorobanType =
   | 'address'
   | 'u32'
@@ -231,6 +233,21 @@ export function generateMockTransactions(count: number): TransactionRecord[] {
     fee: (Math.random() * 0.01).toFixed(5),
   }));
 }
+
+export const MOCK_CONTRACT_CONFIG = loadMockContractConfig(
+  {
+    NEXT_PUBLIC_CONTRACT_ID: process.env.NEXT_PUBLIC_CONTRACT_ID,
+    NEXT_PUBLIC_CONTRACT_FUNCTIONS: process.env.NEXT_PUBLIC_CONTRACT_FUNCTIONS,
+    NEXT_PUBLIC_CONTRACT_MOCK_RESULTS: process.env.NEXT_PUBLIC_CONTRACT_MOCK_RESULTS,
+    NEXT_PUBLIC_CONTRACT_MOCK_TRANSACTIONS: process.env.NEXT_PUBLIC_CONTRACT_MOCK_TRANSACTIONS,
+  },
+  {
+    contractId: 'CAEZJVJ4N7P7GRUVD5NG5LYYH23AQHJUKQEUHW54LR5PGQX3V7FXD7Q',
+    functions: MOCK_CONTRACT_FUNCTIONS,
+    results: {},
+    transactions: null,
+  },
+);
 
 export function generateMockResourceCost(): ResourceCost {
   return {
