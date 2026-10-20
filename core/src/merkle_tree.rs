@@ -351,6 +351,205 @@ impl MerkleTree {
         Ok(tree)
     }
 
+    /// Visualizes the Merkle tree structure as an ASCII art diagram.
+    ///
+    /// This includes tree metadata (root hash, leaf count, tree height), an indented
+    /// ASCII branch hierarchy from root to leaves, and a level-by-level breakdown.
+    pub fn to_ascii_art(&self) -> String {
+        if self.nodes.is_empty() || self.leaf_count == 0 {
+            return "(Empty Merkle Tree)\n".to_string();
+        }
+
+        let mut out = String::new();
+        out.push_str("====================================================================\n");
+        out.push_str("                     MERKLE TREE VISUALIZATION                      \n");
+        out.push_str("====================================================================\n");
+        out.push_str(&format!("Root Hash   : {}\n", self.get_root_hex()));
+        out.push_str(&format!("Leaf Count  : {}\n", self.leaf_count));
+        out.push_str(&format!("Tree Height : {} level(s)\n", self.nodes.len()));
+        out.push_str("--------------------------------------------------------------------\n");
+        out.push_str("Tree Hierarchy:\n");
+        out.push_str(&self.to_ascii_hierarchy());
+        out.push_str("\n--------------------------------------------------------------------\n");
+        out.push_str("Level Breakdown:\n");
+        out.push_str(&self.to_ascii_layers());
+        out.push_str("====================================================================\n");
+        out
+    }
+
+    /// Alias for `to_ascii_art`.
+    pub fn render_ascii(&self) -> String {
+        self.to_ascii_art()
+    }
+
+    /// Returns the hierarchical tree representation using ASCII branch lines.
+    pub fn to_ascii_hierarchy(&self) -> String {
+        if self.nodes.is_empty() {
+            return "(Empty)\n".to_string();
+        }
+
+        let root_level = self.nodes.len() - 1;
+        let mut out = String::new();
+        self.render_hierarchy_node(&mut out, root_level, 0, "", true);
+        out
+    }
+
+    fn render_hierarchy_node(
+        &self,
+        out: &mut String,
+        level: usize,
+        index: usize,
+        prefix: &str,
+        is_last: bool,
+    ) {
+        let node_hash = self.nodes[level][index];
+        let short_hash = format!(
+            "{}...{}",
+            &hex::encode(&node_hash[..4]),
+            &hex::encode(&node_hash[28..])
+        );
+
+        if level == self.nodes.len() - 1 {
+            // Root node
+            if level == 0 {
+                // Single-leaf tree: root is also leaf 0
+                let leaf_preview = self.format_leaf_data(0);
+                out.push_str(&format!(
+                    "[Root / Leaf 0] {} (hash: {})\n",
+                    leaf_preview, short_hash
+                ));
+                return;
+            } else {
+                out.push_str(&format!("[Root] {}\n", short_hash));
+            }
+        } else {
+            let branch = if is_last { "└── " } else { "├── " };
+            out.push_str(prefix);
+            out.push_str(branch);
+
+            if level == 0 {
+                // Leaf node
+                let leaf_preview = self.format_leaf_data(index);
+                out.push_str(&format!(
+                    "[Leaf {}] {} (hash: {})\n",
+                    index, leaf_preview, short_hash
+                ));
+                return;
+            } else {
+                out.push_str(&format!("[Node L{}:{}] {}\n", level, index, short_hash));
+            }
+        }
+
+        if level > 0 {
+            let child_level = level - 1;
+            let left_idx = 2 * index;
+            let right_idx = 2 * index + 1;
+            let has_right = right_idx < self.nodes[child_level].len();
+            let is_odd_promoted = !has_right && left_idx < self.nodes[child_level].len();
+
+            let next_prefix = if level == self.nodes.len() - 1 {
+                "".to_string()
+            } else if is_last {
+                format!("{}    ", prefix)
+            } else {
+                format!("{}│   ", prefix)
+            };
+
+            // Left child
+            if left_idx < self.nodes[child_level].len() {
+                let left_is_last = !has_right && !is_odd_promoted;
+                self.render_hierarchy_node(
+                    out,
+                    child_level,
+                    left_idx,
+                    &next_prefix,
+                    left_is_last,
+                );
+            }
+
+            // Right child
+            if has_right {
+                self.render_hierarchy_node(
+                    out,
+                    child_level,
+                    right_idx,
+                    &next_prefix,
+                    true,
+                );
+            } else if is_odd_promoted {
+                // Sibling promoted from odd child (paired with itself)
+                let branch = "└── ";
+                out.push_str(&next_prefix);
+                out.push_str(branch);
+                out.push_str(&format!(
+                    "[Dup L{}:{}] (odd sibling paired with itself)\n",
+                    child_level, left_idx
+                ));
+            }
+        }
+    }
+
+    fn format_leaf_data(&self, index: usize) -> String {
+        if index < self.data_leaves.len() {
+            let data = &self.data_leaves[index];
+            if let Ok(s) = std::str::from_utf8(data) {
+                if s.chars().all(|c| !c.is_control()) {
+                    return if s.len() > 16 {
+                        format!("\"{}...\"", &s[..13])
+                    } else {
+                        format!("\"{}\"", s)
+                    };
+                }
+            }
+            let hex_str = hex::encode(data);
+            if hex_str.len() > 12 {
+                format!("0x{}...", &hex_str[..8])
+            } else {
+                format!("0x{}", hex_str)
+            }
+        } else {
+            "<missing>".to_string()
+        }
+    }
+
+    /// Returns a layer-by-layer ASCII diagram of the tree.
+    pub fn to_ascii_layers(&self) -> String {
+        if self.nodes.is_empty() {
+            return "(Empty)\n".to_string();
+        }
+
+        let mut out = String::new();
+        for (lvl_idx, level_nodes) in self.nodes.iter().enumerate().rev() {
+            let label = if lvl_idx == self.nodes.len() - 1 {
+                format!("Level {} [Root]     : ", lvl_idx)
+            } else if lvl_idx == 0 {
+                "Level 0 [Leaves]   : ".to_string()
+            } else {
+                format!("Level {} [Internal] : ", lvl_idx)
+            };
+            out.push_str(&label);
+
+            let mut node_strs = Vec::new();
+            for (idx, node_hash) in level_nodes.iter().enumerate() {
+                let short_hash = format!(
+                    "{}..{}",
+                    &hex::encode(&node_hash[..2]),
+                    &hex::encode(&node_hash[30..])
+                );
+                if lvl_idx == 0 && idx < self.data_leaves.len() {
+                    let preview = self.format_leaf_data(idx);
+                    node_strs.push(format!("[{}: {} ({})]", idx, preview, short_hash));
+                } else {
+                    node_strs.push(format!("[{}: {}]", idx, short_hash));
+                }
+            }
+
+            out.push_str(&node_strs.join(" "));
+            out.push('\n');
+        }
+        out
+    }
+
     fn hash_leaf(data: &[u8]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(data);
@@ -1259,5 +1458,63 @@ mod incremental_equivalence_tests {
         tree_full.build(all).unwrap();
 
         assert_eq!(tree_inc.root, tree_full.root);
+    }
+
+    #[test]
+    fn test_to_ascii_art_empty_tree() {
+        let tree = MerkleTree::new(32);
+        let art = tree.to_ascii_art();
+        assert!(art.contains("Empty Merkle Tree"));
+        assert_eq!(tree.render_ascii(), art);
+        assert_eq!(tree.to_ascii_hierarchy(), "(Empty)\n");
+        assert_eq!(tree.to_ascii_layers(), "(Empty)\n");
+    }
+
+    #[test]
+    fn test_to_ascii_art_single_leaf() {
+        let tree = make_tree(&["single_leaf"]);
+        let art = tree.to_ascii_art();
+        assert!(art.contains("MERKLE TREE VISUALIZATION"));
+        assert!(art.contains("Leaf Count  : 1"));
+        assert!(art.contains("Tree Height : 1 level(s)"));
+        assert!(art.contains("[Root / Leaf 0] \"single_leaf\""));
+        assert!(art.contains("Level 0 [Leaves]"));
+    }
+
+    #[test]
+    fn test_to_ascii_art_even_leaves() {
+        let tree = make_tree(&["apple", "banana", "cherry", "date"]);
+        let art = tree.to_ascii_art();
+        assert!(art.contains("Leaf Count  : 4"));
+        assert!(art.contains("Tree Height : 3 level(s)"));
+        assert!(art.contains("[Root]"));
+        assert!(art.contains("[Leaf 0] \"apple\""));
+        assert!(art.contains("[Leaf 1] \"banana\""));
+        assert!(art.contains("[Leaf 2] \"cherry\""));
+        assert!(art.contains("[Leaf 3] \"date\""));
+        assert!(art.contains("Level 2 [Root]"));
+        assert!(art.contains("Level 1 [Internal]"));
+        assert!(art.contains("Level 0 [Leaves]"));
+    }
+
+    #[test]
+    fn test_to_ascii_art_odd_leaves() {
+        let tree = make_tree(&["alpha", "beta", "gamma"]);
+        let art = tree.to_ascii_art();
+        assert!(art.contains("Leaf Count  : 3"));
+        assert!(art.contains("[Leaf 0] \"alpha\""));
+        assert!(art.contains("[Leaf 1] \"beta\""));
+        assert!(art.contains("[Leaf 2] \"gamma\""));
+        assert!(art.contains("odd sibling paired with itself"));
+    }
+
+    #[test]
+    fn test_to_ascii_art_binary_leaves() {
+        let leaves = vec![vec![0xde, 0xad, 0xbe, 0xef], vec![0xca, 0xfe]];
+        let mut tree = MerkleTree::new(32);
+        tree.build(leaves).unwrap();
+        let art = tree.to_ascii_art();
+        assert!(art.contains("0xdeadbeef"));
+        assert!(art.contains("0xcafe"));
     }
 }

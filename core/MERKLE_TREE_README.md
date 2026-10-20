@@ -159,6 +159,78 @@ for i in 0..4 {
 }
 ```
 
+### `tree.to_ascii_art() → String` (or `tree.render_ascii() → String`)
+
+Renders the complete Merkle tree structure as a detailed ASCII art diagram. Includes metadata, an indented hierarchy from root to leaves with sibling branches, and a level-by-level hash breakdown.
+
+```rust
+let mut tree = MerkleTree::new(32);
+tree.build(vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()])?;
+
+println!("{}", tree.to_ascii_art());
+```
+
+---
+
+## CLI Merkle Tree Commands
+
+The `sky-moon-scope-core` binary includes built-in CLI commands to construct, verify, and visualize Merkle trees directly from the terminal without writing Rust code.
+
+### 1. Visualize Tree as ASCII Art (`merkle visualize`)
+
+```bash
+cargo run -p sky-moon-scope-core -- merkle visualize leaf1 leaf2 leaf3 leaf4
+```
+
+Example output:
+```text
+====================================================================
+                     MERKLE TREE VISUALIZATION                      
+====================================================================
+Root Hash   : 6512fd1c06d860e0d5ce39023c4a2a10688f21e8d47be44275ba2ffbf73587e9
+Leaf Count  : 4
+Tree Height : 3 level(s)
+--------------------------------------------------------------------
+Tree Hierarchy:
+[Root] 6512fd1c...f73587e9
+├── [Node L1:0] eb02e1a3...ca9fb9d1
+│   ├── [Leaf 0] "leaf1" (hash: e3b0c442...4f53cda1)
+│   └── [Leaf 1] "leaf2" (hash: 8c6976e5...9b71d224)
+└── [Node L1:1] 34a5b6c7...5d6e7f8a
+    ├── [Leaf 2] "leaf3" (hash: 7c4d5e6f...8f2c3d4e)
+    └── [Leaf 3] "leaf4" (hash: 1f2b3c4d...3b1a2c3d)
+
+--------------------------------------------------------------------
+Level Breakdown:
+Level 2 [Root]     : [0: 65..e9]
+Level 1 [Internal] : [0: eb..d1] [1: 34..8a]
+Level 0 [Leaves]   : [0: "leaf1" (e3..a1)] [1: "leaf2" (8c..24)] [2: "leaf3" (7c..4e)] [3: "leaf4" (1f..3d)]
+====================================================================
+```
+
+### 2. Visualize Tree from File (`merkle visualize-file`)
+
+Build and visualize a Merkle tree from a newline-delimited file of leaf values:
+```bash
+cargo run -p sky-moon-scope-core -- merkle visualize-file leaves.txt
+```
+
+### 3. Build Tree and Print Root (`merkle build` / `merkle build-file`)
+
+```bash
+# Direct arguments
+cargo run -p sky-moon-scope-core -- merkle build leaf1 leaf2 leaf3
+
+# From a newline-delimited file
+cargo run -p sky-moon-scope-core -- merkle build-file leaves.txt
+```
+
+### 4. Generate Proof (`merkle proof`)
+
+```bash
+cargo run -p sky-moon-scope-core -- merkle proof 0 leaf1 leaf2 leaf3
+```
+
 ---
 
 ## Usage Examples
@@ -598,8 +670,8 @@ Common causes:
 - [x] `append_leaves()` method for efficient batch append operations
 - [x] `update_leaf()` method for single leaf updates without full rebuild
 - [x] `update_leaves()` method for bulk leaf updates with single tree rebuild
+- [x] CLI command to visualize Merkle tree structure as ASCII art (`merkle visualize`)
 - [ ] Sparse Merkle Tree variant for key-value inclusion proofs
-- [ ] CLI binary (`sky-moon-scope-merkle`) for scripting without writing Rust
 - [ ] Multi-proof generation (prove multiple leaves in one pass)
 - [ ] Integration with `private_transfer` commitment tree
 
