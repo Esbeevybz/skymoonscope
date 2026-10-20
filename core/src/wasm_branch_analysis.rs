@@ -92,6 +92,8 @@ pub struct WasmBranchAnalysisResult {
     /// Per-category branch counts.
     pub branch_type_breakdown: BranchTypeBreakdown,
     /// Conservative upper bound on distinct execution paths (capped at 64).
+    /// Computed via forward dataflow reachability, so only branches that can
+    /// actually be executed from function entry contribute to the estimate.
     pub estimated_paths: usize,
     /// Per-branch descriptors from static analysis.
     pub branches: Vec<BranchInfo>,
@@ -514,6 +516,259 @@ fn scan_function_body(body: &[u8]) -> ScanAccumulator {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Forward dataflow path estimation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Kinds of structured control-flow blocks encountered while scanning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameKind {
+    /// A plain `block ... end`.
+    Block,
+    /// A `loop ... end` with an implicit back-edge.
+    Loop,
+    /// An `if ... else? ... end` conditional.
+    If,
+}
+
+/// Stack frame used by the forward reachability dataflow pass.
+struct DataflowFrame {
+    kind: FrameKind,
+    /// Whether the entry of this block is reachable from function entry.
+    reachable_entry: bool,
+    /// Whether code immediately after this block's `end` is reachable via
+    /// normal fall-through or a branch targeting this block.
+    after_reachable: bool,
+}
+
+/// Skip the immediate bytes for a single WASM instruction, given its opcode.
+///
+/// This is the inverse of the parser in `scan_function_body`: it consumes
+/// exactly the bytes that follow the opcode for every non-control instruction.
+fn skip_instruction_immediates(s: &mut Scanner, opcode: u8) {
+    match opcode {
+        // ── Control instructions already handled by the dataflow pass ───────
+        OP_BLOCK | OP_LOOP | OP_IF | OP_ELSE | OP_END | OP_BR | OP_BR_IF | OP_BR_TABLE
+        | OP_RETURN => {}
+
+        // ── Function calls ─────────────────────────────────────────────────
+        OP_CALL => {
+            s.skip_leb128(); // function index
+        }
+        OP_CALL_INDIRECT => {
+            s.skip_leb128(); // type index
+            s.skip_leb128(); // table index
+        }
+
+        // ── Reference instructions ─────────────────────────────────────────
+        0x25 | 0x26 => {
+            s.skip_leb128(); // table index (table.get / table.set)
+        }
+
+        // ── Variable instructions (local / global) ────────────────────────
+        0x20..=0x24 => {
+            s.skip_leb128(); // local/global index
+        }
+
+        // ── Memory instructions (alignment + offset immediates) ─────────────
+        // i32.load … i64.store32
+        0x28..=0x3E => {
+            s.skip_leb128(); // alignment
+            s.skip_leb128(); // offset
+        }
+        // memory.size, memory.grow
+        0x3F | 0x40 => {
+            s.skip_leb128(); // memory index
+        }
+
+        // ── Numeric constants ─────────────────────────────────────────────
+        0x41 => {
+            s.skip_leb128(); // i32.const
+        }
+        0x42 => {
+            s.skip_leb128(); // i64.const (signed LEB-128, width handled by skip)
+        }
+        0x43 => {
+            s.skip(4); // f32.const
+        }
+        0x44 => {
+            s.skip(8); // f64.const
+        }
+
+        // ── Bulk-memory / SIMD prefix byte ─────────────────────────────────
+        0xFC => {
+            let sub = s.read_leb128_u32().unwrap_or(0);
+            match sub {
+                8 | 10 | 12 => {
+                    s.skip_leb128(); // seg/elem index
+                    s.skip_leb128(); // dst memory/table index
+                }
+                9 | 11 | 13..=17 => {
+                    s.skip_leb128(); // single immediate
+                }
+                _ => {}
+            }
+        }
+
+        // ── SIMD prefix byte ───────────────────────────────────────────────
+        0xFD => {
+            s.skip_leb128(); // SIMD sub-opcode
+        }
+
+        // ── All other opcodes have no immediates ────────────────────────────
+        _ => {}
+    }
+}
+
+/// Mark the post-end region of the block targeted by a `br`-style jump as
+/// reachable. Branches to loops jump to the loop start rather than after it,
+/// so those frames are left unchanged.
+fn mark_branch_target(stack: &mut [DataflowFrame], depth: usize) {
+    if depth >= stack.len() {
+        return;
+    }
+    let target_index = stack.len().saturating_sub(1).saturating_sub(depth);
+    if stack[target_index].kind != FrameKind::Loop {
+        stack[target_index].after_reachable = true;
+    }
+}
+
+/// Conservative upper bound on the number of distinct execution paths
+/// through the function body.
+///
+/// Instead of enumerating the exponential set of paths (2^branches), this
+/// function performs a forward dataflow analysis over the structured control
+/// flow. Each instruction is processed exactly once; reachability facts are
+/// merged at join points. The reachable branch count is then used to
+/// produce a capped exponential upper bound, exactly like the previous
+/// estimator but without iterating over unreachable branches. The result is
+/// capped at [`MAX_ESTIMATED_PATHS`].
+fn estimate_paths_via_dataflow(body: &[u8]) -> usize {
+    let mut s = Scanner::new(body);
+
+    // Skip local declarations: count (LEB128) × (count, valtype) pairs.
+    let local_groups = s.read_leb128_u32().unwrap_or(0);
+    for _ in 0..local_groups {
+        s.skip_leb128(); // count of locals in group
+        s.skip(1); // value type byte
+    }
+
+    let mut stack: Vec<DataflowFrame> = Vec::new();
+    let mut reachable = true;
+    let mut reachable_branches = 0usize;
+
+    while s.remaining() > 0 {
+        let opcode = match s.read_byte() {
+            Some(b) => b,
+            None => break,
+        };
+
+        match opcode {
+            OP_BLOCK => {
+                s.skip_leb128(); // blocktype
+                stack.push(DataflowFrame {
+                    kind: FrameKind::Block,
+                    reachable_entry: reachable,
+                    after_reachable: false,
+                });
+            }
+            OP_LOOP => {
+                s.skip_leb128(); // blocktype
+                if reachable {
+                    reachable_branches += 1;
+                }
+                stack.push(DataflowFrame {
+                    kind: FrameKind::Loop,
+                    reachable_entry: reachable,
+                    after_reachable: false,
+                });
+            }
+            OP_IF => {
+                s.skip_leb128(); // blocktype
+                if reachable {
+                    reachable_branches += 1;
+                }
+                stack.push(DataflowFrame {
+                    kind: FrameKind::If,
+                    reachable_entry: reachable,
+                    after_reachable: false,
+                });
+            }
+            OP_ELSE => {
+                // The then-branch ends here; record whether it fell through,
+                // then start evaluating the else-branch with the same entry
+                // reachability. `else` outside an `if` is malformed — ignore it.
+                if let Some(frame) = stack.last_mut() {
+                    if frame.kind == FrameKind::If {
+                        frame.after_reachable = frame.after_reachable || reachable;
+                        reachable = frame.reachable_entry;
+                    }
+                }
+            }
+            OP_END => {
+                if let Some(frame) = stack.pop() {
+                    // After the block: reachable if the block body fell through
+                    // *or* a branch targeted this block's end, provided the
+                    // block entry itself was reachable.
+                    reachable = (frame.reachable_entry && reachable) || frame.after_reachable;
+                } else {
+                    // Extra end for the function itself; nothing follows.
+                    reachable = false;
+                }
+            }
+            OP_BR => {
+                let depth = s.read_leb128_u32().unwrap_or(0) as usize;
+                if reachable {
+                    mark_branch_target(&mut stack, depth);
+                }
+                reachable = false;
+            }
+            OP_BR_IF => {
+                let depth = s.read_leb128_u32().unwrap_or(0) as usize;
+                if reachable {
+                    mark_branch_target(&mut stack, depth);
+                    reachable_branches += 1;
+                }
+                // fall-through remains reachable
+            }
+            OP_BR_TABLE => {
+                let n = s.read_leb128_u32().unwrap_or(0) as usize;
+                if reachable {
+                    for _ in 0..=n {
+                        if let Some(depth) = s.read_leb128_u32() {
+                            mark_branch_target(&mut stack, depth as usize);
+                        }
+                    }
+                    reachable_branches += 1;
+                } else {
+                    for _ in 0..=n {
+                        s.skip_leb128();
+                    }
+                }
+                reachable = false;
+            }
+            OP_RETURN => {
+                if reachable {
+                    reachable_branches += 1;
+                }
+                reachable = false;
+            }
+            _ => skip_instruction_immediates(&mut s, opcode),
+        }
+    }
+
+    // Convert the reachable branch count into the same capped exponential
+    // upper bound used previously, but now only reachable branches participate.
+    if reachable_branches == 0 {
+        1
+    } else {
+        (2usize.saturating_pow(reachable_branches.min(6) as u32)).min(MAX_ESTIMATED_PATHS)
+    }
+}
+
+/// Maximum value reported by the path-estimation dataflow analysis.
+const MAX_ESTIMATED_PATHS: usize = 64;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Argument variation generator
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -626,7 +881,7 @@ pub fn analyze_wasm_branches(
     args: Vec<String>,
 ) -> Result<WasmBranchAnalysisResult, SimulationError> {
     // ── 1. Static analysis ────────────────────────────────────────────────────
-    let (total_branch_count, max_nesting_depth, branch_type_breakdown, branches) =
+    let (total_branch_count, max_nesting_depth, branch_type_breakdown, branches, estimated_paths) =
         match extract_function_body(&wasm_bytes, &function_name) {
             Some(body) => {
                 let acc = scan_function_body(body);
@@ -634,24 +889,20 @@ pub fn analyze_wasm_branches(
                 let depth = acc.max_depth;
                 let breakdown = acc.breakdown;
                 let branches = acc.branches;
-                (total, depth, breakdown, branches)
+                // Forward dataflow estimate avoids the O(2^N) cost of enumerating
+                // every path; it processes each instruction once and caps the
+                // reported bound.
+                let estimated = estimate_paths_via_dataflow(body);
+                (total, depth, breakdown, branches, estimated)
             }
             None => {
                 tracing::warn!(
                     function = %function_name,
                     "Could not locate function body in WASM — static analysis unavailable"
                 );
-                (0, 0, BranchTypeBreakdown::default(), vec![])
+                (0, 0, BranchTypeBreakdown::default(), vec![], 1)
             }
         };
-
-    // Conservative estimate: every branch adds one independent path.
-    // Capped at 64 to avoid misleading exponential claims.
-    let estimated_paths = if total_branch_count == 0 {
-        1
-    } else {
-        (2usize.saturating_pow(total_branch_count.min(6) as u32)).min(64)
-    };
 
     // ── 2. Baseline simulation ────────────────────────────────────────────────
     let baseline_resources = profile_contract(
@@ -1036,6 +1287,130 @@ mod tests {
 
         let acc = scan_function_body(&body);
         assert!(acc.max_depth >= 2);
+    }
+
+    // ── Forward dataflow path-estimation tests ────────────────────────────────
+
+    #[test]
+    fn test_dataflow_empty_body_one_path() {
+        let body = [0x00u8, OP_END]; // 0 local groups + function end
+        assert_eq!(estimate_paths_via_dataflow(&body), 1);
+    }
+
+    #[test]
+    fn test_dataflow_single_if_counts_reachable_branch() {
+        let mut body: Vec<u8> = vec![0x00]; // 0 local groups
+        body.push(OP_IF);
+        body.push(0x40); // empty blocktype
+        body.push(OP_END); // end of if
+        body.push(OP_END); // end of function
+        assert_eq!(estimate_paths_via_dataflow(&body), 2);
+    }
+
+    #[test]
+    fn test_dataflow_br_if_counts_conditional_jump() {
+        let mut body: Vec<u8> = vec![0x00]; // 0 local groups
+        body.push(OP_BLOCK);
+        body.push(0x40);
+        body.push(OP_BR_IF);
+        body.push(0x00); // target the enclosing block
+        body.push(OP_END);
+        body.push(OP_END); // end of function
+        assert_eq!(estimate_paths_via_dataflow(&body), 2);
+    }
+
+    #[test]
+    fn test_dataflow_br_table_counts_switch() {
+        let mut body: Vec<u8> = vec![0x00]; // 0 local groups
+        body.push(OP_BLOCK);
+        body.push(0x40);
+        body.push(OP_BR_TABLE);
+        body.push(0x01); // 1 target + default
+        body.push(0x00); // target label
+        body.push(0x00); // default label
+        body.push(OP_END);
+        body.push(OP_END); // end of function
+        assert_eq!(estimate_paths_via_dataflow(&body), 2);
+    }
+
+    #[test]
+    fn test_dataflow_early_return_is_counted() {
+        let mut body: Vec<u8> = vec![0x00]; // 0 local groups
+        body.push(OP_BLOCK);
+        body.push(0x40);
+        body.push(OP_RETURN);
+        body.push(OP_END);
+        body.push(OP_END); // end of function
+        assert_eq!(estimate_paths_via_dataflow(&body), 2);
+    }
+
+    #[test]
+    fn test_dataflow_unreachable_code_after_return_is_ignored() {
+        let mut body: Vec<u8> = vec![0x00]; // 0 local groups
+        body.push(OP_RETURN);
+        body.push(OP_IF);
+        body.push(0x40);
+        body.push(OP_END);
+        body.push(OP_END); // end of function
+        assert_eq!(estimate_paths_via_dataflow(&body), 2);
+    }
+
+    #[test]
+    fn test_dataflow_br_makes_outer_block_post_end_reachable() {
+        let mut body: Vec<u8> = vec![0x00]; // 0 local groups
+        body.push(OP_BLOCK);
+        body.push(0x40); // outer block
+        body.push(OP_BLOCK);
+        body.push(0x40); // inner block
+        body.push(OP_BR);
+        body.push(0x01); // branch to outer block
+        body.push(OP_END); // end inner
+        body.push(OP_RETURN); // unreachable because br already exits the outer block
+        body.push(OP_END); // end outer
+        body.push(OP_END); // end function
+        assert_eq!(estimate_paths_via_dataflow(&body), 1);
+    }
+
+    #[test]
+    fn test_dataflow_br_outer_then_early_return_is_counted() {
+        let mut body: Vec<u8> = vec![0x00]; // 0 local groups
+        body.push(OP_BLOCK);
+        body.push(0x40); // outer block
+        body.push(OP_BR);
+        body.push(0x00); // branch to the outer block itself
+        body.push(OP_END); // end outer
+        body.push(OP_RETURN); // reachable after the outer block end
+        body.push(OP_END); // end function
+        assert_eq!(estimate_paths_via_dataflow(&body), 2);
+    }
+
+    #[test]
+    fn test_dataflow_unreachable_nested_structure_does_not_desync() {
+        let mut body: Vec<u8> = vec![0x00]; // 0 local groups
+        body.push(OP_RETURN);
+        // Unreachable but structurally nested code: the scanner must still
+        // parse block boundaries correctly.
+        body.push(OP_BLOCK);
+        body.push(0x40);
+        body.push(OP_IF);
+        body.push(0x40);
+        body.push(OP_END);
+        body.push(OP_END);
+        body.push(OP_END); // end function
+        assert_eq!(estimate_paths_via_dataflow(&body), 2);
+    }
+
+    #[test]
+    fn test_dataflow_reachable_branch_cap() {
+        // 100 sequential, reachable `if` blocks → linear estimate, capped at 64.
+        let mut body: Vec<u8> = vec![0x00]; // 0 local groups
+        for _ in 0..100 {
+            body.push(OP_IF);
+            body.push(0x40);
+            body.push(OP_END);
+        }
+        body.push(OP_END); // end of function
+        assert_eq!(estimate_paths_via_dataflow(&body), MAX_ESTIMATED_PATHS);
     }
 
     // ── Arg variation tests ───────────────────────────────────────────────────

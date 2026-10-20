@@ -8,6 +8,7 @@ import {
   overallPercent,
   formatValue,
   formatPercent,
+  sanitizeResources,
   type NutritionMetric,
   type NutritionResources,
   type NutritionSeverity,
@@ -71,17 +72,23 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
   const [expanded, setExpanded] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [exportPdfError, setExportPdfError] = useState<string | null>(null);
 
   const metrics = useMemo(
     () =>
       buildMetrics(
-        {
+        // sanitizeResources clamps every field to ≥ 0, so a negative RAM
+        // delta from the backend (which can occur when the process frees
+        // memory between repeated simulation runs) never produces a negative
+        // bar or percentage in the label.
+        sanitizeResources({
           cpu_instructions,
           ram_bytes,
           ledger_read_bytes,
           ledger_write_bytes,
           transaction_size_bytes,
-        },
+        }),
         limits,
       ),
     [
@@ -133,6 +140,31 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
       setExporting(false);
     }
   }, [functionName]);
+
+  /**
+   * Export the label as a PDF. `pdfExport` is imported lazily so it stays
+   * out of the initial bundle — the label renders fine without it.
+   */
+  const handleExportPdf = useCallback(async () => {
+    setExportingPdf(true);
+    setExportPdfError(null);
+
+    try {
+      const { buildPdfBytes, downloadPdf } = await import('../lib/pdfExport');
+      const bytes = buildPdfBytes(metrics, {
+        functionName: functionName || 'transaction',
+        costStroops: cost_stroops,
+        generatedAt: new Date().toISOString(),
+      });
+      const filename = `sky-moon-scope-nutrition-${functionName || 'transaction'}-${Date.now()}.pdf`;
+      downloadPdf(bytes, filename);
+    } catch (error) {
+      console.error('Nutrition label PDF export failed:', error);
+      setExportPdfError('Could not export the label as a PDF.');
+    } finally {
+      setExportingPdf(false);
+    }
+  }, [metrics, functionName, cost_stroops]);
 
   return (
     <div className="flex flex-col gap-2">
@@ -284,17 +316,37 @@ export const NutritionLabel: React.FC<NutritionLabelProps> = ({
         </p>
       </div>
 
-      {/* Export control, kept outside the captured area */}
+      {/* Export controls, kept outside the captured area */}
       <div className="flex items-center justify-end gap-2">
         {exportError && (
           <span role="alert" className="text-xs text-[#cf222e]">
             {exportError}
           </span>
         )}
+        {exportPdfError && (
+          <span role="alert" className="text-xs text-[#cf222e]">
+            {exportPdfError}
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={handleExportPdf}
+          disabled={exportingPdf}
+          aria-label="Export as PDF"
+          className="inline-flex items-center gap-1.5 rounded border border-[var(--border-default)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-card)] disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {exportingPdf ? (
+            <Loader2 size={14} className="animate-spin" aria-hidden="true" />
+          ) : (
+            <Download size={14} aria-hidden="true" />
+          )}
+          {exportingPdf ? 'Exporting...' : 'Export PDF'}
+        </button>
         <button
           type="button"
           onClick={handleExport}
           disabled={exporting}
+          aria-label="Export as PNG"
           className="inline-flex items-center gap-1.5 rounded border border-[var(--border-default)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-card)] disabled:cursor-not-allowed disabled:opacity-60"
         >
           {exporting ? (

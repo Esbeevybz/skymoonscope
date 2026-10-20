@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{Error as SqlxError, FromRow, SqlitePool, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 use thiserror::Error;
 use tracing;
 use utoipa::ToSchema;
@@ -10,13 +10,25 @@ use uuid::Uuid;
 #[derive(Error, Debug)]
 pub enum FeeStoreError {
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(sqlx::Error),
+
+    #[error("Pool timed out: {0}")]
+    PoolTimedOut(String),
 
     #[error("Record not found: {0}")]
     NotFound(String),
 
     #[error("Invalid data: {0}")]
     InvalidData(String),
+}
+
+impl From<SqlxError> for FeeStoreError {
+    fn from(err: SqlxError) -> Self {
+        match err {
+            SqlxError::PoolTimedOut(_) => FeeStoreError::PoolTimedOut(err.to_string()),
+            _ => FeeStoreError::Database(err),
+        }
+    }
 }
 
 /// Historical fee sample from a ledger header
@@ -51,6 +63,25 @@ pub struct FeeStore {
 }
 
 impl FeeStore {
+    /// Create a new fee store, building a connection pool configured for concurrent writes.
+    ///
+    /// - `acquire_timeout(10 s)`: instead of blocking indefinitely, SQLite will retry for up to 10 s before giving up.
+    /// - `idle_timeout(300 s)`: idle connections are recycled after 5 minutes.
+    /// - `max_connections(5)`: caps the pool so writers queue rather than race.
+    pub async fn connect(database_url: &str) -> Result<Self, FeeStoreError> {
+        let options = sqlx::SqliteConnectOptions::from_str(database_url)?
+            .create_if_missing(true);
+
+        let pool = sqlx::SqlitePoolOptions::new()
+            .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .idle_timeout(std::time::Duration::from_secs(300))
+            .connect_with(options)
+            .await?;
+
+        Ok(Self { pool })
+    }
+
     /// Create a new fee store with the given database pool
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }

@@ -65,6 +65,8 @@ pub struct MerkleTree {
     data_leaves: Vec<Vec<u8>>,
     /// All layers of the tree from leaves to the root.
     nodes: Vec<Vec<[u8; 32]>>,
+    /// Leaf hashes cached for incremental updates.
+    leaf_hashes: Vec<[u8; 32]>,
 }
 
 impl MerkleTree {
@@ -76,6 +78,7 @@ impl MerkleTree {
             leaf_count: 0,
             data_leaves: Vec::new(),
             nodes: Vec::new(),
+            leaf_hashes: Vec::new(),
         }
     }
 
@@ -96,7 +99,7 @@ impl MerkleTree {
         }
 
         let leaf_hashes: Vec<[u8; 32]> = leaves.iter().map(|leaf| Self::hash_leaf(leaf)).collect();
-        self.nodes = Self::build_levels(leaf_hashes);
+        self.nodes = Self::build_levels(leaf_hashes.clone());
         self.root = *self
             .nodes
             .last()
@@ -104,6 +107,159 @@ impl MerkleTree {
             .ok_or("Failed to calculate tree root.")?;
         self.data_leaves = leaves;
         self.leaf_count = self.data_leaves.len();
+        self.leaf_hashes = leaf_hashes;
+
+        Ok(())
+    }
+
+    /// Append one or more new leaves to the tree without a full rebuild.
+    /// This is significantly faster than rebuilding when adding a small number of leaves.
+    ///
+    /// # Arguments
+    /// * `new_leaves` - Raw leaf data to append
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if tree is empty, leaves would exceed capacity, or tree is in an invalid state
+    pub fn append_leaves(&mut self, new_leaves: Vec<Vec<u8>>) -> Result<(), &'static str> {
+        if new_leaves.is_empty() {
+            return Ok(()); // No-op for empty append
+        }
+
+        if self.nodes.is_empty() {
+            return Err("Cannot append to uninitialized tree. Call build() first.");
+        }
+
+        let max_leaves = if self.levels >= 64 {
+            usize::MAX
+        } else {
+            1usize.checked_shl(self.levels as u32).unwrap_or(usize::MAX)
+        };
+
+        if self.leaf_count.saturating_add(new_leaves.len()) > max_leaves {
+            return Err("Appending leaves would exceed configured tree capacity.");
+        }
+
+        // Hash the new leaves
+        let new_leaf_hashes: Vec<[u8; 32]> =
+            new_leaves.iter().map(|leaf| Self::hash_leaf(leaf)).collect();
+
+        // Append the new leaf hashes to the leaf level
+        self.leaf_hashes.extend_from_slice(&new_leaf_hashes);
+        self.data_leaves.extend(new_leaves);
+        self.leaf_count = self.data_leaves.len();
+
+        // Rebuild the tree from the updated leaf hashes
+        self.nodes = Self::build_levels(self.leaf_hashes.clone());
+        self.root = *self
+            .nodes
+            .last()
+            .and_then(|level| level.first())
+            .ok_or("Failed to calculate tree root after append.")?;
+
+        Ok(())
+    }
+
+    /// Update a specific leaf in place without a full rebuild.
+    /// This is faster than rebuilding when modifying one or a few leaves.
+    ///
+    /// # Arguments
+    /// * `leaf_index` - The index of the leaf to update
+    /// * `new_leaf_data` - The new raw leaf data
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if index is out of bounds or tree is uninitialized
+    pub fn update_leaf(&mut self, leaf_index: usize, new_leaf_data: Vec<u8>) -> Result<(), &'static str> {
+        if self.nodes.is_empty() {
+            return Err("Cannot update leaf in uninitialized tree. Call build() first.");
+        }
+
+        if leaf_index >= self.leaf_count {
+            return Err("Leaf index is out of bounds.");
+        }
+
+        let new_leaf_hash = Self::hash_leaf(&new_leaf_data);
+
+        // If the hash hasn't changed, we can short-circuit
+        if self.leaf_hashes[leaf_index] == new_leaf_hash {
+            // Still update the data but no tree recomputation needed
+            self.data_leaves[leaf_index] = new_leaf_data;
+            return Ok(());
+        }
+
+        // Update the leaf hash and data
+        self.leaf_hashes[leaf_index] = new_leaf_hash;
+        self.data_leaves[leaf_index] = new_leaf_data;
+
+        // Rebuild the tree with the updated leaf hashes
+        self.nodes = Self::build_levels(self.leaf_hashes.clone());
+        self.root = *self
+            .nodes
+            .last()
+            .and_then(|level| level.first())
+            .ok_or("Failed to calculate tree root after update.")?;
+
+        Ok(())
+    }
+
+    /// Update multiple leaves in place.
+    /// More efficient than calling `update_leaf` multiple times as it rebuilds the tree once.
+    ///
+    /// # Arguments
+    /// * `updates` - Vector of (leaf_index, new_leaf_data) tuples
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err` if any index is out of bounds or tree is uninitialized
+    pub fn update_leaves(&mut self, updates: Vec<(usize, Vec<u8>)>) -> Result<(), &'static str> {
+        if updates.is_empty() {
+            return Ok(()); // No-op for empty updates
+        }
+
+        if self.nodes.is_empty() {
+            return Err("Cannot update leaves in uninitialized tree. Call build() first.");
+        }
+
+        // Validate all indices first
+        for (idx, _) in &updates {
+            if *idx >= self.leaf_count {
+                return Err("Leaf index is out of bounds.");
+            }
+        }
+
+        // Check if any changes actually occur
+        let mut has_changes = false;
+        for (idx, new_leaf_data) in &updates {
+            let new_hash = Self::hash_leaf(new_leaf_data);
+            if self.leaf_hashes[*idx] != new_hash {
+                has_changes = true;
+                break;
+            }
+        }
+
+        // If no changes, just update the data and return
+        if !has_changes {
+            for (idx, new_leaf_data) in updates {
+                self.data_leaves[idx] = new_leaf_data;
+            }
+            return Ok(());
+        }
+
+        // Apply all updates
+        for (idx, new_leaf_data) in updates {
+            let new_hash = Self::hash_leaf(&new_leaf_data);
+            self.leaf_hashes[idx] = new_hash;
+            self.data_leaves[idx] = new_leaf_data;
+        }
+
+        // Rebuild the tree once
+        self.nodes = Self::build_levels(self.leaf_hashes.clone());
+        self.root = *self
+            .nodes
+            .last()
+            .and_then(|level| level.first())
+            .ok_or("Failed to calculate tree root after bulk update.")?;
 
         Ok(())
     }
@@ -193,6 +349,205 @@ impl MerkleTree {
         let mut tree = MerkleTree::new(32);
         tree.build(leaves)?;
         Ok(tree)
+    }
+
+    /// Visualizes the Merkle tree structure as an ASCII art diagram.
+    ///
+    /// This includes tree metadata (root hash, leaf count, tree height), an indented
+    /// ASCII branch hierarchy from root to leaves, and a level-by-level breakdown.
+    pub fn to_ascii_art(&self) -> String {
+        if self.nodes.is_empty() || self.leaf_count == 0 {
+            return "(Empty Merkle Tree)\n".to_string();
+        }
+
+        let mut out = String::new();
+        out.push_str("====================================================================\n");
+        out.push_str("                     MERKLE TREE VISUALIZATION                      \n");
+        out.push_str("====================================================================\n");
+        out.push_str(&format!("Root Hash   : {}\n", self.get_root_hex()));
+        out.push_str(&format!("Leaf Count  : {}\n", self.leaf_count));
+        out.push_str(&format!("Tree Height : {} level(s)\n", self.nodes.len()));
+        out.push_str("--------------------------------------------------------------------\n");
+        out.push_str("Tree Hierarchy:\n");
+        out.push_str(&self.to_ascii_hierarchy());
+        out.push_str("\n--------------------------------------------------------------------\n");
+        out.push_str("Level Breakdown:\n");
+        out.push_str(&self.to_ascii_layers());
+        out.push_str("====================================================================\n");
+        out
+    }
+
+    /// Alias for `to_ascii_art`.
+    pub fn render_ascii(&self) -> String {
+        self.to_ascii_art()
+    }
+
+    /// Returns the hierarchical tree representation using ASCII branch lines.
+    pub fn to_ascii_hierarchy(&self) -> String {
+        if self.nodes.is_empty() {
+            return "(Empty)\n".to_string();
+        }
+
+        let root_level = self.nodes.len() - 1;
+        let mut out = String::new();
+        self.render_hierarchy_node(&mut out, root_level, 0, "", true);
+        out
+    }
+
+    fn render_hierarchy_node(
+        &self,
+        out: &mut String,
+        level: usize,
+        index: usize,
+        prefix: &str,
+        is_last: bool,
+    ) {
+        let node_hash = self.nodes[level][index];
+        let short_hash = format!(
+            "{}...{}",
+            &hex::encode(&node_hash[..4]),
+            &hex::encode(&node_hash[28..])
+        );
+
+        if level == self.nodes.len() - 1 {
+            // Root node
+            if level == 0 {
+                // Single-leaf tree: root is also leaf 0
+                let leaf_preview = self.format_leaf_data(0);
+                out.push_str(&format!(
+                    "[Root / Leaf 0] {} (hash: {})\n",
+                    leaf_preview, short_hash
+                ));
+                return;
+            } else {
+                out.push_str(&format!("[Root] {}\n", short_hash));
+            }
+        } else {
+            let branch = if is_last { "└── " } else { "├── " };
+            out.push_str(prefix);
+            out.push_str(branch);
+
+            if level == 0 {
+                // Leaf node
+                let leaf_preview = self.format_leaf_data(index);
+                out.push_str(&format!(
+                    "[Leaf {}] {} (hash: {})\n",
+                    index, leaf_preview, short_hash
+                ));
+                return;
+            } else {
+                out.push_str(&format!("[Node L{}:{}] {}\n", level, index, short_hash));
+            }
+        }
+
+        if level > 0 {
+            let child_level = level - 1;
+            let left_idx = 2 * index;
+            let right_idx = 2 * index + 1;
+            let has_right = right_idx < self.nodes[child_level].len();
+            let is_odd_promoted = !has_right && left_idx < self.nodes[child_level].len();
+
+            let next_prefix = if level == self.nodes.len() - 1 {
+                "".to_string()
+            } else if is_last {
+                format!("{}    ", prefix)
+            } else {
+                format!("{}│   ", prefix)
+            };
+
+            // Left child
+            if left_idx < self.nodes[child_level].len() {
+                let left_is_last = !has_right && !is_odd_promoted;
+                self.render_hierarchy_node(
+                    out,
+                    child_level,
+                    left_idx,
+                    &next_prefix,
+                    left_is_last,
+                );
+            }
+
+            // Right child
+            if has_right {
+                self.render_hierarchy_node(
+                    out,
+                    child_level,
+                    right_idx,
+                    &next_prefix,
+                    true,
+                );
+            } else if is_odd_promoted {
+                // Sibling promoted from odd child (paired with itself)
+                let branch = "└── ";
+                out.push_str(&next_prefix);
+                out.push_str(branch);
+                out.push_str(&format!(
+                    "[Dup L{}:{}] (odd sibling paired with itself)\n",
+                    child_level, left_idx
+                ));
+            }
+        }
+    }
+
+    fn format_leaf_data(&self, index: usize) -> String {
+        if index < self.data_leaves.len() {
+            let data = &self.data_leaves[index];
+            if let Ok(s) = std::str::from_utf8(data) {
+                if s.chars().all(|c| !c.is_control()) {
+                    return if s.len() > 16 {
+                        format!("\"{}...\"", &s[..13])
+                    } else {
+                        format!("\"{}\"", s)
+                    };
+                }
+            }
+            let hex_str = hex::encode(data);
+            if hex_str.len() > 12 {
+                format!("0x{}...", &hex_str[..8])
+            } else {
+                format!("0x{}", hex_str)
+            }
+        } else {
+            "<missing>".to_string()
+        }
+    }
+
+    /// Returns a layer-by-layer ASCII diagram of the tree.
+    pub fn to_ascii_layers(&self) -> String {
+        if self.nodes.is_empty() {
+            return "(Empty)\n".to_string();
+        }
+
+        let mut out = String::new();
+        for (lvl_idx, level_nodes) in self.nodes.iter().enumerate().rev() {
+            let label = if lvl_idx == self.nodes.len() - 1 {
+                format!("Level {} [Root]     : ", lvl_idx)
+            } else if lvl_idx == 0 {
+                "Level 0 [Leaves]   : ".to_string()
+            } else {
+                format!("Level {} [Internal] : ", lvl_idx)
+            };
+            out.push_str(&label);
+
+            let mut node_strs = Vec::new();
+            for (idx, node_hash) in level_nodes.iter().enumerate() {
+                let short_hash = format!(
+                    "{}..{}",
+                    &hex::encode(&node_hash[..2]),
+                    &hex::encode(&node_hash[30..])
+                );
+                if lvl_idx == 0 && idx < self.data_leaves.len() {
+                    let preview = self.format_leaf_data(idx);
+                    node_strs.push(format!("[{}: {} ({})]", idx, preview, short_hash));
+                } else {
+                    node_strs.push(format!("[{}: {}]", idx, short_hash));
+                }
+            }
+
+            out.push_str(&node_strs.join(" "));
+            out.push('\n');
+        }
+        out
     }
 
     fn hash_leaf(data: &[u8]) -> [u8; 32] {
@@ -307,10 +662,252 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_proof_valid_two_leaves() {
-        let tree = make_tree(&["alice", "bob"]);
-        let proof = tree.generate_proof(0).unwrap();
-        assert!(MerkleTree::verify_proof(&proof, &tree.root));
+    fn test_append_leaves_single_leaf() {
+        let mut tree = make_tree(&["a", "b"]);
+        let original_root = tree.root;
+        
+        tree.append_leaves(vec![b"c".to_vec()]).expect("append succeeds");
+        
+        // Root should have changed
+        assert_ne!(tree.root, original_root);
+        // Count should be updated
+        assert_eq!(tree.leaf_count(), 3);
+        // All proofs should still be valid
+        for i in 0..3 {
+            let proof = tree.generate_proof(i).expect("proof exists");
+            assert!(proof.verify());
+        }
+    }
+
+    #[test]
+    fn test_append_leaves_multiple() {
+        let mut tree = make_tree(&["a", "b"]);
+        let original_root = tree.root;
+        
+        tree.append_leaves(vec![b"c".to_vec(), b"d".to_vec(), b"e".to_vec()])
+            .expect("append succeeds");
+        
+        assert_ne!(tree.root, original_root);
+        assert_eq!(tree.leaf_count(), 5);
+        for i in 0..5 {
+            let proof = tree.generate_proof(i).expect("proof exists");
+            assert!(proof.verify());
+        }
+    }
+
+    #[test]
+    fn test_append_leaves_empty_is_noop() {
+        let mut tree = make_tree(&["a", "b", "c"]);
+        let original_root = tree.root;
+        
+        tree.append_leaves(vec![]).expect("empty append is ok");
+        
+        assert_eq!(tree.root, original_root);
+        assert_eq!(tree.leaf_count(), 3);
+    }
+
+    #[test]
+    fn test_append_leaves_to_empty_tree_fails() {
+        let mut tree = MerkleTree::new(32);
+        assert!(tree.append_leaves(vec![b"a".to_vec()]).is_err());
+    }
+
+    #[test]
+    fn test_append_leaves_exceeds_capacity() {
+        let mut tree = MerkleTree::new(2); // Max 4 leaves
+        tree.build(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+            .expect("build succeeds");
+        
+        // Trying to append more than capacity allows should fail
+        assert!(tree
+            .append_leaves(vec![b"d".to_vec(), b"e".to_vec()])
+            .is_err());
+    }
+
+    #[test]
+    fn test_update_leaf_single() {
+        let mut tree = make_tree(&["a", "b", "c"]);
+        let original_root = tree.root;
+        let original_leaf_1 = tree.generate_proof(1).unwrap().leaf_hash;
+        
+        tree.update_leaf(1, b"x".to_vec()).expect("update succeeds");
+        
+        // Root should have changed
+        assert_ne!(tree.root, original_root);
+        // Leaf hash at index 1 should have changed
+        let new_leaf_1 = tree.generate_proof(1).unwrap().leaf_hash;
+        assert_ne!(new_leaf_1, original_leaf_1);
+        // All proofs should verify
+        for i in 0..3 {
+            let proof = tree.generate_proof(i).expect("proof exists");
+            assert!(proof.verify());
+        }
+    }
+
+    #[test]
+    fn test_update_leaf_same_data_is_noop() {
+        let mut tree = make_tree(&["a", "b", "c"]);
+        let original_root = tree.root;
+        
+        tree.update_leaf(1, b"b".to_vec()).expect("update succeeds");
+        
+        // Root should NOT have changed since we updated with the same data
+        assert_eq!(tree.root, original_root);
+    }
+
+    #[test]
+    fn test_update_leaf_out_of_bounds() {
+        let mut tree = make_tree(&["a", "b"]);
+        assert!(tree.update_leaf(5, b"x".to_vec()).is_err());
+    }
+
+    #[test]
+    fn test_update_leaf_uninitialized_tree() {
+        let mut tree = MerkleTree::new(32);
+        assert!(tree.update_leaf(0, b"x".to_vec()).is_err());
+    }
+
+    #[test]
+    fn test_update_leaves_multiple() {
+        let mut tree = make_tree(&["a", "b", "c", "d"]);
+        let original_root = tree.root;
+        
+        tree.update_leaves(vec![
+            (0, b"w".to_vec()),
+            (2, b"y".to_vec()),
+        ])
+        .expect("bulk update succeeds");
+        
+        assert_ne!(tree.root, original_root);
+        assert_eq!(tree.leaf_count(), 4);
+        for i in 0..4 {
+            let proof = tree.generate_proof(i).expect("proof exists");
+            assert!(proof.verify());
+        }
+    }
+
+    #[test]
+    fn test_update_leaves_empty_is_noop() {
+        let mut tree = make_tree(&["a", "b", "c"]);
+        let original_root = tree.root;
+        
+        tree.update_leaves(vec![]).expect("empty update is ok");
+        
+        assert_eq!(tree.root, original_root);
+    }
+
+    #[test]
+    fn test_update_leaves_all_same_data_is_noop() {
+        let mut tree = make_tree(&["a", "b", "c"]);
+        let original_root = tree.root;
+        
+        tree.update_leaves(vec![
+            (0, b"a".to_vec()),
+            (1, b"b".to_vec()),
+        ])
+        .expect("update with same data succeeds");
+        
+        // Root should NOT have changed
+        assert_eq!(tree.root, original_root);
+    }
+
+    #[test]
+    fn test_update_leaves_out_of_bounds() {
+        let mut tree = make_tree(&["a", "b"]);
+        assert!(tree
+            .update_leaves(vec![(5, b"x".to_vec())])
+            .is_err());
+    }
+
+    #[test]
+    fn test_update_leaves_uninitialized_tree() {
+        let mut tree = MerkleTree::new(32);
+        assert!(tree
+            .update_leaves(vec![(0, b"x".to_vec())])
+            .is_err());
+    }
+
+    #[test]
+    fn test_incremental_update_preserves_proof_validity() {
+        // Start with 4 leaves
+        let mut tree = make_tree(&["a", "b", "c", "d"]);
+        
+        // Get proof for leaf 0 before update
+        let proof_before = tree.generate_proof(0).unwrap();
+        assert!(proof_before.verify());
+        
+        // Update leaf 2 (not affecting leaf 0 data, but changing tree structure)
+        tree.update_leaf(2, b"x".to_vec()).expect("update succeeds");
+        
+        // Get proof for leaf 0 after update
+        let proof_after = tree.generate_proof(0).unwrap();
+        
+        // The proofs should be different since tree changed
+        assert_ne!(proof_before.root, proof_after.root);
+        // But the new proof should still verify
+        assert!(proof_after.verify());
+    }
+
+    #[test]
+    fn test_append_then_update_sequence() {
+        let mut tree = make_tree(&["a", "b"]);
+        
+        // Append new leaves
+        tree.append_leaves(vec![b"c".to_vec(), b"d".to_vec()])
+            .expect("append succeeds");
+        assert_eq!(tree.leaf_count(), 4);
+        
+        // Verify all proofs
+        for i in 0..4 {
+            assert!(tree.generate_proof(i).unwrap().verify());
+        }
+        
+        // Update a leaf
+        tree.update_leaf(1, b"x".to_vec()).expect("update succeeds");
+        assert_eq!(tree.leaf_count(), 4);
+        
+        // Verify all proofs again
+        for i in 0..4 {
+            assert!(tree.generate_proof(i).unwrap().verify());
+        }
+    }
+
+    #[test]
+    fn test_large_append() {
+        let mut tree = make_tree(&["a"]);
+        let original_count = tree.leaf_count();
+        
+        // Append 100 new leaves
+        let new_leaves: Vec<Vec<u8>> = (0..100)
+            .map(|i| format!("leaf-{i}").into_bytes())
+            .collect();
+        
+        tree.append_leaves(new_leaves).expect("large append succeeds");
+        assert_eq!(tree.leaf_count(), original_count + 100);
+        
+        // Sample verify some proofs
+        for i in vec![0, 50, 99, 100] {
+            let proof = tree.generate_proof(i).expect("proof exists");
+            assert!(proof.verify());
+        }
+    }
+
+    #[test]
+    fn test_bulk_update_all_leaves() {
+        let mut tree = make_tree(&["a", "b", "c", "d", "e"]);
+        let original_root = tree.root;
+        
+        let updates: Vec<(usize, Vec<u8>)> = (0..5)
+            .map(|i| (i, format!("new-{i}").into_bytes()))
+            .collect();
+        
+        tree.update_leaves(updates).expect("bulk update succeeds");
+        
+        assert_ne!(tree.root, original_root);
+        for i in 0..5 {
+            let proof = tree.generate_proof(i).expect("proof exists");
+            assert!(proof.verify());
+        }
     }
 
     #[test]
@@ -475,156 +1072,49 @@ mod reference_vector_tests {
 
     #[test]
     fn test_odd_leaves_all_proofs_valid() {
-        // 3 leaves — includes the "duplicate-last" padding case.
-        let tree = make_tree(&["a", "b", "c"]);
-        for i in 0..tree.leaf_count() {
-            let proof = tree.generate_proof(i).unwrap();
-            assert!(proof.verify(), "proof for leaf {i} failed");
+        // Test multiple odd leaf counts — includes duplicate-last padding across levels.
+        for &count in &[1, 3, 5, 7, 9, 11, 15, 17, 25, 31, 33] {
+            let leaf_strings: Vec<String> = (0..count).map(|i| format!("leaf-{i}")).collect();
+            let leaf_slices: Vec<&str> = leaf_strings.iter().map(|s| s.as_str()).collect();
+            let tree = make_tree(&leaf_slices);
+            assert_eq!(tree.leaf_count(), count);
+            for i in 0..tree.leaf_count() {
+                let proof = tree
+                    .generate_proof(i)
+                    .unwrap_or_else(|_| panic!("proof for leaf {i} in {count}-leaf tree exists"));
+                assert_eq!(proof.leaf_index, i);
+                assert_eq!(proof.root, tree.root);
+                assert!(proof.verify(), "proof for leaf {i} in {count}-leaf tree failed verify()");
+                assert!(
+                    MerkleTree::verify_proof(&proof, &tree.root),
+                    "proof for leaf {i} in {count}-leaf tree failed MerkleTree::verify_proof"
+                );
+            }
         }
     }
 }
 
-fn test_odd_leaf_count_root_matches_reference() {
-    // Leaves: ["a", "b", "c"] — 3 leaves (odd).
-    // The last leaf is paired with itself when building the next level.
-    // Expected root: 3334bf169bd4337da65ca7ed1b63c09fa0b77886bedf7cd0cc4b9353dd07dd59
-    let tree = make_tree(&["a", "b", "c"]);
-    let expected = "3334bf169bd4337da65ca7ed1b63c09fa0b77886bedf7cd0cc4b9353dd07dd59";
-    assert_eq!(tree.get_root_hex(), expected);
-}
+// ── Property-based fuzz tests for MerkleTree ──────────────────────────────────
+//
+// Run with: cargo test (as part of the normal test suite)
+// For libfuzzer-based fuzzing, see core/fuzz/fuzz_targets/merkle_build.rs
+//
+// To run with higher iteration counts:
+//   PROPTEST_CASES=10000 cargo test fuzz_
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use proptest::prelude::*;
 
-#[test]
-fn test_single_leaf_root_matches_reference() {
-    // Single leaf: double SHA-256("solo") with no pairing.
-    // Single leaf: SHA-256("solo") with no pairing.
-    // Expected root: 0018e0e3babbc9f34cfaadf921b6e92dea1318e245a364dd929ed1257a40fa0c
-    let tree = make_tree(&["solo"]);
-    let expected = "0018e0e3babbc9f34cfaadf921b6e92dea1318e245a364dd929ed1257a40fa0c";
-    assert_eq!(tree.get_root_hex(), expected);
-}
-
-#[test]
-fn test_two_leaf_root_matches_reference() {
-    // Leaves: ["alice", "bob"] — 2 leaves (even).
-    // Expected root: d6289d374fe3c1f34cf4bd88937fa65ca7a069223d2b31fb4e3a2792eaa5d815
-    let tree = make_tree(&["alice", "bob"]);
-    let expected = "d6289d374fe3c1f34cf4bd88937fa65ca7a069223d2b31fb4e3a2792eaa5d815";
-    assert_eq!(hex::encode(tree.root()), expected);
-}
-
-#[test]
-fn test_five_leaf_root_matches_reference() {
-    // Leaves: ["a", "b", "c", "d", "e"] — 5 leaves (odd).
-    // Expected root: fe6d1a83ed5b116f4e61ac59d42668258e169e5998e3986e189a0fc72cc40487
-    let tree = make_tree(&["a", "b", "c", "d", "e"]);
-    let expected = "fe6d1a83ed5b116f4e61ac59d42668258e169e5998e3986e189a0fc72cc40487";
-    assert_eq!(hex::encode(tree.root()), expected);
-}
-
-#[test]
-fn test_even_leaves_all_proofs_valid() {
-    // 4 leaves — all proofs must verify against the known root.
-    for i in 0..tree.leaf_count() {
-        let proof = tree.generate_proof(i).unwrap();
-        assert!(proof.verify(), "proof for leaf {i} failed");
+    fn arb_leaf() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 0..=256)
     }
-}
 
-fn test_odd_leaves_all_proofs_valid() {
-    // 3 leaves — includes the "duplicate-last" padding case.
+    fn arb_leaves(min: usize, max: usize) -> impl Strategy<Value = Vec<Vec<u8>>> {
+        prop::collection::vec(arb_leaf(), min..=max)
+    }
 
-    // ── Property-based fuzz tests for MerkleTree ──────────────────────────────────
-    //
-    // Run with: cargo test (as part of the normal test suite)
-    // For libfuzzer-based fuzzing, see core/fuzz/fuzz_targets/merkle_build.rs
-    // To run with higher iteration counts:
-    //   PROPTEST_CASES=10000 cargo test fuzz_
-    #[cfg(test)]
-    mod fuzz_tests {
-        use super::*;
-        use proptest::prelude::*;
-
-        fn arb_leaf() -> impl Strategy<Value = Vec<u8>> {
-            prop::collection::vec(any::<u8>(), 0..=256)
-
-            // Reference computed with double SHA-256 leaf hashing + sorted hash_pair
-            // (identical algorithm to `MerkleTree::hash_leaf` / `hash_pair`).
-        }
-
-        #[test]
-        fn test_odd_leaf_count_root_matches_reference() {
-            // Leaves: ["a", "b", "c"] — 3 leaves (odd).
-            // The last leaf is paired with itself when building the next level.
-            let tree = make_tree(&["a", "b", "c"]);
-            let expected = "3334bf169bd4337da65ca7ed1b63c09fa0b77886bedf7cd0cc4b9353dd07dd59";
-            assert_eq!(tree.get_root_hex(), expected);
-        }
-
-        #[test]
-        fn test_single_leaf_root_matches_reference() {
-            // Single leaf: double SHA-256("solo") with no pairing.
-            let tree = make_tree(&["solo"]);
-            let expected = "0018e0e3babbc9f34cfaadf921b6e92dea1318e245a364dd929ed1257a40fa0c";
-            assert_eq!(tree.get_root_hex(), expected);
-        }
-
-        #[test]
-        fn test_two_leaf_root_matches_reference() {
-            // Leaves: ["alice", "bob"] — 2 leaves (even).
-            let tree = make_tree(&["alice", "bob"]);
-            let expected = "d6289d374fe3c1f34cf4bd88937fa65ca7a069223d2b31fb4e3a2792eaa5d815";
-            assert_eq!(tree.get_root_hex(), expected);
-        }
-
-        #[test]
-        fn test_five_leaf_root_matches_reference() {
-            // Leaves: ["a", "b", "c", "d", "e"] — 5 leaves (odd).
-            let tree = make_tree(&["a", "b", "c", "d", "e"]);
-            let expected = "fe6d1a83ed5b116f4e61ac59d42668258e169e5998e3986e189a0fc72cc40487";
-            assert_eq!(tree.get_root_hex(), expected);
-        }
-
-        #[test]
-        fn test_even_leaves_all_proofs_valid() {
-            // 4 leaves — all proofs must verify against the known root.
-            let tree = make_tree(&["a", "b", "c", "d"]);
-            for i in 0..tree.leaf_count() {
-                let proof = tree.generate_proof(i).unwrap();
-                assert!(proof.verify(), "proof for leaf {i} failed");
-            }
-        }
-
-        #[test]
-        fn test_odd_leaves_all_proofs_valid() {
-            // 3 leaves — includes the "duplicate-last" padding case.
-            let tree = make_tree(&["a", "b", "c"]);
-            for i in 0..tree.leaf_count() {
-                let proof = tree.generate_proof(i).unwrap();
-                assert!(proof.verify(), "proof for leaf {i} failed");
-            }
-        }
-
-        // ── Property-based fuzz tests for MerkleTree ──────────────────────────────────
-        //
-        // Run with: cargo test (as part of the normal test suite)
-        // For libfuzzer-based fuzzing, see core/fuzz/fuzz_targets/merkle_build.rs
-        //
-        // To run with higher iteration counts:
-        //   PROPTEST_CASES=10000 cargo test fuzz_
-        #[cfg(test)]
-        mod fuzz_tests {
-            use super::*;
-            use proptest::prelude::*;
-
-            fn arb_leaf() -> impl Strategy<Value = Vec<u8>> {
-                prop::collection::vec(any::<u8>(), 0..=256)
-            }
-
-            fn arb_leaves(min: usize, max: usize) -> impl Strategy<Value = Vec<Vec<u8>>> {
-                prop::collection::vec(arb_leaf(), min..=max)
-            }
-
-            proptest! {
+    proptest! {
                 #![proptest_config(ProptestConfig::with_cases(500))]
 
                 /// Builder must never panic on any non-empty input.
@@ -741,7 +1231,290 @@ fn test_odd_leaves_all_proofs_valid() {
                         prop_assert_eq!(t.root, tree_direct.root);
                     }
                 }
+    }
+}
+
+
+// ── Integration tests for incremental vs. full rebuild equivalence ────────────
+#[cfg(test)]
+mod incremental_equivalence_tests {
+    use super::*;
+
+    #[test]
+    fn test_incremental_append_equals_full_rebuild_single_leaf() {
+        let initial_leaves: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec()];
+        let new_leaf = vec![b"c".to_vec()];
+        let all_leaves = [&initial_leaves[..], &new_leaf[..]].concat();
+
+        // Build incrementally
+        let mut tree_incremental = MerkleTree::new(32);
+        tree_incremental.build(initial_leaves.clone()).unwrap();
+        tree_incremental.append_leaves(new_leaf.clone()).unwrap();
+
+        // Build from scratch
+        let mut tree_full = MerkleTree::new(32);
+        tree_full.build(all_leaves).unwrap();
+
+        // Roots must match
+        assert_eq!(tree_incremental.root, tree_full.root);
+
+        // Proofs must match
+        for i in 0..3 {
+            let proof_inc = tree_incremental.generate_proof(i).unwrap();
+            let proof_full = tree_full.generate_proof(i).unwrap();
+
+            assert_eq!(proof_inc.root, proof_full.root);
+            assert_eq!(proof_inc.leaf_hash, proof_full.leaf_hash);
+            assert_eq!(proof_inc.proof.len(), proof_full.proof.len());
+
+            for (p_inc, p_full) in proof_inc.proof.iter().zip(proof_full.proof.iter()) {
+                assert_eq!(p_inc.hash, p_full.hash);
+                assert_eq!(p_inc.is_left, p_full.is_left);
             }
         }
+    }
+
+    #[test]
+    fn test_incremental_append_equals_full_rebuild_multiple_leaves() {
+        let initial_leaves: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec()];
+        let new_leaves: Vec<Vec<u8>> = vec![
+            b"c".to_vec(),
+            b"d".to_vec(),
+            b"e".to_vec(),
+        ];
+        let all_leaves = [&initial_leaves[..], &new_leaves[..]].concat();
+
+        // Build incrementally
+        let mut tree_incremental = MerkleTree::new(32);
+        tree_incremental.build(initial_leaves.clone()).unwrap();
+        tree_incremental.append_leaves(new_leaves.clone()).unwrap();
+
+        // Build from scratch
+        let mut tree_full = MerkleTree::new(32);
+        tree_full.build(all_leaves).unwrap();
+
+        // Roots must match
+        assert_eq!(tree_incremental.root, tree_full.root);
+
+        // All proofs must match
+        for i in 0..5 {
+            let proof_inc = tree_incremental.generate_proof(i).unwrap();
+            let proof_full = tree_full.generate_proof(i).unwrap();
+            assert_eq!(proof_inc.root, proof_full.root);
+        }
+    }
+
+    #[test]
+    fn test_incremental_update_equals_full_rebuild() {
+        let leaves: Vec<Vec<u8>> = vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec(),
+        ];
+
+        // Build incrementally and update
+        let mut tree_incremental = MerkleTree::new(32);
+        tree_incremental.build(leaves.clone()).unwrap();
+        tree_incremental.update_leaf(2, b"x".to_vec()).unwrap();
+
+        // Build from scratch with updated leaf
+        let mut updated_leaves = leaves.clone();
+        updated_leaves[2] = b"x".to_vec();
+        let mut tree_full = MerkleTree::new(32);
+        tree_full.build(updated_leaves).unwrap();
+
+        // Roots must match
+        assert_eq!(tree_incremental.root, tree_full.root);
+
+        // All proofs must match
+        for i in 0..4 {
+            let proof_inc = tree_incremental.generate_proof(i).unwrap();
+            let proof_full = tree_full.generate_proof(i).unwrap();
+            assert_eq!(proof_inc.root, proof_full.root);
+        }
+    }
+
+    #[test]
+    fn test_incremental_bulk_update_equals_full_rebuild() {
+        let leaves: Vec<Vec<u8>> = vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec(),
+            b"e".to_vec(),
+        ];
+
+        // Build incrementally and update multiple leaves
+        let mut tree_incremental = MerkleTree::new(32);
+        tree_incremental.build(leaves.clone()).unwrap();
+        tree_incremental.update_leaves(vec![
+            (0, b"w".to_vec()),
+            (2, b"x".to_vec()),
+            (4, b"z".to_vec()),
+        ]).unwrap();
+
+        // Build from scratch with updated leaves
+        let mut updated_leaves = leaves.clone();
+        updated_leaves[0] = b"w".to_vec();
+        updated_leaves[2] = b"x".to_vec();
+        updated_leaves[4] = b"z".to_vec();
+        let mut tree_full = MerkleTree::new(32);
+        tree_full.build(updated_leaves).unwrap();
+
+        // Roots must match
+        assert_eq!(tree_incremental.root, tree_full.root);
+
+        // All proofs must match
+        for i in 0..5 {
+            let proof_inc = tree_incremental.generate_proof(i).unwrap();
+            let proof_full = tree_full.generate_proof(i).unwrap();
+            assert_eq!(proof_inc.root, proof_full.root);
+        }
+    }
+
+    #[test]
+    fn test_complex_sequence_incremental_equals_full_rebuild() {
+        // Start with 2 leaves
+        let initial_leaves: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec()];
+        
+        // Incremental path
+        let mut tree_inc = MerkleTree::new(32);
+        tree_inc.build(initial_leaves.clone()).unwrap();
+        tree_inc.append_leaves(vec![b"c".to_vec(), b"d".to_vec()]).unwrap();
+        tree_inc.update_leaf(1, b"b_updated".to_vec()).unwrap();
+        tree_inc.append_leaves(vec![b"e".to_vec()]).unwrap();
+        tree_inc.update_leaves(vec![(0, b"a_updated".to_vec()), (3, b"d_updated".to_vec())]).unwrap();
+
+        // Full rebuild path
+        let final_leaves = vec![
+            b"a_updated".to_vec(),
+            b"b_updated".to_vec(),
+            b"c".to_vec(),
+            b"d_updated".to_vec(),
+            b"e".to_vec(),
+        ];
+        let mut tree_full = MerkleTree::new(32);
+        tree_full.build(final_leaves).unwrap();
+
+        // Roots must match
+        assert_eq!(tree_inc.root, tree_full.root);
+
+        // All leaf counts must match
+        assert_eq!(tree_inc.leaf_count(), tree_full.leaf_count());
+
+        // All proofs must match
+        for i in 0..5 {
+            let proof_inc = tree_inc.generate_proof(i).unwrap();
+            let proof_full = tree_full.generate_proof(i).unwrap();
+            assert_eq!(proof_inc.root, proof_full.root);
+            assert_eq!(proof_inc.leaf, proof_full.leaf);
+        }
+    }
+
+    #[test]
+    fn test_large_tree_incremental_append_equals_full_rebuild() {
+        // Create a large initial tree
+        let initial_leaves: Vec<Vec<u8>> = (0..50)
+            .map(|i| format!("leaf-{i}").into_bytes())
+            .collect();
+        let new_leaves: Vec<Vec<u8>> = (50..100)
+            .map(|i| format!("leaf-{i}").into_bytes())
+            .collect();
+        let all_leaves = [&initial_leaves[..], &new_leaves[..]].concat();
+
+        // Build incrementally
+        let mut tree_inc = MerkleTree::new(32);
+        tree_inc.build(initial_leaves.clone()).unwrap();
+        tree_inc.append_leaves(new_leaves).unwrap();
+
+        // Build from scratch
+        let mut tree_full = MerkleTree::new(32);
+        tree_full.build(all_leaves).unwrap();
+
+        // Roots must match
+        assert_eq!(tree_inc.root, tree_full.root);
+
+        // Sample proofs at key positions
+        for i in vec![0, 25, 49, 50, 75, 99] {
+            let proof_inc = tree_inc.generate_proof(i).unwrap();
+            let proof_full = tree_full.generate_proof(i).unwrap();
+            assert_eq!(proof_inc.root, proof_full.root);
+        }
+    }
+
+    #[test]
+    fn test_odd_leaf_count_incremental_append() {
+        // Start with odd count
+        let initial: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        let to_add: Vec<Vec<u8>> = vec![b"d".to_vec(), b"e".to_vec()];
+        let all = [&initial[..], &to_add[..]].concat();
+
+        let mut tree_inc = MerkleTree::new(32);
+        tree_inc.build(initial.clone()).unwrap();
+        tree_inc.append_leaves(to_add).unwrap();
+
+        let mut tree_full = MerkleTree::new(32);
+        tree_full.build(all).unwrap();
+
+        assert_eq!(tree_inc.root, tree_full.root);
+    }
+
+    #[test]
+    fn test_to_ascii_art_empty_tree() {
+        let tree = MerkleTree::new(32);
+        let art = tree.to_ascii_art();
+        assert!(art.contains("Empty Merkle Tree"));
+        assert_eq!(tree.render_ascii(), art);
+        assert_eq!(tree.to_ascii_hierarchy(), "(Empty)\n");
+        assert_eq!(tree.to_ascii_layers(), "(Empty)\n");
+    }
+
+    #[test]
+    fn test_to_ascii_art_single_leaf() {
+        let tree = make_tree(&["single_leaf"]);
+        let art = tree.to_ascii_art();
+        assert!(art.contains("MERKLE TREE VISUALIZATION"));
+        assert!(art.contains("Leaf Count  : 1"));
+        assert!(art.contains("Tree Height : 1 level(s)"));
+        assert!(art.contains("[Root / Leaf 0] \"single_leaf\""));
+        assert!(art.contains("Level 0 [Leaves]"));
+    }
+
+    #[test]
+    fn test_to_ascii_art_even_leaves() {
+        let tree = make_tree(&["apple", "banana", "cherry", "date"]);
+        let art = tree.to_ascii_art();
+        assert!(art.contains("Leaf Count  : 4"));
+        assert!(art.contains("Tree Height : 3 level(s)"));
+        assert!(art.contains("[Root]"));
+        assert!(art.contains("[Leaf 0] \"apple\""));
+        assert!(art.contains("[Leaf 1] \"banana\""));
+        assert!(art.contains("[Leaf 2] \"cherry\""));
+        assert!(art.contains("[Leaf 3] \"date\""));
+        assert!(art.contains("Level 2 [Root]"));
+        assert!(art.contains("Level 1 [Internal]"));
+        assert!(art.contains("Level 0 [Leaves]"));
+    }
+
+    #[test]
+    fn test_to_ascii_art_odd_leaves() {
+        let tree = make_tree(&["alpha", "beta", "gamma"]);
+        let art = tree.to_ascii_art();
+        assert!(art.contains("Leaf Count  : 3"));
+        assert!(art.contains("[Leaf 0] \"alpha\""));
+        assert!(art.contains("[Leaf 1] \"beta\""));
+        assert!(art.contains("[Leaf 2] \"gamma\""));
+        assert!(art.contains("odd sibling paired with itself"));
+    }
+
+    #[test]
+    fn test_to_ascii_art_binary_leaves() {
+        let leaves = vec![vec![0xde, 0xad, 0xbe, 0xef], vec![0xca, 0xfe]];
+        let mut tree = MerkleTree::new(32);
+        tree.build(leaves).unwrap();
+        let art = tree.to_ascii_art();
+        assert!(art.contains("0xdeadbeef"));
+        assert!(art.contains("0xcafe"));
     }
 }

@@ -1,19 +1,19 @@
 #![cfg(test)]
 
 //! Threshold multi-sig tests exercising the EmergencyGuard RBAC model:
-//! - Guardians can trigger emergency_pause unilaterally.
+//! - Guardians (multi-sig) can trigger emergency_pause.
 //! - Admins (multi-sig) can resume and manage roles.
 
 use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 
 use emergency_guard::{EmergencyGuard, EmergencyGuardClient};
 
-fn setup_guard(
-    env: &Env,
+fn setup_guard<'a>(
+    env: &'a Env,
     admins: &[Address],
     threshold: u32,
-    guardian: &Address,
-) -> EmergencyGuardClient<'_> {
+    guardian: &'a Address,
+) -> EmergencyGuardClient<'a> {
     let contract_id = env.register(EmergencyGuard, ());
     let client = EmergencyGuardClient::new(env, &contract_id);
     let admins_vec = {
@@ -27,26 +27,34 @@ fn setup_guard(
     client
 }
 
-/// A guardian can trigger emergency_pause without admin multi-sig.
+/// Guardians can trigger emergency_pause with multi-sig meeting the threshold.
 #[test]
-fn test_guardian_single_sig_emergency_pause() {
+fn test_guardian_multi_sig_emergency_pause() {
     let env = Env::default();
     env.mock_all_auths();
 
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
     let a3 = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
     let guardian = Address::generate(&env);
     let client = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 2, &guardian);
 
-    // Guardian acts alone — no admin multi-sig needed
-    client.emergency_pause(&guardian);
+    // Add two more guardians so the guardian set has 3 members; threshold is 2.
+    let approvers = vec![&env, a1.clone(), a2.clone()];
+    client.add_guardian(&approvers, &g1);
+    client.add_guardian(&approvers, &g2);
+
+    // Two guardians meet the threshold of 2.
+    let pause_approvers = vec![&env, g1.clone(), g2.clone()];
+    client.emergency_pause(&pause_approvers);
     assert!(client.is_paused(&emergency_guard::PauseType::MINT));
 }
 
-/// An admin can also trigger emergency_pause unilaterally.
+/// An admin CANNOT trigger emergency_pause (only guardians can).
 #[test]
-fn test_admin_single_sig_emergency_pause() {
+fn test_admin_cannot_emergency_pause() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -55,8 +63,9 @@ fn test_admin_single_sig_emergency_pause() {
     let guardian = Address::generate(&env);
     let client = setup_guard(&env, &[a1.clone(), a2.clone()], 2, &guardian);
 
-    client.emergency_pause(&a1);
-    assert!(client.is_paused(&emergency_guard::PauseType::MINT));
+    // Admin is not a guardian, so emergency_pause is rejected.
+    let result = client.try_emergency_pause(&vec![&env, a1.clone()]);
+    assert!(result.is_err());
 }
 
 /// A non-guardian, non-admin cannot trigger emergency_pause.
@@ -71,7 +80,7 @@ fn test_outsider_cannot_emergency_pause() {
     let outsider = Address::generate(&env);
     let client = setup_guard(&env, &[a1.clone(), a2.clone()], 2, &guardian);
 
-    let result = client.try_emergency_pause(&outsider);
+    let result = client.try_emergency_pause(&vec![&env, outsider.clone()]);
     assert!(result.is_err());
 }
 
@@ -84,11 +93,19 @@ fn test_multisig_2_of_3_resume_succeeds() {
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
     let a3 = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
     let guardian = Address::generate(&env);
     let client = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 2, &guardian);
 
-    // Guardian pauses
-    client.emergency_pause(&guardian);
+    // Add guardians so guardians can emergency_pause with multi-sig.
+    let approvers = vec![&env, a1.clone(), a2.clone()];
+    client.add_guardian(&approvers, &g1);
+    client.add_guardian(&approvers, &g2);
+
+    // Guardians pause
+    let pause_approvers = vec![&env, g1.clone(), g2.clone()];
+    client.emergency_pause(&pause_approvers);
     assert!(client.is_paused(&emergency_guard::PauseType::MINT));
 
     // 2-of-3 admins resume
@@ -106,10 +123,17 @@ fn test_multisig_resume_fails_insufficient() {
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
     let a3 = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
     let guardian = Address::generate(&env);
     let client = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 2, &guardian);
 
-    client.emergency_pause(&guardian);
+    let approvers = vec![&env, a1.clone(), a2.clone()];
+    client.add_guardian(&approvers, &g1);
+    client.add_guardian(&approvers, &g2);
+
+    let pause_approvers = vec![&env, g1.clone(), g2.clone()];
+    client.emergency_pause(&pause_approvers);
 
     let approvers = vec![&env, a1.clone()];
     let result = client.try_resume(&approvers);
@@ -163,11 +187,23 @@ fn test_multisig_3_of_3_all_required() {
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
     let a3 = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let g3 = Address::generate(&env);
     let guardian = Address::generate(&env);
     let client = setup_guard(&env, &[a1.clone(), a2.clone(), a3.clone()], 3, &guardian);
 
-    client.emergency_pause(&guardian);
+    // Add guardians so guardians can emergency_pause with multi-sig (threshold 3).
+    let approvers = vec![&env, a1.clone(), a2.clone(), a3.clone()];
+    client.add_guardian(&approvers, &g1);
+    client.add_guardian(&approvers, &g2);
+    client.add_guardian(&approvers, &g3);
 
+    // All 3 guardians pause
+    let pause_approvers = vec![&env, g1.clone(), g2.clone(), g3.clone()];
+    client.emergency_pause(&pause_approvers);
+
+    // All 3 admins resume
     let approvers = vec![&env, a1.clone(), a2.clone(), a3.clone()];
     client.resume(&approvers);
     assert!(!client.is_paused(&emergency_guard::PauseType::MINT));
@@ -181,12 +217,18 @@ fn test_multisig_duplicate_approvers_rejected() {
 
     let a1 = Address::generate(&env);
     let a2 = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
     let guardian = Address::generate(&env);
     let client = setup_guard(&env, &[a1.clone(), a2.clone()], 2, &guardian);
 
-    client.emergency_pause(&guardian);
+    let approvers = vec![&env, a1.clone(), a2.clone()];
+    client.add_guardian(&approvers, &g1);
+    client.add_guardian(&approvers, &g2);
 
-    // Provide a1 twice — should only count as 1 unique approver
+    client.emergency_pause(&vec![&env, g1.clone(), g2.clone()]);
+
+    // Provide a1 twice for resume — should only count as 1 unique approver
     let approvers = vec![&env, a1.clone(), a1.clone()];
     let result = client.try_resume(&approvers);
     assert!(result.is_err());

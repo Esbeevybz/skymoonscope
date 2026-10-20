@@ -10,8 +10,8 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [dependencies]
-soroban-sdk = { version = "22.0.0", features = ["testutils"] }
-soroban-env-host = { version = "22", features = ["testutils"] }
+soroban-sdk = { version = "22.0.0" }
+soroban-env-host = { version = "22" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 serde = { version = "1.0", features = ["derive"] }
@@ -58,6 +58,7 @@ rayon = "1.8"
 # and RAM utilisation for the local process. Default features include
 # everything we need: `system`, `process`, and the CPU usage diff.
 sysinfo = "0.32"
+nanoid = "0.4"
 # gRPC event streaming (Issue #583)
 #
 # The `tls` feature pulls in rustls so the gRPC server can terminate TLS and

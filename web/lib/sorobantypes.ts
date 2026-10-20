@@ -55,6 +55,12 @@ export interface InvocationResult {
   error?: string;
   /** Error type from backend (e.g., BAD_REQUEST, INTERNAL_SERVER_ERROR) */
   errorType?: string;
+  /**
+   * The original `.wasm` filename that was uploaded for this invocation.
+   * Stored alongside the result so the UI can display it after a page refresh,
+   * when the in-memory `File` object is no longer available.
+   */
+  wasmFileName?: string;
   /** Primary `/analyze` response payload for the latest invocation. */
   analysisReport?: ResourceReport;
   /** Backward-compatible alias for older stored history entries. */
@@ -136,6 +142,7 @@ export interface ResourceReport extends SorobanResources {
   ttl_analysis: TtlAnalysisApiReport | null;
   nutrition: NutritionReport;
   call_graph: CallGraph | null;
+  max_call_depth: number | null;
   call_graph_mermaid: string | null;
   state_snapshot: SimulationStateSnapshot | null;
   protocol_version: number;
@@ -242,6 +249,7 @@ export interface FeeBumpOption {
   feeStroops: number;
   feeXlm: string;
   description: string;
+  estimatedTime?: string;
 }
 
 export interface FeeEstimate {
@@ -251,11 +259,18 @@ export interface FeeEstimate {
   totalFeeXlm: string;
   feeBumps: FeeBumpOption[];
   networkFees: {
-    low: number;
-    medium: number;
-    high: number;
+    economy: number;
+    standard: number;
+    fast: number;
   };
   surgeMultiplier: number;
 }
 
-export type FeeBumpLevel = 'low' | 'medium' | 'high';
+export type FeeBumpLevel = 'economy' | 'standard' | 'fast';
+
+export interface NetworkFeeComparison {
+  testnet: FeeEstimate;
+  mainnet: FeeEstimate;
+  percentageDifference: number;
+  testnetHigher: boolean;
+}

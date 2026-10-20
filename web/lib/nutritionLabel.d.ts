@@ -43,3 +43,23 @@ export function buildMetrics(
 export function overallPercent(metrics: NutritionMetric[]): number;
 export function formatValue(value: number): string;
 export function formatPercent(percent: number): string;
+
+/**
+ * Clamp every resource field in `resources` to ≥ 0.
+ *
+ * Use this before passing backend data to `buildMetrics` so that a negative
+ * RAM delta (which can occur when the backend diffs RSS between simulation
+ * runs) never produces a negative bar in the label.
+ */
+export function sanitizeResources(resources: Partial<NutritionResources>): NutritionResources;
+
+/**
+ * Export the nutrition label as a PDF and trigger a browser download.
+ *
+ * @param metrics  Pre-built metric rows from `buildMetrics`.
+ * @param options  Optional metadata to include in the document.
+ */
+export function exportPdf(
+  metrics: NutritionMetric[],
+  options?: { functionName?: string; costStroops?: number },
+): Promise<void>;

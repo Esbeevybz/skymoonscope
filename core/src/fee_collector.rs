@@ -1,10 +1,13 @@
 use crate::fee_store::{FeeStore, LedgerFeeSample};
 use crate::leader_lock::RedisLeaderLock;
 use crate::rpc_provider::ProviderRegistry;
+use crate::sys_alarms::{emit_sys_alarm, SysAlarmConfig, SysAlarmEvent, ENV_INSTANCE_ID};
 use crate::AppMetrics;
 use chrono::Utc;
 use reqwest::Client;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing;
@@ -37,6 +40,9 @@ pub struct FeeCollectorConfig {
     pub batch_size: u64,
     /// Request timeout
     pub request_timeout: Duration,
+    /// How long to reuse the most recent `getLatestLedger` RPC result.
+    /// A zero duration disables caching.
+    pub market_data_cache_ttl: Duration,
 }
 
 impl Default for FeeCollectorConfig {
@@ -45,8 +51,128 @@ impl Default for FeeCollectorConfig {
             collection_interval_secs: 5, // Stellar ledgers close every ~5 seconds
             batch_size: 10,
             request_timeout: Duration::from_secs(10),
+            market_data_cache_ttl: Duration::from_secs(1),
         }
     }
+}
+
+/// Default number of attempts (including the first) for a fee-record write.
+pub const DEFAULT_MAX_WRITE_ATTEMPTS: usize = 3;
+/// Default delay before the first retry.
+pub const DEFAULT_WRITE_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+/// Default upper bound for the exponential backoff between retries.
+pub const DEFAULT_WRITE_MAX_BACKOFF: Duration = Duration::from_millis(500);
+/// Default cap on the number of records held in the dead-letter buffer.
+pub const DEFAULT_DEAD_LETTER_CAPACITY: usize = 256;
+/// Default number of consecutive exhausted writes before an alarm is raised.
+pub const DEFAULT_ALARM_AFTER_CONSECUTIVE_FAILURES: u64 = 5;
+
+/// Tuning for the bounded retry + dead-letter behaviour around
+/// fee-record persistence.
+///
+/// [`retry_with_backoff`] makes up to `max_attempts` attempts in total
+/// (the first try counts) and sleeps `initial_backoff`,
+/// `initial_backoff * backoff_multiplier`, … between attempts, capped at
+/// `max_backoff`. Records that still fail are pushed onto the bounded
+/// dead-letter buffer instead of disappearing.
+#[derive(Debug, Clone)]
+pub struct FeeWritePolicy {
+    /// Total attempts per write, including the initial one. Clamped to >= 1.
+    pub max_attempts: usize,
+    /// Delay before the second attempt.
+    pub initial_backoff: Duration,
+    /// Multiplier applied to the inter-attempt delay after each failure.
+    pub backoff_multiplier: u32,
+    /// Upper bound for the inter-attempt delay.
+    pub max_backoff: Duration,
+    /// Maximum number of records retained in the dead-letter buffer.
+    pub dead_letter_capacity: usize,
+    /// Consecutive exhausted writes that trigger a `sys_alarms` alert.
+    /// `0` disables alerting.
+    pub alarm_after_consecutive_failures: u64,
+}
+
+impl Default for FeeWritePolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_MAX_WRITE_ATTEMPTS,
+            initial_backoff: DEFAULT_WRITE_INITIAL_BACKOFF,
+            backoff_multiplier: 2,
+            max_backoff: DEFAULT_WRITE_MAX_BACKOFF,
+            dead_letter_capacity: DEFAULT_DEAD_LETTER_CAPACITY,
+            alarm_after_consecutive_failures: DEFAULT_ALARM_AFTER_CONSECUTIVE_FAILURES,
+        }
+    }
+}
+
+impl FeeWritePolicy {
+    /// Next backoff delay, growing geometrically and clamped to
+    /// [`Self::max_backoff`].
+    fn next_backoff(&self, current: Duration) -> Duration {
+        current
+            .saturating_mul(self.backoff_multiplier.max(1))
+            .min(self.max_backoff)
+    }
+}
+
+/// A fee sample that could not be persisted after every retry attempt.
+///
+/// Retained in the collector's in-memory dead-letter buffer so operators
+/// can inspect or drain it instead of losing the record silently. The
+/// buffer is process-local and bounded by
+/// [`FeeWritePolicy::dead_letter_capacity`].
+#[derive(Debug, Clone)]
+pub struct DeadLetterRecord {
+    /// The fee sample that failed to persist.
+    pub sample: LedgerFeeSample,
+    /// Number of write attempts made before giving up.
+    pub attempts: usize,
+    /// Error returned by the final attempt.
+    pub last_error: String,
+    /// When the record was dead-lettered.
+    pub enqueued_at: chrono::DateTime<Utc>,
+}
+
+/// Run `operation` with bounded exponential backoff.
+///
+/// Returns the number of attempts used on success, or
+/// `Err((attempts, last_error))` once `policy.max_attempts` is reached.
+/// `operation` is always invoked at least once.
+async fn retry_with_backoff<F, Fut>(
+    policy: &FeeWritePolicy,
+    mut operation: F,
+) -> Result<usize, (usize, String)>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let max_attempts = policy.max_attempts.max(1);
+    let mut backoff = policy.initial_backoff;
+    let mut last_error = String::new();
+
+    for attempt in 1..=max_attempts {
+        match operation().await {
+            Ok(()) => return Ok(attempt),
+            Err(err) => {
+                last_error = err;
+                if attempt < max_attempts {
+                    tracing::warn!(
+                        attempt,
+                        max_attempts,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %last_error,
+                        "Fee record DB write failed; backing off before retry"
+                    );
+                    if !backoff.is_zero() {
+                        tokio::time::sleep(backoff).await;
+                    }
+                    backoff = policy.next_backoff(backoff);
+                }
+            }
+        }
+    }
+
+    Err((max_attempts, last_error))
 }
 
 /// Fee collector that polls RPC nodes for ledger fee data
@@ -55,12 +181,27 @@ pub struct FeeCollector {
     store: Arc<FeeStore>,
     client: Client,
     config: FeeCollectorConfig,
+    latest_ledger_cache: Mutex<Option<(u64, Instant)>>,
     last_collected_sequence: std::sync::atomic::AtomicU64,
     metrics: Arc<AppMetrics>,
     /// Leader-election lease. Only the instance holding it persists ledger
     /// fee samples, so running multiple Core instances doesn't cause
     /// duplicate collection or racing writes to `FeeStore`.
     leader_lock: Arc<RedisLeaderLock>,
+    /// Bounded retry / dead-letter tuning for fee-record writes.
+    write_policy: FeeWritePolicy,
+    /// `sys_alarms` configuration used to alert when writes are
+    /// dead-lettered.
+    alarm_config: SysAlarmConfig,
+    /// Process-local buffer of fee samples that exhausted their retries,
+    /// bounded by [`FeeWritePolicy::dead_letter_capacity`].
+    dead_letters: Mutex<VecDeque<DeadLetterRecord>>,
+    /// Count of records evicted because the dead-letter buffer was full.
+    dead_letters_dropped: AtomicU64,
+    /// Consecutive fee-record writes that exhausted their retries.
+    consecutive_store_failures: AtomicU64,
+    /// Count of `sys_alarms` alerts raised by the dead-letter path.
+    alarms_raised: AtomicU64,
 }
 
 impl FeeCollector {
@@ -80,10 +221,221 @@ impl FeeCollector {
                 .build()
                 .expect("Failed to create HTTP client"),
             config,
+            latest_ledger_cache: Mutex::new(None),
             last_collected_sequence: std::sync::atomic::AtomicU64::new(0),
+            write_policy: FeeWritePolicy::default(),
+            alarm_config: SysAlarmConfig::from_env(),
+            dead_letters: Mutex::new(VecDeque::new()),
+            dead_letters_dropped: AtomicU64::new(0),
+            consecutive_store_failures: AtomicU64::new(0),
+            alarms_raised: AtomicU64::new(0),
             metrics,
             leader_lock,
         }
+    }
+
+    /// Override the bounded-retry / dead-letter policy (defaults to
+    /// [`FeeWritePolicy::default`]).
+    pub fn with_write_policy(mut self, policy: FeeWritePolicy) -> Self {
+        self.write_policy = policy;
+        self
+    }
+
+    /// Override the `sys_alarms` configuration used for dead-letter
+    /// alerts (defaults to [`SysAlarmConfig::from_env`]).
+    pub fn with_alarm_config(mut self, alarm_config: SysAlarmConfig) -> Self {
+        self.alarm_config = alarm_config;
+        self
+    }
+
+    /// Persist `sample`, retrying transient failures with backoff and
+    /// dead-lettering it when every attempt fails.
+    ///
+    /// On success the consecutive-failure counter is reset and `Ok(())`
+    /// is returned. On exhaustion the sample is copied into the bounded
+    /// dead-letter buffer, a `sys_alarms` alert is raised once the
+    /// consecutive-failure threshold is crossed, and the final store
+    /// error is returned so callers keep logging / counting it — errors
+    /// are never swallowed.
+    async fn persist_sample_with_retry(
+        &self,
+        sample: &LedgerFeeSample,
+    ) -> Result<(), FeeCollectorError> {
+        let store = Arc::clone(&self.store);
+        let ledger = sample.ledger_sequence;
+        let mut attempt = 0usize;
+
+        let outcome = retry_with_backoff(&self.write_policy, || {
+            let store = Arc::clone(&store);
+            attempt += 1;
+            let attempt_no = attempt;
+            async move {
+                store
+                    .upsert_ledger_sample(sample)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        })
+        .await;
+
+        match outcome {
+            Ok(attempts) => {
+                self.note_store_success();
+                if attempts > 1 {
+                    tracing::info!(ledger, attempts, "Fee record persisted after retry");
+                }
+                Ok(())
+            }
+            Err((attempts, error)) => {
+                tracing::error!(
+                    ledger,
+                    attempts,
+                    error = %error,
+                    "Fee record DB write failed after all retries; dead-lettering"
+                );
+                self.enqueue_dead_letter(sample, attempts, &error).await;
+                Err(FeeCollectorError::StoreError(error))
+            }
+        }
+    }
+
+    /// Reset the consecutive-failure counter after a successful write.
+    fn note_store_success(&self) {
+        self.consecutive_store_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Push a permanently-failed sample onto the bounded dead-letter
+    /// buffer and raise a `sys_alarms` alert when the consecutive-failure
+    /// threshold is crossed.
+    async fn enqueue_dead_letter(
+        &self,
+        sample: &LedgerFeeSample,
+        attempts: usize,
+        last_error: &str,
+    ) {
+        let record = DeadLetterRecord {
+            sample: sample.clone(),
+            attempts,
+            last_error: last_error.to_string(),
+            enqueued_at: Utc::now(),
+        };
+
+        let capacity = self.write_policy.dead_letter_capacity;
+        if capacity == 0 {
+            self.dead_letters_dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let mut buffer = self
+                .dead_letters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while buffer.len() >= capacity {
+                buffer.pop_front();
+                self.dead_letters_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            buffer.push_back(record);
+        }
+
+        let consecutive = self
+            .consecutive_store_failures
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let threshold = self.write_policy.alarm_after_consecutive_failures;
+        // Alert on the first crossing and then once per further threshold
+        // worth of failures, so a sustained outage does not page per record.
+        if threshold > 0 && (consecutive == threshold || consecutive % threshold == 0) {
+            self.raise_fee_store_alarm(consecutive).await;
+        }
+    }
+
+    /// Emit a `sys_alarms` alert describing the consecutive write failures.
+    ///
+    /// [`SysAlarmEvent`] is reused as-is: `value_percent` carries the
+    /// consecutive-failure count, `threshold_percent` the configured
+    /// threshold, and `process_memory_bytes` / `total_memory_bytes` the
+    /// current dead-letter depth / capacity.
+    async fn raise_fee_store_alarm(&self, consecutive: u64) {
+        self.alarms_raised.fetch_add(1, Ordering::Relaxed);
+        let threshold = self.write_policy.alarm_after_consecutive_failures;
+        tracing::warn!(
+            consecutive_failures = consecutive,
+            threshold,
+            dead_letter_depth = self.dead_letter_len(),
+            "Fee collector exceeded the consecutive DB write failure threshold"
+        );
+
+        if !self.alarm_config.enabled {
+            tracing::warn!("sys_alarms is disabled; fee collector alert not emitted");
+            return;
+        }
+
+        let node_id = std::env::var(ENV_INSTANCE_ID)
+            .ok()
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .filter(|value| !value.trim().is_empty());
+
+        let payload = SysAlarmEvent {
+            event: "fee_store_write_failed",
+            resource: "fee_collector",
+            value_percent: consecutive as f64,
+            threshold_percent: threshold as f64,
+            process_memory_bytes: self.dead_letter_len() as u64,
+            total_memory_bytes: self.write_policy.dead_letter_capacity as u64,
+            pid: std::process::id(),
+            node_id,
+            timestamp: Utc::now(),
+        };
+
+        emit_sys_alarm(self.alarm_config.webhook_url.as_deref(), &payload).await;
+    }
+
+    /// Number of fee samples currently held in the dead-letter buffer.
+    pub fn dead_letter_len(&self) -> usize {
+        self.dead_letters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Configured maximum size of the dead-letter buffer.
+    pub fn dead_letter_capacity(&self) -> usize {
+        self.write_policy.dead_letter_capacity
+    }
+
+    /// Total number of records evicted from a full dead-letter buffer.
+    pub fn dead_letters_dropped(&self) -> u64 {
+        self.dead_letters_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot of the dead-letter buffer, oldest first, without removing
+    /// anything.
+    pub fn dead_letter_snapshot(&self) -> Vec<DeadLetterRecord> {
+        self.dead_letters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Remove and return every buffered dead-letter record, oldest first,
+    /// emptying the buffer.
+    pub fn drain_dead_letters(&self) -> Vec<DeadLetterRecord> {
+        self.dead_letters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    /// Consecutive fee-record writes that exhausted their retries. Reset
+    /// to `0` by the next successful write.
+    pub fn consecutive_store_failures(&self) -> u64 {
+        self.consecutive_store_failures.load(Ordering::Relaxed)
+    }
+
+    /// Number of `sys_alarms` alerts raised by the dead-letter path.
+    pub fn alarms_raised(&self) -> u64 {
+        self.alarms_raised.load(Ordering::Relaxed)
     }
 
     /// Run the background collection loop until a shutdown signal is received.
@@ -182,7 +534,7 @@ impl FeeCollector {
             for seq in start..=end {
                 match self.fetch_ledger_fee_data(seq).await {
                     Ok(sample) => {
-                        if let Err(e) = self.store.upsert_ledger_sample(&sample).await {
+                        if let Err(e) = self.persist_sample_with_retry(&sample).await {
                             tracing::error!(
                                 ledger = seq,
                                 error = %e,
@@ -209,11 +561,9 @@ impl FeeCollector {
         // Fetch latest ledger details
         let sample = self.fetch_ledger_fee_data(latest_sequence).await?;
 
-        // Store in database
-        self.store
-            .upsert_ledger_sample(&sample)
-            .await
-            .map_err(|e| FeeCollectorError::StoreError(e.to_string()))?;
+        // Store in database, retrying transient failures and dead-lettering
+        // records that still fail so no fee sample is silently dropped.
+        self.persist_sample_with_retry(&sample).await?;
 
         // Update last collected sequence
         self.last_collected_sequence
@@ -231,13 +581,47 @@ impl FeeCollector {
 
     /// Get the latest ledger sequence from RPC
     async fn get_latest_ledger_sequence(&self) -> Result<u64, FeeCollectorError> {
+        if let Some(sequence) =
+            cached_latest_ledger(&self.latest_ledger_cache, self.config.market_data_cache_ttl)
+        {
+            return Ok(sequence);
+        }
+
         let providers = self.registry.healthy_providers().await;
         if providers.is_empty() {
             return Err(FeeCollectorError::NoHealthyProviders);
         }
 
         // Try the first healthy provider
-        let provider = &providers[0];
+                let provider = &providers[0];
+
+        // Use the RPC fee statistics for real-time fee tracking.
+        if let Ok(fee_stats) = self.fetch_fee_stats(provider).await {
+            if let Some(p50) = fee_stats["p50"].as_str().and_then(|v| v.parse::<i64>().ok()) {
+                let p95 = fee_stats["p95"]
+                    .as_str()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(p50);
+
+                let transaction_count = fee_stats["transactionCount"]
+                    .as_str()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(0);
+
+                return Ok(LedgerFeeSample {
+                    ledger_sequence: sequence as i64,
+                    collected_at: Utc::now(),
+                    base_reserve: 0,
+                    base_fee: p50,
+                    max_fee: p95,
+                    fee_charged: 0,
+                    transaction_count,
+                    ledger_close_time: Utc::now(),
+                });
+            }
+        }
+
+        
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -274,30 +658,54 @@ impl FeeCollector {
             FeeCollectorError::ParseError("Missing sequence in response".to_string())
         })?;
 
+        if !self.config.market_data_cache_ttl.is_zero() {
+            *self
+                .latest_ledger_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((sequence, Instant::now()));
+        }
+
         Ok(sequence)
     }
 
     /// Fetch detailed fee data for a specific ledger
-    async fn fetch_ledger_fee_data(
+        /// Fetch real-time fee statistics from Stellar RPC.
+    async fn fetch_fee_stats(
         &self,
-        sequence: u64,
-    ) -> Result<LedgerFeeSample, FeeCollectorError> {
-        let providers = self.registry.healthy_providers().await;
-        if providers.is_empty() {
-            return Err(FeeCollectorError::NoHealthyProviders);
+        provider: &crate::rpc_provider::RpcProvider,
+    ) -> Result<serde_json::Value, FeeCollectorError> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getFeeStats",
+            "params": null
+        });
+
+        let mut req = self.client.post(&provider.url).json(&body);
+
+        if let (Some(header), Some(value)) = (&provider.auth_header, &provider.auth_value) {
+            req = req.header(header.as_str(), value.as_str());
         }
 
-        let provider = &providers[0];
+        let response = req
+            .send()
+            .await
+            .map_err(|e| FeeCollectorError::RpcRequestFailed(e.to_string()))?;
 
-        // Try getLedgers endpoint first (if available)
-        // Fallback to parsing from getTransactions if needed
-        match self.fetch_from_get_ledgers(provider, sequence).await {
-            Ok(sample) => Ok(sample),
-            Err(e) => {
-                tracing::warn!(error = %e, "getLedgers not available, using fallback");
-                self.fetch_from_get_transactions(provider, sequence).await
-            }
+        if !response.status().is_success() {
+            return Err(FeeCollectorError::RpcRequestFailed(format!(
+                "HTTP {}",
+                response.status()
+            )));
         }
+
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| FeeCollectorError::ParseError(e.to_string()))?;
+
+        Ok(json["result"]["inclusionFee"].clone())
     }
 
     /// Fetch fee data using getLedgers RPC method
@@ -483,18 +891,40 @@ impl FeeCollector {
     /// The data is upserted so re-running over the same range is idempotent.
     pub async fn fetch_and_store_ledger(&self, sequence: u64) -> Result<(), FeeCollectorError> {
         let sample = self.fetch_ledger_fee_data(sequence).await?;
-        self.store
-            .upsert_ledger_sample(&sample)
-            .await
-            .map_err(|e| FeeCollectorError::StoreError(e.to_string()))?;
+        self.persist_sample_with_retry(&sample).await?;
         tracing::debug!(ledger = sequence, "Re-indexed ledger");
         Ok(())
     }
 }
 
+fn cached_latest_ledger(cache: &Mutex<Option<(u64, Instant)>>, ttl: Duration) -> Option<u64> {
+    if ttl.is_zero() {
+        return None;
+    }
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(_, fetched_at)| fetched_at.elapsed() < ttl)
+        .map(|(sequence, _)| *sequence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_ledger_cache_obeys_ttl_and_zero_disables_it() {
+        let cache = Mutex::new(Some((42, Instant::now())));
+        assert_eq!(
+            cached_latest_ledger(&cache, Duration::from_secs(1)),
+            Some(42)
+        );
+        assert_eq!(cached_latest_ledger(&cache, Duration::ZERO), None);
+
+        *cache.lock().unwrap() = Some((42, Instant::now() - Duration::from_secs(2)));
+        assert_eq!(cached_latest_ledger(&cache, Duration::from_secs(1)), None);
+    }
 
     #[test]
     fn test_default_config() {
@@ -532,6 +962,7 @@ mod tests {
                 collection_interval_secs: 60,
                 batch_size: 1,
                 request_timeout: Duration::from_millis(50),
+                market_data_cache_ttl: Duration::from_secs(1),
             },
             metrics,
             leader_lock,
@@ -552,5 +983,242 @@ mod tests {
             .await
             .expect("fee collector should exit promptly after shutdown")
             .expect("fee collector task should not panic");
+    }
+
+    fn test_registry() -> Arc<ProviderRegistry> {
+        Arc::new(ProviderRegistry::new(vec![
+            crate::rpc_provider::RpcProvider {
+                name: "test".to_string(),
+                url: "http://127.0.0.1:9".to_string(),
+                auth_header: None,
+                auth_value: None,
+                advertise: None,
+            },
+        ]))
+    }
+
+    fn test_leader_lock() -> Arc<RedisLeaderLock> {
+        let redis_client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+        Arc::new(RedisLeaderLock::new(
+            redis_client,
+            "test_fee_collector_dead_letter",
+            Duration::from_secs(10),
+        ))
+    }
+
+    fn sample(ledger_sequence: i64) -> LedgerFeeSample {
+        LedgerFeeSample {
+            ledger_sequence,
+            collected_at: Utc::now(),
+            base_reserve: 0,
+            base_fee: 100,
+            max_fee: 100,
+            fee_charged: 0,
+            transaction_count: 0,
+            ledger_close_time: Utc::now(),
+        }
+    }
+
+    /// A store whose connection pool has been closed, so every write fails
+    /// deterministically without touching a real database.
+    async fn failing_store() -> Arc<FeeStore> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        pool.close().await;
+        Arc::new(FeeStore::new(pool))
+    }
+
+    /// A store backed by an in-memory SQLite table that accepts writes.
+    async fn writable_store() -> Arc<FeeStore> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        sqlx::query(
+            "CREATE TABLE ledger_fee_samples (\
+                ledger_sequence INTEGER PRIMARY KEY, \
+                collected_at TEXT NOT NULL, \
+                base_reserve INTEGER NOT NULL, \
+                base_fee INTEGER NOT NULL, \
+                max_fee INTEGER NOT NULL, \
+                fee_charged INTEGER NOT NULL, \
+                transaction_count INTEGER NOT NULL, \
+                ledger_close_time TEXT NOT NULL\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create ledger_fee_samples");
+        Arc::new(FeeStore::new(pool))
+    }
+
+    fn collector_with(store: Arc<FeeStore>, policy: FeeWritePolicy) -> Arc<FeeCollector> {
+        Arc::new(
+            FeeCollector::new(
+                test_registry(),
+                store,
+                FeeCollectorConfig::default(),
+                Arc::new(AppMetrics::new().expect("metrics")),
+                test_leader_lock(),
+            )
+            .with_write_policy(policy)
+            .with_alarm_config(SysAlarmConfig::default()),
+        )
+    }
+
+    fn fast_policy() -> FeeWritePolicy {
+        FeeWritePolicy {
+            initial_backoff: Duration::from_millis(0),
+            max_backoff: Duration::from_millis(0),
+            ..FeeWritePolicy::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_with_backoff_succeeds_after_transient_failures() {
+        let policy = fast_policy();
+        let mut calls = 0usize;
+        let outcome = retry_with_backoff(&policy, || {
+            calls += 1;
+            let attempt = calls;
+            async move {
+                if attempt < 3 {
+                    Err(format!("transient failure {attempt}"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(outcome, Ok(3));
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn retry_with_backoff_exhausts_and_reports_last_error() {
+        let policy = fast_policy();
+        let mut calls = 0usize;
+        let outcome = retry_with_backoff(&policy, || {
+            calls += 1;
+            async move { Err::<(), String>("db unavailable".to_string()) }
+        })
+        .await;
+
+        assert_eq!(
+            outcome,
+            Err((policy.max_attempts, "db unavailable".to_string()))
+        );
+        assert_eq!(calls, policy.max_attempts);
+    }
+
+    #[tokio::test]
+    async fn exhausted_write_is_dead_lettered_and_not_swallowed() {
+        let policy = FeeWritePolicy {
+            max_attempts: 2,
+            dead_letter_capacity: 8,
+            alarm_after_consecutive_failures: 100,
+            ..fast_policy()
+        };
+        let collector = collector_with(failing_store().await, policy.clone());
+
+        let result = collector.persist_sample_with_retry(&sample(42)).await;
+
+        assert!(matches!(result, Err(FeeCollectorError::StoreError(_))));
+        assert_eq!(collector.dead_letter_len(), 1);
+        let buffered = collector.dead_letter_snapshot();
+        assert_eq!(buffered.len(), 1);
+        assert_eq!(buffered[0].sample.ledger_sequence, 42);
+        assert_eq!(buffered[0].attempts, policy.max_attempts);
+        assert!(!buffered[0].last_error.is_empty());
+        assert_eq!(collector.consecutive_store_failures(), 1);
+        assert_eq!(collector.alarms_raised(), 0);
+    }
+
+    #[tokio::test]
+    async fn dead_letter_buffer_is_bounded_and_drops_oldest() {
+        let policy = FeeWritePolicy {
+            max_attempts: 1,
+            dead_letter_capacity: 2,
+            alarm_after_consecutive_failures: 0,
+            ..fast_policy()
+        };
+        let collector = collector_with(failing_store().await, policy);
+
+        for ledger in [1, 2, 3] {
+            let _ = collector.persist_sample_with_retry(&sample(ledger)).await;
+        }
+
+        assert_eq!(collector.dead_letter_len(), 2);
+        assert_eq!(collector.dead_letters_dropped(), 1);
+        let buffered = collector.dead_letter_snapshot();
+        assert_eq!(buffered[0].sample.ledger_sequence, 2);
+        assert_eq!(buffered[1].sample.ledger_sequence, 3);
+    }
+
+    #[tokio::test]
+    async fn drain_dead_letters_returns_records_and_empties_buffer() {
+        let policy = FeeWritePolicy {
+            max_attempts: 1,
+            alarm_after_consecutive_failures: 0,
+            ..fast_policy()
+        };
+        let collector = collector_with(failing_store().await, policy);
+
+        for ledger in [10, 11] {
+            let _ = collector.persist_sample_with_retry(&sample(ledger)).await;
+        }
+        assert_eq!(collector.dead_letter_len(), 2);
+
+        let drained = collector.drain_dead_letters();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].sample.ledger_sequence, 10);
+        assert_eq!(drained[1].sample.ledger_sequence, 11);
+        assert_eq!(collector.dead_letter_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn alarm_is_raised_at_consecutive_failure_threshold() {
+        let policy = FeeWritePolicy {
+            max_attempts: 1,
+            alarm_after_consecutive_failures: 3,
+            ..fast_policy()
+        };
+        let collector = collector_with(failing_store().await, policy);
+
+        for ledger in 1..=2 {
+            let _ = collector.persist_sample_with_retry(&sample(ledger)).await;
+        }
+        assert_eq!(collector.alarms_raised(), 0);
+        assert_eq!(collector.consecutive_store_failures(), 2);
+
+        let _ = collector.persist_sample_with_retry(&sample(3)).await;
+        assert_eq!(collector.alarms_raised(), 1);
+
+        let _ = collector.persist_sample_with_retry(&sample(4)).await;
+        assert_eq!(collector.alarms_raised(), 1);
+
+        let _ = collector.persist_sample_with_retry(&sample(5)).await;
+        assert_eq!(collector.alarms_raised(), 1);
+
+        let _ = collector.persist_sample_with_retry(&sample(6)).await;
+        assert_eq!(collector.alarms_raised(), 2);
+    }
+
+    #[tokio::test]
+    async fn successful_write_does_not_dead_letter_or_alarm() {
+        let collector = collector_with(writable_store().await, fast_policy());
+
+        assert!(collector
+            .persist_sample_with_retry(&sample(99))
+            .await
+            .is_ok());
+        assert_eq!(collector.dead_letter_len(), 0);
+        assert_eq!(collector.consecutive_store_failures(), 0);
+        assert_eq!(collector.alarms_raised(), 0);
     }
 }

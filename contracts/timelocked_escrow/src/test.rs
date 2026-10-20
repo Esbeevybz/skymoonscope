@@ -1,5 +1,6 @@
 use crate::contract::TimelockEscrowClient;
 use crate::guardian::{approval_count, has_quorum, set_approval};
+use crate::storage_types::Error;
 use crate::TimelockEscrow;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -233,7 +234,7 @@ fn test_release_after_cancel_fails() {
     client.release();
 }
 
-// ── 10. Guardian Rotation ─────────────────────────────────────
+// ── 10. Guardian Rotation With Time-Lock Delay ───────────────────
 
 #[test]
 fn test_guardian_rotation() {
@@ -244,7 +245,7 @@ fn test_guardian_rotation() {
     client.approve(&guardians.get(0).unwrap());
     assert_eq!(client.get_approval_count(), 1);
 
-    // Rotate with 3 current guardians authorizing
+    // Propose rotation with 3 current guardians authorizing
     let mut new_guardians = Vec::new(&e);
     for _ in 0..5 {
         new_guardians.push_back(Address::generate(&e));
@@ -255,7 +256,22 @@ fn test_guardian_rotation() {
     approving.push_back(guardians.get(1).unwrap());
     approving.push_back(guardians.get(2).unwrap());
 
-    client.rotate_guardians(&new_guardians, &approving);
+    let eta = client.propose_guardian_rotation(&new_guardians, &approving);
+    assert!(client.get_pending_guardian_rotation().is_some());
+    let pending = client.get_pending_guardian_rotation().unwrap();
+    assert_eq!(pending.eta, eta);
+    assert_eq!(pending.new_guardians.len(), 5);
+
+    // Cannot execute before timelock delay has elapsed
+    let err = client.try_execute_guardian_rotation();
+    assert_eq!(err, Err(Ok(Error::RotationTimelockNotElapsed)));
+
+    // Advance past rotation delay
+    e.ledger().with_mut(|l| l.sequence_number = eta);
+
+    // Execute rotation
+    assert_eq!(client.try_execute_guardian_rotation(), Ok(()));
+    assert!(client.get_pending_guardian_rotation().is_none());
 
     // Approvals should be reset
     assert_eq!(client.get_approval_count(), 0);
@@ -270,6 +286,87 @@ fn test_guardian_rotation() {
     assert_eq!(stored.len(), 5);
     assert_eq!(stored.get(0).unwrap(), new_guardians.get(0).unwrap());
 }
+
+#[test]
+fn test_guardian_rotation_timelock_boundaries() {
+    let (e, client, _, _, _, guardians, _) = setup();
+
+    let mut new_guardians = Vec::new(&e);
+    for _ in 0..5 {
+        new_guardians.push_back(Address::generate(&e));
+    }
+
+    let mut approving = Vec::new(&e);
+    approving.push_back(guardians.get(0).unwrap());
+    approving.push_back(guardians.get(1).unwrap());
+    approving.push_back(guardians.get(2).unwrap());
+
+    let eta = client.propose_guardian_rotation(&new_guardians, &approving);
+
+    // One ledger before eta: still not elapsed
+    e.ledger().with_mut(|l| l.sequence_number = eta - 1);
+    assert_eq!(
+        client.try_execute_guardian_rotation(),
+        Err(Ok(Error::RotationTimelockNotElapsed))
+    );
+
+    // At eta: execution succeeds
+    e.ledger().with_mut(|l| l.sequence_number = eta);
+    assert_eq!(client.try_execute_guardian_rotation(), Ok(()));
+}
+
+#[test]
+fn test_cancel_guardian_rotation_by_guardian() {
+    let (e, client, _, _, _, guardians, _) = setup();
+
+    let mut new_guardians = Vec::new(&e);
+    for _ in 0..5 {
+        new_guardians.push_back(Address::generate(&e));
+    }
+
+    let mut approving = Vec::new(&e);
+    approving.push_back(guardians.get(0).unwrap());
+    approving.push_back(guardians.get(1).unwrap());
+    approving.push_back(guardians.get(2).unwrap());
+
+    client.propose_guardian_rotation(&new_guardians, &approving);
+    assert!(client.get_pending_guardian_rotation().is_some());
+
+    // Any guardian can cancel the pending rotation
+    let canceller = guardians.get(4).unwrap();
+    client.cancel_guardian_rotation(&canceller);
+
+    // Proposal is removed
+    assert!(client.get_pending_guardian_rotation().is_none());
+
+    // Execution fails because there is no pending proposal
+    assert_eq!(
+        client.try_execute_guardian_rotation(),
+        Err(Ok(Error::NoPendingRotation))
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_cancel_guardian_rotation_by_non_guardian_fails() {
+    let (e, client, _, _, _, guardians, _) = setup();
+
+    let mut new_guardians = Vec::new(&e);
+    for _ in 0..5 {
+        new_guardians.push_back(Address::generate(&e));
+    }
+
+    let mut approving = Vec::new(&e);
+    approving.push_back(guardians.get(0).unwrap());
+    approving.push_back(guardians.get(1).unwrap());
+    approving.push_back(guardians.get(2).unwrap());
+
+    client.propose_guardian_rotation(&new_guardians, &approving);
+
+    let non_guardian = Address::generate(&e);
+    client.cancel_guardian_rotation(&non_guardian);
+}
+
 
 // ── 11. Guardian Rotation Insufficient Sigs ───────────────────
 
@@ -668,4 +765,90 @@ fn test_release_after_mutual_cancel_fails() {
     client.approve(&guardians.get(2).unwrap());
     advance_ledger(&e, LOCK_LEDGERS + 1);
     client.release();
+}
+
+// ── Guardian release is gated on the lock expiry (issue #69) ─────────────────
+
+/// `release` is the guardian/quorum path out of the escrow, and it must refuse
+/// to move funds before `unlock_ledger` even when every guardian has approved
+/// (issue #69). A full quorum is not an override for the timelock.
+#[test]
+fn test_full_quorum_cannot_release_before_the_lock_expires() {
+    let (e, client, token_addr, _depositor, beneficiary, guardians, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+
+    for i in 0..5 {
+        client.approve(&guardians.get(i).unwrap());
+    }
+    // Quorum is satisfied, but the lock has not expired.
+    assert_eq!(client.is_releasable(), false);
+
+    let res = client.try_release();
+    assert_eq!(res, Err(Ok(Error::TimelockNotExpired)));
+
+    // Nothing moved.
+    let sac = token::StellarAssetClient::new(&e, &token_addr);
+    assert_eq!(sac.balance(&beneficiary), 0);
+    assert_eq!(client.get_config().unwrap().is_released, false);
+}
+
+/// The check is on the exact boundary: one ledger short is refused, at the
+/// unlock ledger it succeeds.
+#[test]
+fn test_release_is_refused_until_the_exact_unlock_ledger() {
+    let (e, client, _token, _depositor, _beneficiary, guardians, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+    for i in 0..5 {
+        client.approve(&guardians.get(i).unwrap());
+    }
+
+    let unlock_ledger = client.get_config().unwrap().unlock_ledger;
+
+    // One ledger before expiry: still locked.
+    e.ledger()
+        .with_mut(|l| l.sequence_number = unlock_ledger - 1);
+    assert_eq!(client.is_releasable(), false);
+    assert_eq!(client.try_release(), Err(Ok(Error::TimelockNotExpired)));
+
+    // At the unlock ledger: releasable.
+    e.ledger().with_mut(|l| l.sequence_number = unlock_ledger);
+    assert_eq!(client.is_releasable(), true);
+    assert_eq!(client.try_release(), Ok(()));
+}
+
+/// A long time past the unlock ledger is still releasable — the check must not
+/// be an equality test that breaks for late execution.
+#[test]
+fn test_release_still_works_long_after_the_lock_expires() {
+    let (e, client, _token, _depositor, _beneficiary, guardians, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+    for i in 0..5 {
+        client.approve(&guardians.get(i).unwrap());
+    }
+
+    e.ledger().with_mut(|l| l.sequence_number = 1_000_000);
+    assert_eq!(client.is_releasable(), true);
+    assert_eq!(client.try_release(), Ok(()));
+    assert_eq!(client.get_config().unwrap().is_released, true);
+}
+
+/// Without the timelock check an approval cast early would be enough; the
+/// sequence of approve -> time passes -> approve -> release is only valid once
+/// the lock has expired.
+#[test]
+fn test_approvals_early_do_not_enable_early_release() {
+    let (e, client, _token, _depositor, _beneficiary, guardians, _) = setup();
+    client.deposit(&DEPOSIT_AMOUNT);
+
+    // Quorum reached immediately after deposit, well before expiry.
+    for i in 0..5 {
+        client.approve(&guardians.get(i).unwrap());
+    }
+    assert_eq!(client.try_release(), Err(Ok(Error::TimelockNotExpired)));
+
+    // Still refused one ledger before expiry even though nothing else changed.
+    let unlock_ledger = client.get_config().unwrap().unlock_ledger;
+    e.ledger()
+        .with_mut(|l| l.sequence_number = unlock_ledger - 1);
+    assert_eq!(client.try_release(), Err(Ok(Error::TimelockNotExpired)));
 }

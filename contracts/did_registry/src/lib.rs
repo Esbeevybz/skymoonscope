@@ -8,3 +8,4 @@ mod test;
 
 pub use crate::contract::DIDRegistry;
 pub use crate::contract::DIDRegistryClient;
+pub use crate::storage_types::Error;

@@ -120,7 +120,7 @@ export function CallGraphVisualizer({
   callGraph,
   mermaidDefinition,
 }: CallGraphVisualizerProps) {
-  const { nodes, edges } = useMemo(() => buildFlowElements(callGraph), [callGraph]);
+  const { nodes, edges, hasCycle } = useMemo(() => buildFlowElements(callGraph), [callGraph]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
   // Drop a stale selection when a new simulation replaces the graph.
@@ -146,6 +146,19 @@ export function CallGraphVisualizer({
   );
 
   if (nodes.length === 0) {
+    if (hasCycle) {
+      return (
+        <div className="mt-5">
+          <h4 className="mb-3 text-sm font-semibold text-[var(--text-primary)]">
+            Cross-Contract Call Graph
+          </h4>
+          <div className="rounded-lg border border-[var(--border-default)] bg-[var(--bg-elevated)] p-6 text-center text-sm text-[var(--text-secondary)]">
+            <span className="text-[20px]">⚠</span>
+            <div className="mt-2">Cycle detected in call graph — layout cannot proceed.</div>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="mt-5">
         <h4 className="mb-3 text-sm font-semibold text-[var(--text-primary)]">

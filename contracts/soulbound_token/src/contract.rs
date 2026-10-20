@@ -15,6 +15,13 @@ pub enum Error {
     Unauthorized = 3,
     AlreadyMinted = 4,
     TokenNotFound = 5,
+    /// The token is soulbound and therefore cannot be transferred (issue #86).
+    ///
+    /// Reported instead of the generic `Unauthorized` so a caller (or a client
+    /// integrating a wallet that probes for transfer support) can tell "you are
+    /// not allowed to do this" apart from "this token is not transferable at
+    /// all" — the second is a property of the token, not of the caller.
+    NonTransferable = 6,
 }
 
 pub trait SoulboundTokenTrait {
@@ -89,12 +96,19 @@ impl SoulboundTokenTrait for SoulboundToken {
         read_balance(&e, id)
     }
 
-    /// Soulbound badges are non-transferable.
+    /// Soulbound badges are non-transferable: this entry point exists only so a
+    /// standard SEP-41 client gets a clear answer instead of a missing-method
+    /// failure (issue #86).
     fn transfer(_e: Env, _from: Address, _to: Address, _amount: i128) -> Result<(), Error> {
-        Err(Error::Unauthorized)
+        Err(Error::NonTransferable)
     }
 
-    /// Soulbound badges cannot be moved via allowance either.
+    /// Soulbound badges cannot be moved via an allowance either.
+    ///
+    /// The allowance path is the one that usually slips through, because a
+    /// wallet can approve a spender and the transfer is then attempted later;
+    /// rejecting it here keeps the soulbound guarantee intact regardless of how
+    /// the caller obtained authorisation.
     fn transfer_from(
         _e: Env,
         _spender: Address,
@@ -102,7 +116,7 @@ impl SoulboundTokenTrait for SoulboundToken {
         _to: Address,
         _amount: i128,
     ) -> Result<(), Error> {
-        Err(Error::Unauthorized)
+        Err(Error::NonTransferable)
     }
 
     fn burn(e: Env, from: Address) {
