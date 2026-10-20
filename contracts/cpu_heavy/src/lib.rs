@@ -155,6 +155,46 @@ impl CpuHeavyContract {
         Ok(sum)
     }
 
+    /// Profiles multiple contract functions in one run.
+    ///
+    /// Each entry in `calls` names a function to invoke; the return values are
+    /// collected in order so a single invocation can measure several workloads
+    /// against the same budget. Supported names are `"fibonacci_iterative"`,
+    /// `"bubble_sort"`, `"count_primes"`, and `"nested_loop_burn"`.
+    ///
+    /// Returns [`Error::CombinedInputTooLarge`] if any argument exceeds its
+    /// sub-cap.
+    pub fn profile_multiple(
+        env: Env,
+        calls: Vec<u32>,
+        args: Vec<u32>,
+    ) -> Result<Vec<u64>, Error> {
+        if calls.len() > MAX_COMBINED_SORT || args.len() > MAX_COMBINED_SORT {
+            return Err(Error::CombinedInputTooLarge);
+        }
+
+        let mut results = Vec::new(&env);
+        for i in 0..calls.len() {
+            let selector = calls.get(i).unwrap();
+            let arg = args.get(i).unwrap();
+            let value = match selector {
+                0 => Self::fibonacci_iterative(env.clone(), arg)?,
+                1 => {
+                    let mut to_sort = Vec::new(&env);
+                    for k in (0..arg).rev() {
+                        to_sort.push_back(k);
+                    }
+                    Self::bubble_sort(env.clone(), to_sort)?.len() as u64
+                }
+                2 => Self::count_primes(env.clone(), arg)? as u64,
+                3 => Self::nested_loop_burn(env.clone(), arg, 1)?,
+                _ => return Err(Error::CombinedInputTooLarge),
+            };
+            results.push_back(value);
+        }
+        Ok(results)
+    }
+
     /// Runs all three workloads in one invocation and returns
     /// `[fibonacci, prime_count]`.
     ///
