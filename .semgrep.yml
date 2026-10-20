@@ -53,6 +53,36 @@ rules:
           try { ... } catch(e) { ... }
           where: no_logging()
 
+  - id: redundant-auth-checks
+    languages: [rust, javascript, typescript]
+    severity: WARNING
+    message: >-
+      Repeated authorization checks on the same signer are redundant; the second
+      check is typically a false positive or duplicated guard.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $ADDR.require_auth();
+              $ADDR.require_auth();
+          - pattern: |
+              require_auth($ADDR);
+              require_auth($ADDR);
+          - pattern: |
+              if ($COND) {
+                $ADDR.require_auth();
+              }
+              $ADDR.require_auth();
+      - metavariable-pattern:
+          metavariable: $ADDR
+          patterns:
+            - pattern-not: $OTHER
+            - pattern-not: $ADDR.$FIELD
+      - pattern-not-inside: |
+          if ($STATE) {
+            ...
+          }
+          $ADDR.require_auth();
+
   # JavaScript-specific security rules
   - id: javascript-security
     patterns:
