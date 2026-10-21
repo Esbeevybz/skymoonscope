@@ -29,9 +29,20 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let wasm_bytes = fs::read(&args.wasm_file)?;
+    let wasm_bytes = match fs::read(&args.wasm_file) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("Could not read {}: {error}", args.wasm_file.display());
+            std::process::exit(1);
+        }
+    };
 
-    run_profile(&args.wasm_file, wasm_bytes.clone(), &args.function, &args.args)?;
+    if let Err(error) = run_profile(&args.wasm_file, wasm_bytes.clone(), &args.function, &args.args) {
+        eprintln!("Profiling failed: {error}");
+        if !args.watch {
+            std::process::exit(1);
+        }
+    }
     if !args.watch {
         return Ok(());
     }
@@ -76,11 +87,22 @@ fn run_profile(
     function: &str,
     args: &[String],
 ) -> Result<(), Box<dyn Error>> {
-    let (resources, profile) = profile_contract_with_flamegraph(
-        wasm_bytes,
-        function.to_owned(),
-        args.to_vec(),
-    )?;
+    let profile_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        profile_contract_with_flamegraph(
+            wasm_bytes,
+            function.to_owned(),
+            args.to_vec(),
+        )
+    }));
+
+    let (resources, profile) = match profile_res {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(err)) => return Err(Box::new(err)),
+        Err(_) => {
+            return Err("profiling panicked unexpectedly; check contract custom sections and ABI".into());
+        }
+    };
+
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -102,7 +124,8 @@ fn content_changed(previous_hash: &[u8; 32], current_hash: &[u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_changed, content_hash};
+    use super::{content_changed, content_hash, run_profile};
+    use std::path::PathBuf;
 
     #[test]
     fn detects_same_length_wasm_content_changes() {
@@ -114,5 +137,13 @@ mod tests {
         let changed_hash = content_hash(changed);
         assert!(content_changed(&original_hash, &changed_hash));
         assert!(!content_changed(&original_hash, &original_hash));
+    }
+
+    #[test]
+    fn run_profile_handles_corrupt_wasm_without_panic() {
+        let bad_wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let path = PathBuf::from("mock.wasm");
+        let res = run_profile(&path, bad_wasm, "nonexistent", &[]);
+        assert!(res.is_err(), "should gracefully return error for invalid wasm");
     }
 }
