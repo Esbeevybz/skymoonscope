@@ -19,4 +19,6 @@ cargo run --manifest-path core/Cargo.toml --bin wasm-profile -- \
 ```
 
 Each profiling run prints a JSON object containing resource measurements and
-the flamegraph profile. Stop watch mode with Ctrl+C.
+the flamegraph profile. Contracts containing custom sections (e.g., Soroban metadata,
+spec entries, or debug symbols) are safely handled and preserved without causing CLI
+panics. Stop watch mode with Ctrl+C.
