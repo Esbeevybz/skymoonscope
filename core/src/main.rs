@@ -1,4 +1,3 @@
-```rust
 #![allow(dead_code)]
 
 mod auth;
@@ -6,6 +5,7 @@ mod benchmarks;
 mod cache;
 mod call_trace_parser;
 mod comparison;
+mod error_middleware;
 mod errors;
 pub mod fee_analytics;
 pub mod fee_collector;
@@ -18,10 +18,14 @@ mod jobs;
 mod leader_lock;
 mod merkle_tree;
 mod parser;
+mod profiling_webhooks;
 mod routing;
 pub mod rpc_provider;
 mod rpc_throttle;
 mod runner;
+mod shared_results_domain;
+mod shared_results_handlers;
+mod shared_results_store;
 mod simulation;
 mod simulation_service;
 mod task_queue;
@@ -45,6 +49,10 @@ use crate::insights::InsightsEngine;
 use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
 use crate::merkle_tree::MerkleTree;
 use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
+use crate::shared_results_handlers::{
+    check_share_exists, create_share, delete_share, get_share, SharedResultsState,
+};
+use crate::shared_results_store::SharedResultsStore;
 use crate::simulation::{SimulationEngine, SimulationMode, SimulationResult};
 use crate::ws::SimulationBus;
 use crate::worker_pool::EventWorkerPool;
@@ -150,6 +158,9 @@ struct AppConfig {
     /// Fee data collection interval in seconds (default 5).
     #[serde(default = "default_fee_collection_interval")]
     fee_collection_interval_secs: u64,
+    /// TTL in seconds for cached latest-ledger fee market RPC data (default 1).
+    #[serde(default = "default_fee_market_cache_ttl")]
+    fee_market_cache_ttl_secs: u64,
     /// Fee data retention period in days (default 30).
     #[serde(default = "default_fee_retention_days")]
     fee_retention_days: u32,
@@ -190,6 +201,15 @@ struct AppConfig {
     /// When empty, defaults to `*` (allow all origins).
     #[serde(default = "default_allowed_origins")]
     allowed_origins: String,
+    /// Minimum number of seconds between two alerts for the same host
+    /// resource (issue #24).
+    ///
+    /// The system resource alarm monitor is edge-triggered, so without a
+    /// window a resource oscillating around the alarm threshold alerts on
+    /// every sampling interval. `0` disables rate limiting.
+    /// Env: `ALARM_DEDUP_WINDOW_SECS`. Default 60.
+    #[serde(default = "default_alarm_dedup_window_secs")]
+    alarm_dedup_window_secs: u64,
 }
 
 fn default_health_check_interval() -> u64 {
@@ -232,6 +252,10 @@ fn default_fee_collection_interval() -> u64 {
     5
 }
 
+fn default_fee_market_cache_ttl() -> u64 {
+    1
+}
+
 fn default_fee_retention_days() -> u32 {
     30
 }
@@ -260,6 +284,16 @@ fn default_max_cache_size_mb() -> u64 {
 
 fn default_event_bus_capacity() -> usize {
     256
+}
+
+/// Default alert deduplication window in seconds (issue #24).
+///
+/// Mirrors `config::default_alarm_dedup_window_secs()` so the binary and the
+/// library config surface agree on a single default.
+fn default_alarm_dedup_window_secs() -> u64 {
+    60
+}
+
 fn default_allowed_origins() -> String {
     // Empty string means: fall back to allow-all (*).
     // Operators set ALLOWED_ORIGINS=http://localhost:3000,https://app.example.com
@@ -312,6 +346,7 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("max_concurrent_jobs", 10)?
         .set_default("event_worker_threads", 4)?
         .set_default("fee_collection_interval_secs", 5)?
+        .set_default("fee_market_cache_ttl_secs", 1)?
         .set_default("fee_retention_days", 30)?
         .set_default("fee_analysis_enabled", true)?
         .set_default("emergency_verification_paused", false)?
@@ -320,6 +355,12 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("max_cache_size_mb", 100)?
         .set_default("cors_allowed_origins", "")?
         .set_default("event_bus_capacity", 256)?
+        // Issue #24: alert deduplication window, resolved at alarm-manager
+        // initialisation below.
+        .set_default(
+            "alarm_dedup_window_secs",
+            default_alarm_dedup_window_secs(),
+        )?
         .set_default("log_format_json", false)?
         .set_default("allowed_origins", "")?
         .build()?;
@@ -509,6 +550,8 @@ pub struct AppState {
     metrics: Arc<AppMetrics>,
     /// WebSocket event bus for simulation jobs.
     simulation_bus: Arc<SimulationBus>,
+    /// Stellar network passphrase (used for cache key generation)
+    network_passphrase: String,
 }
 
 #[derive(Clone)]
@@ -628,6 +671,36 @@ impl AppMetrics {
     }
 }
 
+/// Fee calculation mode for a simulation request.
+///
+/// When absent (or set to `"simulated"`), the engine computes the fee
+/// automatically from the measured Soroban resource consumption using the
+/// standard formula:
+///
+/// ```text
+/// cost_stroops = cpu_instructions / 10_000
+///              + ram_bytes / 1_024
+///              + (ledger_read_bytes + ledger_write_bytes) / 1_024
+/// ```
+///
+/// When set to `"custom"`, the caller supplies an explicit `cost_stroops`
+/// value that completely replaces the simulated figure. This is useful for
+/// what-if analysis (e.g. "what would this call cost at mainnet fee levels?")
+/// without having to run a separate simulation.
+#[derive(Debug, Clone, Deserialize, ToSchema, PartialEq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum FeeMode {
+    /// Derive the fee automatically from the simulation result (default).
+    Simulated,
+    /// Override the simulated fee with a caller-supplied value.
+    Custom {
+        /// The exact fee to report in the response, in stroops (1 XLM = 10 000 000 stroops).
+        /// Must be greater than zero.
+        #[schema(example = 5000)]
+        cost_stroops: u64,
+    },
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AnalyzeRequest {
     #[schema(example = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC")]
@@ -646,6 +719,13 @@ pub struct AnalyzeRequest {
     #[serde(default)]
     #[schema(example = false)]
     pub include_merkle_tree: Option<bool>,
+    /// Fee calculation mode.
+    ///
+    /// Omit (or set to `{"mode":"simulated"}`) to compute the fee from the
+    /// simulation result. Set to `{"mode":"custom","cost_stroops":<value>}` to
+    /// override the simulated fee with a caller-supplied stroop amount.
+    #[serde(default)]
+    pub fee_mode: Option<FeeMode>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -665,9 +745,17 @@ pub struct ResourceReport {
     /// Transaction size in bytes
     #[schema(example = 450)]
     pub transaction_size_bytes: u64,
-    /// Estimated cost in stroops
+    /// Estimated cost in stroops.
+    ///
+    /// Reflects the simulated resource cost when `fee_override_active` is
+    /// `false`, or the caller-supplied value from a `Custom` fee mode when
+    /// `fee_override_active` is `true`.
     #[schema(example = 1000)]
     pub cost_stroops: u64,
+    /// Whether the fee was overridden by a caller-supplied `FeeMode::Custom`
+    /// value rather than computed from the simulation.
+    #[schema(example = false)]
+    pub fee_override_active: bool,
     /// Report showing which data was injected vs live
     pub state_dependency: Option<Vec<StateDependencyReport>>,
     /// TTL status for touched ledger entries and extension suggestions.
@@ -676,6 +764,8 @@ pub struct ResourceReport {
     pub nutrition: NutritionReport,
     /// Cross-contract call graph
     pub call_graph: Option<crate::simulation::CallGraph>,
+    /// Maximum contract-to-contract call nesting depth (root = 1)
+    pub max_call_depth: Option<usize>,
     /// Call graph in Mermaid format
     pub call_graph_mermaid: Option<String>,
     /// Snapshot of the ledger state used/touched during simulation
@@ -861,6 +951,12 @@ pub struct ProfileWasmRequest {
     /// Optional function arguments.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Optional webhook configuration for profiling result notification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<crate::profiling_webhooks::ProfileWebhookConfig>,
+    /// Optional request ID for correlation with webhook delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 /// Response body for the WASM profiling endpoint.
@@ -921,6 +1017,7 @@ fn to_report(
     result: &SimulationResult,
     insights_engine: &InsightsEngine,
     merkle_tree_root: Option<String>,
+    fee_override_active: bool,
 ) -> ResourceReport {
     let insights_report = insights_engine.analyze(&result.resources);
 
@@ -931,6 +1028,7 @@ fn to_report(
         ledger_write_bytes: result.resources.ledger_write_bytes,
         transaction_size_bytes: result.resources.transaction_size_bytes,
         cost_stroops: result.cost_stroops,
+        fee_override_active,
         state_dependency: result.state_dependency.as_ref().map(|deps| {
             deps.iter()
                 .map(|d| StateDependencyReport {
@@ -980,6 +1078,7 @@ fn to_report(
                 .collect(),
         },
         call_graph: result.call_graph.clone(),
+        max_call_depth: result.call_graph.as_ref().map(|graph| graph.max_depth()),
         call_graph_mermaid: result.call_graph.as_ref().map(|g| g.to_mermaid()),
         state_snapshot: result.state_snapshot.clone(),
         protocol_version: result.protocol_version,
@@ -1023,8 +1122,12 @@ async fn analyze(
     tracing::info!("Received analyze request");
 
     let args = payload.args.clone().unwrap_or_default();
-    let cache_key =
-        SimulationCache::generate_key(&payload.contract_id, &payload.function_name, &args);
+    let cache_key = SimulationCache::generate_key_with_network(
+        &payload.contract_id,
+        &payload.function_name,
+        &args,
+        &state.network_passphrase,
+    );
 
     // Track simulation latency
     let start_time = std::time::Instant::now();
@@ -1140,6 +1243,27 @@ async fn analyze(
         None
     };
 
+    // Apply fee mode override: if the caller supplied a Custom fee mode,
+    // replace the simulated cost_stroops with the provided value.
+    let (result, fee_override_active) = match payload.fee_mode {
+        Some(FeeMode::Custom { cost_stroops }) => {
+            if cost_stroops == 0 {
+                return Err(AppError::BadRequest(
+                    "fee_mode.cost_stroops must be greater than zero".to_string(),
+                ));
+            }
+            tracing::info!(
+                simulated_cost_stroops = result.cost_stroops,
+                custom_cost_stroops = cost_stroops,
+                "Applying custom fee mode override"
+            );
+            let mut overridden = result;
+            overridden.cost_stroops = cost_stroops;
+            (overridden, true)
+        }
+        _ => (result, false),
+    };
+
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static("x-sky-moon-scope-cache"),
@@ -1153,7 +1277,7 @@ async fn analyze(
 
     Ok((
         headers,
-        Json(to_report(&result, &state.insights_engine, merkle_tree_root)),
+        Json(to_report(&result, &state.insights_engine, merkle_tree_root, fee_override_active)),
     ))
 }
 
@@ -1275,7 +1399,7 @@ async fn analyze_wasm(
         protocol_version: payload.protocol_version.unwrap_or(20),
     };
 
-    let report = to_report(&sim_result, &state.insights_engine, None);
+    let report = to_report(&sim_result, &state.insights_engine, None, false);
     state
         .metrics
         .resource_utilization_percent
@@ -1305,12 +1429,15 @@ async fn metrics_handler(
 
 async fn analyze_wasm_profile(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<ProfileWasmRequest>,
+    Json(mut payload): Json<ProfileWasmRequest>,
 ) -> Result<Json<ProfileResponse>, AppError> {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
+    let request_id = payload.request_id.clone();
+
     tracing::info!(
         function_name = %payload.function_name,
+        request_id = ?request_id,
         "Received WASM profile request"
     );
 
@@ -1348,8 +1475,42 @@ async fn analyze_wasm_profile(
     .map_err(|e| AppError::BadRequest(format!("Profiling failed: {}", e)))?;
 
     let (resources, profile) = result;
+    let response = ProfileResponse { profile, resources };
 
-    Ok(Json(ProfileResponse { profile, resources }))
+    // Deliver webhook asynchronously if configured.
+    if let Some(webhook_config) = payload.webhook.take() {
+        let profile_result = serde_json::to_value(&response.profile)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let webhook_payload = crate::profiling_webhooks::ProfilingWebhookPayload {
+            request_id,
+            function_name: payload.function_name.clone(),
+            result: profile_result,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+
+        let client = state.http_client.clone();
+        tokio::spawn(async move {
+            match crate::profiling_webhooks::deliver_profiling_webhook(&client, &webhook_config, webhook_payload).await {
+                Ok(_) => {
+                    tracing::info!(
+                        function_name = %payload.function_name,
+                        request_id = ?request_id,
+                        "Profiling webhook delivered successfully"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        function_name = %payload.function_name,
+                        request_id = ?request_id,
+                        error = %e,
+                        "Failed to deliver profiling webhook"
+                    );
+                }
+            }
+        });
+    }
+
+    Ok(Json(response))
 }
 
 // ── WASM branch analysis handler (Issue #101) ─────────────────────────────────
@@ -1477,6 +1638,7 @@ pub struct CompareApiResponse {
     responses(
         (status = 200, description = "Comparison report", body = CompareApiResponse),
         (status = 400, description = "Invalid request"),
+        (status = 404, description = "Baseline snapshot not found"),
         (status = 500, description = "Comparison failed")
     ),
     tag = "Analysis"
@@ -1594,9 +1756,10 @@ async fn compare_handler(
         }
     };
 
-    let report = comparison::run_comparison(&state.engine, compare_mode)
-        .await
-        .map_err(|e| AppError::Internal(format!("Comparison failed: {}", e)))?;
+    // `?` converts `ComparisonError` into `AppError` via the crate's `From`
+    // impl, so a missing baseline snapshot surfaces as `404 Not Found` instead
+    // of a generic `500`.
+    let report = comparison::run_comparison(&state.engine, compare_mode).await?;
 
     Ok(Json(CompareApiResponse { report }))
 }
@@ -1820,7 +1983,7 @@ async fn fee_analytics(
     ),
     components(schemas(
         AnalyzeRequest, AnalyzeWasmRequest, AnalyzeWasmBranchesRequest,
-        WasmBranchAnalysisResponse, ResourceReport,
+        WasmBranchAnalysisResponse, ResourceReport, FeeMode,
         OptimizeLimitsRequest, OptimizeLimitsResponse,
         CompareApiResponse, RegressionReport, ResourceDelta, RegressionFlag,
         crate::wasm_branch_analysis::BranchInfo,
@@ -2068,16 +2231,18 @@ async fn main() {
 
     // ── Tracing init (#572: JSON format + x-request-id correlation) ────
     let log_json = env::var("LOG_FORMAT").map(|v| v.to_lowercase() == "json").unwrap_or(false);
-    let filter = EnvFilter::from_default_env();
+    let filter = build_env_filter(&config.rust_log);
     if log_json {
         tracing_subscriber::registry()
             .with(filter)
             .with(tracing_subscriber::fmt::layer().json())
             .init();
     } else {
+        tracing_subscriber::registry()
+            .with(filter)
             .with(tracing_subscriber::fmt::layer())
+            .init();
     }
-        .with(build_env_filter(&config.rust_log))
 
     tracing::info!(rust_log = %config.rust_log, "Sky Moon Scope Starting...");
     tracing::info!("Sky Moon Scope initialized with config: {:?}", redacted_config(&config));
@@ -2127,11 +2292,14 @@ async fn main() {
 
     // ── CLI: merkle subcommand ──────────────────────────────────────────
     if args.len() > 1 && args[1] == "merkle" {
-        if args.len() < 4 {
-            eprintln!("Usage: sky-moon-scope-core merkle <build|proof> <args>");
+        if args.len() < 3 {
+            eprintln!("Usage: sky-moon-scope-core merkle <build|build-file|proof|visualize|visualize-file> <args>");
             eprintln!("Commands:");
-            eprintln!("  build <leaf1> <leaf2> ...            Build a Merkle tree and print the root hash");
+            eprintln!("  build <leaf1> <leaf2> ...              Build a Merkle tree and print the root hash");
+            eprintln!("  build-file <file>                      Build a Merkle tree from a newline-delimited leaf file");
             eprintln!("  proof <leaf_index> <leaf1> <leaf2> ... Generate a Merkle proof for the given leaf index");
+            eprintln!("  visualize <leaf1> <leaf2> ...          Visualize Merkle tree structure as ASCII art");
+            eprintln!("  visualize-file <file>                  Visualize Merkle tree structure from file as ASCII art");
             std::process::exit(1);
         }
 
@@ -2145,6 +2313,34 @@ async fn main() {
                 let leaves: Vec<Vec<u8>> = args[3..]
                     .iter()
                     .map(|arg| arg.as_bytes().to_vec())
+                    .collect();
+                let mut tree = merkle_tree::MerkleTree::new(32);
+                match tree.build(leaves) {
+                    Ok(()) => println!("{}", tree.get_root_hex()),
+                    Err(err) => {
+                        eprintln!("Error building Merkle tree: {}", err);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "build-file" => {
+                if args.len() < 4 {
+                    eprintln!("Usage: sky-moon-scope-core merkle build-file <file>");
+                    eprintln!("  Each non-empty line in <file> is treated as a leaf value.");
+                    std::process::exit(1);
+                }
+                let file_path = &args[3];
+                let content = match std::fs::read_to_string(file_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error reading {}: {}", file_path, e);
+                        std::process::exit(1);
+                    }
+                };
+                let leaves: Vec<Vec<u8>> = content
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.as_bytes().to_vec())
                     .collect();
                 let mut tree = merkle_tree::MerkleTree::new(32);
                 match tree.build(leaves) {
@@ -2193,13 +2389,80 @@ async fn main() {
                 });
                 println!("{}", serde_json::to_string_pretty(&output).unwrap());
             }
+            "visualize" | "ascii" | "tree" => {
+                if args.len() < 4 {
+                    eprintln!("Usage: sky-moon-scope-core merkle visualize <leaf1> <leaf2> ...");
+                    std::process::exit(1);
+                }
+                let leaves: Vec<Vec<u8>> = args[3..]
+                    .iter()
+                    .map(|arg| arg.as_bytes().to_vec())
+                    .collect();
+                let mut tree = merkle_tree::MerkleTree::new(32);
+                match tree.build(leaves) {
+                    Ok(()) => println!("{}", tree.to_ascii_art()),
+                    Err(err) => {
+                        eprintln!("Error building Merkle tree: {}", err);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "visualize-file" => {
+                if args.len() < 4 {
+                    eprintln!("Usage: sky-moon-scope-core merkle visualize-file <file>");
+                    eprintln!("  Each non-empty line in <file> is treated as a leaf value.");
+                    std::process::exit(1);
+                }
+                let file_path = &args[3];
+                let content = match std::fs::read_to_string(file_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error reading {}: {}", file_path, e);
+                        std::process::exit(1);
+                    }
+                };
+                let leaves: Vec<Vec<u8>> = content
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| l.as_bytes().to_vec())
+                    .collect();
+                let mut tree = merkle_tree::MerkleTree::new(32);
+                match tree.build(leaves) {
+                    Ok(()) => println!("{}", tree.to_ascii_art()),
+                    Err(err) => {
+                        eprintln!("Error building Merkle tree: {}", err);
+                        std::process::exit(1);
+                    }
+                }
+            }
             unknown => {
                 eprintln!("Unknown merkle command: {}", unknown);
-                eprintln!("Available commands: build, proof");
+                eprintln!("Available commands: build, build-file, proof, visualize, visualize-file");
                 std::process::exit(1);
             }
         }
 
+        return;
+    }
+
+    // ── CLI: visualize-merkle shortcut ──────────────────────────────────
+    if args.len() > 1 && (args[1] == "visualize-merkle" || args[1] == "merkle-ascii") {
+        if args.len() < 3 {
+            eprintln!("Usage: sky-moon-scope-core visualize-merkle <leaf1> <leaf2> ...");
+            std::process::exit(1);
+        }
+        let leaves: Vec<Vec<u8>> = args[2..]
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+        let mut tree = merkle_tree::MerkleTree::new(32);
+        match tree.build(leaves) {
+            Ok(()) => println!("{}", tree.to_ascii_art()),
+            Err(err) => {
+                eprintln!("Error building Merkle tree: {}", err);
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
@@ -2246,7 +2509,7 @@ async fn main() {
                 comparison::print_report(&report);
             }
             Err(e) => {
-                eprintln!("Error: Comparison failed: {}", e);
+                eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
@@ -2411,6 +2674,7 @@ async fn main() {
             collection_interval_secs: 5,
             batch_size: 50,
             request_timeout: std::time::Duration::from_secs(30),
+            market_data_cache_ttl: std::time::Duration::from_secs(config.fee_market_cache_ttl_secs),
         };
 
         let collector = Arc::new(FeeCollector::new(
@@ -2530,6 +2794,7 @@ async fn main() {
     let metrics = Arc::new(AppMetrics::new().expect("Failed to initialize Prometheus metrics"));
 
     let fee_store = Arc::new(FeeStore::new(db_pool.clone()));
+    let shared_results_store = Arc::new(SharedResultsStore::new(db_pool.clone()));
     let fee_analytics_engine = FeeAnalyticsEngine::new();
     let job_queue_config = JobQueueConfig {
         job_timeout_secs: config.job_timeout_secs,
@@ -2618,6 +2883,7 @@ async fn main() {
             collection_interval_secs: config.fee_collection_interval_secs,
             batch_size: 10,
             request_timeout: std::time::Duration::from_secs(10),
+            market_data_cache_ttl: std::time::Duration::from_secs(config.fee_market_cache_ttl_secs),
         };
 
         let leader_redis_client = redis::Client::open(config.redis_url.as_str())
@@ -2707,6 +2973,7 @@ async fn main() {
         metrics: Arc::clone(&app_metrics),
         metrics,
         simulation_bus,
+        network_passphrase: config.network_passphrase.clone(),
     });
 
     // ── Issue #592: System Resource Alarm Monitor ────────────────────────
@@ -2717,11 +2984,20 @@ async fn main() {
     // triggered hysteresis so a sustained saturation produces exactly
     // one breach notification (plus a recovery notification when the
     // resource drops back below threshold).
-    let alarm_config = crate::sys_alarms::SysAlarmConfig::from_env();
+    //
+    // Issue #24: the edge trigger fires on *every* crossing, so a resource
+    // flapping around the threshold would alert once per sample. The
+    // deduplication window (config: `alarm_dedup_window_secs`) caps that at
+    // one alert per resource per window.
+    let alarm_config = crate::sys_alarms::SysAlarmConfig::from_env()
+        .with_dedup_window_secs(config.alarm_dedup_window_secs);
     let alarm_monitor = crate::sys_alarms::SysAlarmMonitor::new(alarm_config)
         .with_metrics(Arc::clone(&app_metrics));
     if let Some(_alarm_handle) = alarm_monitor.spawn() {
-        tracing::info!("System resource alarm monitor spawned (issue #592)");
+        tracing::info!(
+            alarm_dedup_window_secs = config.alarm_dedup_window_secs,
+            "System resource alarm monitor spawned (issue #592)"
+        );
     }
     // Clone the bus Arc before app_state is moved into the router, so the gRPC
     // server can subscribe to the same broadcast channel.
@@ -2786,6 +3062,11 @@ async fn main() {
         .route("/fees/recommend", get(fee_recommend))
         .route("/fees/history", get(fee_history))
         .route("/fees/analytics", get(fee_analytics))
+        // Shared results routes (public access - links to view results)
+        .route("/api/shares", post(create_share))
+        .route("/api/shares/:share_id", get(get_share))
+        .route("/api/shares/:share_id/exists", get(check_share_exists))
+        .route("/api/shares/:share_id", axum::routing::delete(delete_share))
         // WebSocket streaming (Issue #105) authenticates during the upgrade.
         .route("/ws/jobs/:job_id", get(ws::ws_handler))
         // Inbound webhooks signature validation (Issue #582)
@@ -2796,6 +3077,10 @@ async fn main() {
             config.inbound_webhook_secret.clone(),
         ))))
         .layer(Extension(webhook_validation::InboundWebhookNonceCache::default()))
+        .layer(Extension(SharedResultsState {
+            store: shared_results_store,
+            base_url: format!("http://0.0.0.0:{}", config.server_port),
+        }))
         // GraphQL contract execution history + token metadata query layer.
         .route(
             "/graphql",
@@ -2805,6 +3090,10 @@ async fn main() {
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
+        // ── Error sanitization middleware (#error-security) ─────────────────
+        // Replaces 5xx error details with opaque messages while logging
+        // full Debug details server-side to prevent information leakage.
+        .layer(middleware::from_fn(error_middleware::error_sanitization_middleware))
         // ── x-request-id (#572) ───────────────────────────────────────
         // Assigns a UUID to every inbound request under the `x-request-id`
         // header and propagates it to outbound responses so clients can
@@ -3030,7 +3319,7 @@ mod tests {
         };
 
         let insights_engine = InsightsEngine::new();
-        let report = to_report(&sim_result, &insights_engine, None);
+        let report = to_report(&sim_result, &insights_engine, None, false);
 
         assert_eq!(report.cost_stroops, 5000);
         assert_eq!(report.cpu_instructions, 1000000);
@@ -3095,10 +3384,18 @@ mod tests {
         let event_pool = Arc::new(EventWorkerPool::new(4).unwrap());
         let app_state = Arc::new(AppState {
             engine: SimulationEngine::new("https://test.example.com".to_string()),
+            provider_registry: Arc::new(ProviderRegistry::new(Default::default())),
             cache: SimulationCache::new(),
             insights_engine: InsightsEngine::new(),
+            gas_golfing_analyzer: GasGolfingAnalyzer::new(),
             simulation_timeout: std::time::Duration::from_secs(30),
+            job_queue: JobQueue::new(10),
             event_worker_pool: Arc::clone(&event_pool),
+            fee_analytics_engine: FeeAnalyticsEngine::new(),
+            fee_store: Arc::new(FeeStore::new()),
+            metrics: Arc::new(AppMetrics::new().unwrap()),
+            simulation_bus: Arc::new(SimulationBus::new(100)),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
         });
         let auth_state = Arc::new(auth::AuthState::new(
             "test-secret".to_string(),
@@ -3258,6 +3555,121 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // ── FeeMode unit tests ────────────────────────────────────────────────────
+
+    /// to_report propagates cost_stroops from the SimulationResult unchanged
+    /// when fee_override_active=false (the default simulated path).
+    #[test]
+    fn test_to_report_no_fee_override_preserves_simulated_cost() {
+        let sim_result = SimulationResult {
+            resources: SorobanResources {
+                cpu_instructions: 500_000,
+                ram_bytes: 1_024,
+                ledger_read_bytes: 256,
+                ledger_write_bytes: 128,
+                transaction_size_bytes: 512,
+            },
+            transaction_hash: None,
+            latest_ledger: 100,
+            cost_stroops: 9_999,
+            state_dependency: None,
+            ttl_analysis: None,
+            transaction_data: "AAA".to_string(),
+            call_graph: None,
+            state_snapshot: None,
+            protocol_version: 20,
+        };
+
+        let insights_engine = InsightsEngine::new();
+        let report = to_report(&sim_result, &insights_engine, None, false);
+
+        assert_eq!(report.cost_stroops, 9_999);
+        assert!(!report.fee_override_active, "fee_override_active should be false");
+    }
+
+    /// to_report sets fee_override_active=true when the caller passes true,
+    /// signalling that the cost_stroops was already replaced in the handler.
+    #[test]
+    fn test_to_report_with_fee_override_flag() {
+        let mut sim_result = SimulationResult {
+            resources: SorobanResources {
+                cpu_instructions: 1_000_000,
+                ram_bytes: 2_048,
+                ledger_read_bytes: 512,
+                ledger_write_bytes: 256,
+                transaction_size_bytes: 1_024,
+            },
+            transaction_hash: None,
+            latest_ledger: 200,
+            cost_stroops: 5_000, // simulated value
+            state_dependency: None,
+            ttl_analysis: None,
+            transaction_data: "AAA".to_string(),
+            call_graph: None,
+            state_snapshot: None,
+            protocol_version: 21,
+        };
+
+        // Simulate the override that the analyze() handler performs before calling to_report.
+        let custom_stroops: u64 = 12_345;
+        sim_result.cost_stroops = custom_stroops;
+
+        let insights_engine = InsightsEngine::new();
+        let report = to_report(&sim_result, &insights_engine, None, true);
+
+        assert_eq!(report.cost_stroops, custom_stroops);
+        assert!(report.fee_override_active, "fee_override_active should be true");
+    }
+
+    /// FeeMode::Simulated deserialises from JSON.
+    #[test]
+    fn test_fee_mode_simulated_deserializes() {
+        let json = r#"{"mode":"simulated"}"#;
+        let mode: FeeMode = serde_json::from_str(json).expect("should deserialise");
+        assert_eq!(mode, FeeMode::Simulated);
+    }
+
+    /// FeeMode::Custom with a cost_stroops field deserialises from JSON.
+    #[test]
+    fn test_fee_mode_custom_deserializes() {
+        let json = r#"{"mode":"custom","cost_stroops":7500}"#;
+        let mode: FeeMode = serde_json::from_str(json).expect("should deserialise");
+        assert_eq!(mode, FeeMode::Custom { cost_stroops: 7_500 });
+    }
+
+    /// AnalyzeRequest with fee_mode omitted deserialises correctly
+    /// (fee_mode defaults to None).
+    #[test]
+    fn test_analyze_request_fee_mode_defaults_to_none() {
+        let json = r#"{"contract_id":"CTEST","function_name":"hello"}"#;
+        let req: AnalyzeRequest = serde_json::from_str(json).expect("should deserialise");
+        assert!(req.fee_mode.is_none());
+    }
+
+    /// AnalyzeRequest with an explicit Custom fee_mode deserialises the value.
+    #[test]
+    fn test_analyze_request_fee_mode_custom_round_trips() {
+        let json = r#"{
+            "contract_id": "CTEST",
+            "function_name": "hello",
+            "fee_mode": {"mode": "custom", "cost_stroops": 99000}
+        }"#;
+        let req: AnalyzeRequest = serde_json::from_str(json).expect("should deserialise");
+        assert_eq!(req.fee_mode, Some(FeeMode::Custom { cost_stroops: 99_000 }));
+    }
+
+    /// AnalyzeRequest with FeeMode::Simulated deserialises correctly.
+    #[test]
+    fn test_analyze_request_fee_mode_simulated_round_trips() {
+        let json = r#"{
+            "contract_id": "CTEST",
+            "function_name": "hello",
+            "fee_mode": {"mode": "simulated"}
+        }"#;
+        let req: AnalyzeRequest = serde_json::from_str(json).expect("should deserialise");
+        assert_eq!(req.fee_mode, Some(FeeMode::Simulated));
+    }
 }
 
 async fn analyze_simulation(
@@ -3267,5 +3679,3 @@ async fn analyze_simulation(
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
 }
-
-```

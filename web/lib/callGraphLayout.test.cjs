@@ -190,8 +190,8 @@ test('buildFlowElements leaves gas-less edges unlabelled and neutral', () => {
 });
 
 test('buildFlowElements returns empty arrays for an absent graph', () => {
-  assert.deepEqual(buildFlowElements(null), { nodes: [], edges: [] });
-  assert.deepEqual(buildFlowElements(undefined), { nodes: [], edges: [] });
+  assert.deepEqual(buildFlowElements(null), { nodes: [], edges: [], hasCycle: false });
+  assert.deepEqual(buildFlowElements(undefined), { nodes: [], edges: [], hasCycle: false });
 });
 
 test('buildFlowElements gives every node and edge a unique id', () => {

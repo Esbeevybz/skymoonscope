@@ -1,6 +1,6 @@
 # Governance Contract
 
-A comprehensive DAO governance system for Soroban implementing multi-step proposal workflows with voting, delegation, and timelock execution.
+A Comprehensive DAO governance system for Soroban implementing multi-step proposal workflows with voting, delegation, and timelock execution.
 
 ## Overview
 
@@ -20,6 +20,7 @@ This contract provides a full-featured governance system where proposals progres
 - **Timelock Execution**: Delayed execution for security
 - **Admin Controls**: Proposal cancellation and parameter management
 - **M-of-N Execution Authorization**: A configurable, distinct set of administrators must approve execution.
+- **Side-by-Side Version Comparison**: Compare two snapshots of the same proposal to see what changed.
 
 ## Multi-signature execution
 
@@ -38,9 +39,10 @@ The legacy `initialize` method configures a one-of-one execution policy for back
 enum ProposalState {
     Draft,      // Created but not voting
     Voting,     // Active voting period
-    Queued,     // Approved, waiting for timelock
-    Executed,   // Successfully executed
-    Cancelled,  // Cancelled by admin
+    Queued,      // Approved, waiting for timelock
+    Executed,    // Successfully executed
+    Cancelled,   // Cancelled by admin
+    Vetoed,      // Vetoed by the security council
 }
 ```
 
@@ -74,6 +76,38 @@ fn get_proposal(e: Env, proposal_id: u32) -> Proposal
 fn get_voting_power(e: Env, user: Address) -> i128
 fn get_effective_voting_power(e: Env, user: Address) -> i128  // Includes delegated power
 fn get_config(e: Env) -> GovernanceConfig
+```
+
+### Version Comparison
+```rust
+fn get_proposal_version(e: Env, proposal_id: u32, version: u32) -> Proposal
+fn compare_proposal_versions(e: Env, proposal_id: u32, version_a: u32, version_b: u32) -> ProposalComparison
+```
+
+Each proposal snapshot is stored under a `ProposalVersion(proposal_id, version)` storage key. `compare_proposal_versions` returns a `ProposalComparison` describing the side-by-side differences:
+
+| Field | Meaning |
+| --- | --- |
+| `title_changed` | The proposal title differs between versions |
+| `description_changed` | The description differs |
+| `actions_changed` | Any added, removed, or modified action |
+| `state_changed` | The proposal state differs |
+| `for_votes_changed` / `against_votes_changed` | Vote tallies differ |
+| `actions_added` | Count of actions present in version B but not in A  |
+| `actions_removed` | Count of actions present in version A but not in B |
+| `actions_modified` | Count of actions with the same target but different args |
+| `same_actions` | True when no action differences exist |
+| `identical` | True when every compared field is unchanged |
+
+Example:
+
+```rust
+// Snapshot two versions of proposal 7 and compare them.
+let comparison = client.compare_proposal_versions(&7, &1, &2);
+if comparison.title_changed {
+    // surface the title diff to users
+
+}
 ```
 
 ## Usage Example
@@ -137,15 +171,14 @@ cargo test --package soroban-governance-contract
 
 ## Parameters
 
-- **voting_period**: Duration of voting in seconds (e.g., 604800 = 7 days)
-- **timelock_delay**: Delay before execution in seconds (e.g., 172800 = 2 days)
+- **voting_period**: Duration of voting in seconds (e.g. 604800 = 7 days)
+- **timelock_delay**: Delay before execution in seconds (e.g. 172800 = 2 days)
 - **quorum_percentage**: Minimum participation as percentage of total voting power
 
 ## Future Enhancements
 
 - Quadratic voting
 - Proposal templates
-- Multi-signature execution
 - Cross-chain governance
 - Snapshot voting integration
 

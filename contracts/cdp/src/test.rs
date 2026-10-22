@@ -305,3 +305,103 @@ fn current_volatility_returns_oracle_value() {
     oracle.set_volatility(&10_000);
     assert_eq!(client.current_volatility_bps(), 10_000);
 }
+
+// ---------------------------------------------------------------------------
+// Governance-controlled liquidation threshold (issue #70)
+// ---------------------------------------------------------------------------
+
+/// The liquidation threshold is readable and changeable without redeploying.
+#[test]
+fn liquidation_threshold_is_governance_controllable() {
+    let (env, contract_id, _admin, _borrower, _liq, _collateral, _oracle) = setup();
+    let client = CdpContractClient::new(&env, &contract_id);
+
+    // Initialised at 150%.
+    assert_eq!(client.liquidation_threshold_bps(), Ok(15_000));
+
+    // Governance raises it to 200%.
+    assert_eq!(client.set_liquidation_threshold(&20_000), Ok(()));
+    assert_eq!(client.liquidation_threshold_bps(), Ok(20_000));
+    assert_eq!(
+        client.get_risk_params().unwrap().min_collateral_ratio_bps,
+        20_000
+    );
+
+    // And lowers it again.
+    assert_eq!(client.set_liquidation_threshold(&12_500), Ok(()));
+    assert_eq!(client.liquidation_threshold_bps(), Ok(12_500));
+}
+
+/// Only the admin may move the threshold.
+#[test]
+fn liquidation_threshold_setter_is_admin_gated() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    let (env, contract_id, _admin, _borrower, _liq, _collateral, _oracle) = setup();
+    let client = CdpContractClient::new(&env, &contract_id);
+
+    let attacker = Address::generate(&env);
+    let res = client
+        .mock_auths(&[MockAuth {
+            address: &attacker,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "set_liquidation_threshold",
+                args: (1i128,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_set_liquidation_threshold(&1);
+
+    assert!(res.is_err());
+    // Unchanged.
+    assert_eq!(client.liquidation_threshold_bps(), Ok(15_000));
+}
+
+/// Nonsensical thresholds are rejected rather than written to storage.
+#[test]
+fn liquidation_threshold_setter_validates_input() {
+    let (env, contract_id, _admin, _borrower, _liq, _collateral, _oracle) = setup();
+    let client = CdpContractClient::new(&env, &contract_id);
+
+    // At or below 100% leaves no room for oracle drift.
+    assert_eq!(
+        client.try_set_liquidation_threshold(&0),
+        Err(Ok(Error::InvalidConfig))
+    );
+    assert_eq!(
+        client.try_set_liquidation_threshold(&10_000),
+        Err(Ok(Error::InvalidConfig))
+    );
+    // Absurdly high.
+    assert_eq!(
+        client.try_set_liquidation_threshold(&1_000_000),
+        Err(Ok(Error::InvalidConfig))
+    );
+
+    // Still the initial value after every rejection.
+    assert_eq!(client.liquidation_threshold_bps(), Ok(15_000));
+}
+
+/// Updating the incentive leaves the threshold alone, and vice versa.
+#[test]
+fn risk_param_setters_are_independent() {
+    let (env, contract_id, _admin, _borrower, _liq, _collateral, _oracle) = setup();
+    let client = CdpContractClient::new(&env, &contract_id);
+
+    let before = client.get_risk_params().unwrap();
+
+    assert_eq!(client.set_liquidation_threshold(&18_000), Ok(()));
+    let after_threshold = client.get_risk_params().unwrap();
+    assert_eq!(after_threshold.min_collateral_ratio_bps, 18_000);
+    assert_eq!(
+        after_threshold.liquidation_incentive_bps,
+        before.liquidation_incentive_bps
+    );
+
+    assert_eq!(client.set_liquidation_incentive(&500), Ok(()));
+    let after_incentive = client.get_risk_params().unwrap();
+    assert_eq!(after_incentive.min_collateral_ratio_bps, 18_000);
+    assert_eq!(after_incentive.liquidation_incentive_bps, 500);
+}

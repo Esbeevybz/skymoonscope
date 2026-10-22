@@ -79,8 +79,18 @@ Anything else is rejected with `InvalidConfig`.
 | `get_pool()` / `get_guards()` / `get_bids()` / `get_asks()` | Views |
 | `get_spot_price()` | Pool spot price, or 0 when the pool is empty |
 | `get_match_depth_used()` / `get_match_depth_remaining()` | Current ledger's depth budget |
+| `estimate_inclusion_probability(fee_bid)` | Estimated probability that a fee bid is included, in basis points |
 
 Prices are `token_b` per `token_a`, scaled by `PRICE_SCALE` (1e6).
+
+## Inclusion probability
+
+`estimate_inclusion_probability(fee_bid)` returns an estimate, in basis points
+(`0..=10_000`), of the probability that a transaction bidding `fee_bid` is
+included. The estimate is monotonic non-decreasing in `fee_bid`: a higher bid
+never yields a lower probability. A zero bid returns 0, and bids at or above the
+saturation threshold return `10_000` (certain inclusion). The function is a pure
+view and does not mutate contract state.
 
 ## Settlement
 

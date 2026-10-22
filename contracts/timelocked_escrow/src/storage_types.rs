@@ -9,6 +9,8 @@ pub enum DataKey {
     Guardians,
     Approvals,
     ApprovalEpoch,
+    PendingRotation,
+    RotationDelayLedgers,
 }
 
 // ── Escrow Configuration ──────────────────────────────────────
@@ -25,6 +27,15 @@ pub struct EscrowConfig {
     pub is_cancelled: bool,
     pub cancellation_fee_bps: u32,
     pub protocol_vault: Address,
+}
+
+// ── Pending Guardian Rotation ─────────────────────────────────
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PendingGuardianRotation {
+    pub new_guardians: Vec<Address>,
+    pub eta: u32,
 }
 
 // ── Errors ────────────────────────────────────────────────────
@@ -46,6 +57,8 @@ pub enum Error {
     InvalidGuardianCount = 11,
     DuplicateGuardian = 12,
     CancellationFeeTooHigh = 13,
+    NoPendingRotation = 14,
+    RotationTimelockNotElapsed = 15,
 }
 
 // ── Event Structs ─────────────────────────────────────────────
@@ -95,6 +108,19 @@ pub struct MutualCancelEvent {
     pub amount: i128,
     pub fee: i128,
     pub protocol_vault: Address,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct GuardianRotationProposedEvent {
+    pub new_guardians: Vec<Address>,
+    pub eta: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct GuardianRotationCancelledEvent {
+    pub canceller: Address,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

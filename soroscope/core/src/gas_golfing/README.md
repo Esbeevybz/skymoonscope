@@ -7,7 +7,7 @@ Automated static analysis of Soroban smart contract WASM bytecode to identify ga
 Gas golfing analysis helps developers optimize their Soroban contracts by detecting common inefficient patterns in the compiled WASM bytecode. The analyzer identifies opportunities for:
 
 - **Loop optimizations** - Replacing inefficient loop patterns with bitwise operations
-- **Memory allocation improvements** - Reducing excessive memory operations
+- **Memory allocation improvements** - Reducing excessive memory operations and repeated scratch-space growth
 - **Arithmetic optimizations** - Using bitwise shifts instead of expensive operations
 - **Storage batching** - Minimizing redundant storage reads/writes
 - **Branch optimization** - Simplifying complex conditional logic

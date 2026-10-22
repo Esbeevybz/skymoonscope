@@ -3,12 +3,14 @@
 use super::*;
 use soroban_sdk::{Env, Vec};
 
+#[allow(dead_code)]
 fn setup(env: &Env) -> CpuHeavyContractClient<'_> {
     let contract_id = env.register(CpuHeavyContract, ());
     CpuHeavyContractClient::new(env, &contract_id)
 }
 
 /// Builds a descending `[n-1, ..., 0]` list, the worst case for bubble sort.
+#[allow(dead_code)]
 fn descending(env: &Env, n: u32) -> Vec<u32> {
     let mut v = Vec::new(env);
     for i in (0..n).rev() {
@@ -20,6 +22,7 @@ fn descending(env: &Env, n: u32) -> Vec<u32> {
 // ── Happy paths ──────────────────────────────────────────────────────────────
 
 #[test]
+#[allow(dead_code)]
 fn test_benchmarks_run_successfully() {
     let env = Env::default();
     let client = setup(&env);
@@ -34,6 +37,7 @@ fn test_benchmarks_run_successfully() {
 }
 
 #[test]
+#[allow(dead_code)]
 fn test_combined_benchmark() {
     let env = Env::default();
     let client = setup(&env);
@@ -45,6 +49,7 @@ fn test_combined_benchmark() {
 }
 
 #[test]
+#[allow(dead_code)]
 fn test_bubble_sort_handles_degenerate_lengths() {
     let env = Env::default();
     let client = setup(&env);
@@ -59,6 +64,7 @@ fn test_bubble_sort_handles_degenerate_lengths() {
 // ── Guards accept inputs exactly at the cap ──────────────────────────────────
 
 #[test]
+#[allow(dead_code)]
 fn test_inputs_at_the_cap_are_accepted() {
     let env = Env::default();
     let client = setup(&env);
@@ -80,6 +86,7 @@ fn test_inputs_at_the_cap_are_accepted() {
 /// WASM instructions. The WASM figures behind each constant are recorded in
 /// `lib.rs`.
 #[test]
+#[allow(dead_code)]
 fn test_worst_case_call_stays_within_default_budget() {
     let env = Env::default();
     let client = setup(&env);
@@ -103,6 +110,7 @@ fn test_worst_case_call_stays_within_default_budget() {
 // ── Guards reject inputs past the cap with a clean error code ────────────────
 
 #[test]
+#[allow(dead_code)]
 fn test_fibonacci_rejects_oversized_input() {
     let env = Env::default();
     let client = setup(&env);
@@ -118,6 +126,7 @@ fn test_fibonacci_rejects_oversized_input() {
 }
 
 #[test]
+#[allow(dead_code)]
 fn test_bubble_sort_rejects_oversized_input() {
     let env = Env::default();
     let client = setup(&env);
@@ -129,6 +138,7 @@ fn test_bubble_sort_rejects_oversized_input() {
 }
 
 #[test]
+#[allow(dead_code)]
 fn test_count_primes_rejects_oversized_input() {
     let env = Env::default();
     let client = setup(&env);
@@ -140,6 +150,7 @@ fn test_count_primes_rejects_oversized_input() {
 }
 
 #[test]
+#[allow(dead_code)]
 fn test_nested_loop_burn_rejects_oversized_input() {
     let env = Env::default();
     let client = setup(&env);
@@ -158,6 +169,7 @@ fn test_nested_loop_burn_rejects_oversized_input() {
 /// `outer * inner` overflows `u32`, so a naive `outer * inner` guard would wrap
 /// to a small number and wave the call through. `saturating_mul` must not.
 #[test]
+#[allow(dead_code)]
 fn test_nested_loop_burn_guard_survives_multiplication_overflow() {
     let env = Env::default();
     let client = setup(&env);
@@ -173,6 +185,7 @@ fn test_nested_loop_burn_guard_survives_multiplication_overflow() {
 }
 
 #[test]
+#[allow(dead_code)]
 fn test_combined_benchmark_rejects_each_oversized_argument() {
     let env = Env::default();
     let client = setup(&env);
@@ -194,6 +207,7 @@ fn test_combined_benchmark_rejects_each_oversized_argument() {
 /// the budget essentially untouched — that is what distinguishes a guard from a
 /// host budget abort.
 #[test]
+#[allow(dead_code)]
 fn test_rejected_call_does_no_work() {
     let env = Env::default();
     let client = setup(&env);
@@ -212,6 +226,7 @@ fn test_rejected_call_does_no_work() {
 /// UI decodes them by number, so reordering the enum would silently change what
 /// users see.
 #[test]
+#[allow(dead_code)]
 fn test_error_codes_are_stable() {
     assert_eq!(Error::FibonacciInputTooLarge as u32, 1);
     assert_eq!(Error::SortInputTooLarge as u32, 2);

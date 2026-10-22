@@ -2323,7 +2323,10 @@ fn test_swap_exact_in_prevents_1_stroop_micro_swap_exploit() {
 
     assert_eq!(client.get_amount_out(&false, &1), 0);
     let input_for_one = client.get_amount_in(&false, &1);
-    assert!(input_for_one > 1, "1 stroop must require a positive pool-favoring input: {input_for_one}");
+    assert!(
+        input_for_one > 1,
+        "1 stroop must require a positive pool-favoring input: {input_for_one}"
+    );
     assert_eq!(
         client.try_swap_exact_in(&trader, &false, &1, &0),
         Err(Ok(Error::InsufficientLiquidity))

@@ -25,8 +25,8 @@ impl SimpleToken {
             .instance()
             .set(&DataKey::Balance(admin.clone()), &initial_supply);
 
-        let admins = vec![&env, admin];
-        EmergencyGuard::initialize(env.clone(), admins, 1).expect("Failed to init guard");
+        let admins = vec![&env, admin.clone()];
+        EmergencyGuard::initialize(env.clone(), admins, 1, admin.clone()).expect("Failed to init guard");
     }
 
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
@@ -127,10 +127,6 @@ impl SimpleToken {
         env.storage()
             .instance()
             .set(&DataKey::TotalSupply, &(supply - amount));
-    }
-
-    pub fn get_pause_state(env: Env) -> u32 {
-        EmergencyGuard::get_pause_state(env)
     }
 
     // ==== EMERGENCY GUARD FUNCTIONS ====

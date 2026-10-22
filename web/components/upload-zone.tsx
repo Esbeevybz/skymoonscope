@@ -222,8 +222,6 @@ export function UploadZone({
   onFileReady,
   onReset,
   backendUrl,
-  enableBackendValidation = true
-  backendUrl = 'http://localhost:8080/analyze/wasm',
   enableBackendValidation = true,
 }: UploadZoneProps) {
   // Falls back to the configured backend (see /settings) when not overridden.
