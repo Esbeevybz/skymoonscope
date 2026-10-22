@@ -138,33 +138,25 @@ fn bench_append_vs_rebuild(c: &mut Criterion) {
         // Full rebuild: build from scratch with all leaves
         let all_leaves = make_leaves(n + append_count);
         group.throughput(Throughput::Elements((n + append_count) as u64));
-        group.bench_with_input(
-            BenchmarkId::new("full_rebuild", n),
-            &n,
-            |b, _| {
-                b.iter(|| {
-                    let mut tree = MerkleTree::new(32);
-                    tree.build(all_leaves.clone()).unwrap();
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("full_rebuild", n), &n, |b, _| {
+            b.iter(|| {
+                let mut tree = MerkleTree::new(32);
+                tree.build(all_leaves.clone()).unwrap();
+            });
+        });
 
         // Incremental append
         let base_leaves = make_leaves(n);
         let append_leaves: Vec<Vec<u8>> = (n..n + append_count)
             .map(|i| (i as u64).to_le_bytes().to_vec())
             .collect();
-        group.bench_with_input(
-            BenchmarkId::new("incremental_append", n),
-            &n,
-            |b, _| {
-                b.iter(|| {
-                    let mut tree = MerkleTree::new(32);
-                    tree.build(base_leaves.clone()).unwrap();
-                    tree.append_leaves(append_leaves.clone()).unwrap();
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("incremental_append", n), &n, |b, _| {
+            b.iter(|| {
+                let mut tree = MerkleTree::new(32);
+                tree.build(base_leaves.clone()).unwrap();
+                tree.append_leaves(append_leaves.clone()).unwrap();
+            });
+        });
     }
 
     group.finish();
@@ -181,16 +173,12 @@ fn bench_update_leaf(c: &mut Criterion) {
         let mut modified_leaves = leaves.clone();
         modified_leaves[0] = vec![0xffu8; 8];
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(
-            BenchmarkId::new("full_rebuild_update", n),
-            &n,
-            |b, _| {
-                b.iter(|| {
-                    let mut tree = MerkleTree::new(32);
-                    tree.build(modified_leaves.clone()).unwrap();
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("full_rebuild_update", n), &n, |b, _| {
+            b.iter(|| {
+                let mut tree = MerkleTree::new(32);
+                tree.build(modified_leaves.clone()).unwrap();
+            });
+        });
 
         // Incremental update
         group.bench_with_input(

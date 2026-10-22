@@ -644,9 +644,10 @@ impl WasmInstrumenter {
                     // If parsing or re-encoding fails or panics (e.g. malformed Name subsections
                     // or unknown custom formatting), we fall back to preserving the custom
                     // section as raw bytes so instrumentation never fails or panics on custom sections.
-                    let reencode_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        reencoder.parse_custom_section(&mut module, reader)
-                    }));
+                    let reencode_res =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            reencoder.parse_custom_section(&mut module, reader)
+                        }));
                     match reencode_res {
                         Ok(Ok(())) => {}
                         _ => {
@@ -1057,6 +1058,34 @@ pub enum AuthSigner {
     SecretKey { secret: String },
     /// A fully-formed, already-signed `SorobanAuthorizationEntry` in base64 XDR.
     PreSignedXdr { xdr: String },
+    /// A custom auth entry injected for privileged function testing.
+    ///
+    /// Unlike `SecretKey` (which requires the actual private key) and
+    /// `PreSignedXdr` (which requires a fully-formed XDR blob), `CustomEntry`
+    /// lets the caller specify the signer address, nonce, and expiration
+    /// ledger directly. The signature is optional — when omitted the engine
+    /// produces an entry with an empty signature map, which is accepted by
+    /// `simulateTransaction` on networks that do not enforce signature
+    /// verification during simulation (e.g. local sandbox or testnet with
+    /// relaxed auth).
+    ///
+    /// This is primarily useful for:
+    /// - Testing privileged admin functions without holding the admin key
+    /// - Simulating multi-sig scenarios where only one signer is available
+    /// - Dry-running governance proposals before collecting signatures
+    CustomEntry {
+        /// The Stellar account address (G...) that the auth entry is for.
+        address: String,
+        /// Optional nonce. If omitted, a deterministic nonce is derived from
+        /// the address and invocation.
+        nonce: Option<i64>,
+        /// Ledger at which the auth entry expires. If omitted, uses the
+        /// `expiration_ledger` passed to `simulate_with_auth`.
+        signature_expiration_ledger: Option<u32>,
+        /// Optional pre-computed signature bytes. If omitted, the entry is
+        /// created with an empty signature map (unsigned).
+        signature: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -2054,7 +2083,8 @@ impl SimulationEngine {
         }
 
         let mut last_error: Option<SimulationError> = None;
-        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(self.max_total_retry_duration_secs);
+        let retry_deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(self.max_total_retry_duration_secs);
 
         for provider in &providers {
             // Check if we've exceeded the maximum total retry duration
@@ -3152,8 +3182,107 @@ impl SimulationEngine {
                     network_passphrase,
                     expiration_ledger,
                 ),
+                AuthSigner::CustomEntry {
+                    address,
+                    nonce,
+                    signature_expiration_ledger,
+                    signature,
+                } => self.build_custom_auth_entry(
+                    address,
+                    *nonce,
+                    signature_expiration_ledger.unwrap_or(expiration_ledger),
+                    signature.as_deref(),
+                    root_invocation,
+                ),
             })
             .collect()
+    }
+
+    /// Build a `SorobanAuthorizationEntry` from a custom address without
+    /// requiring the actual private key.
+    ///
+    /// This is the core of the privileged-function-testing feature (#336).
+    /// It constructs a fully-formed auth entry with either an empty
+    /// signature map (for simulation on networks with relaxed auth) or
+    /// a caller-supplied signature.
+    pub fn build_custom_auth_entry(
+        &self,
+        address_str: &str,
+        nonce: Option<i64>,
+        expiration_ledger: u32,
+        signature: Option<&str>,
+        invocation: &SorobanAuthorizedInvocation,
+    ) -> Result<SorobanAuthorizationEntry, SimulationError> {
+        // Parse the Stellar public key (G...)
+        let strkey = Strkey::from_string(address_str).map_err(|e| {
+            SimulationError::NodeError(format!("Invalid address for custom auth entry: {e}"))
+        })?;
+        let public_key = match strkey {
+            Strkey::PublicKeyEd25519(pk) => pk.0,
+            _ => {
+                return Err(SimulationError::NodeError(
+                    "Custom auth entry requires a G... account address".to_string(),
+                ))
+            }
+        };
+
+        // Derive a deterministic nonce if not provided
+        let nonce = match nonce {
+            Some(n) => n,
+            None => {
+                let invocation_xdr = invocation
+                    .to_xdr(Limits::none())
+                    .map_err(|e| SimulationError::XdrError(format!("Encode invocation: {e}")))?;
+                let nonce_input = [&public_key[..], &invocation_xdr[..]].concat();
+                let nonce_hash = Sha256::digest(&nonce_input);
+                i64::from_be_bytes(nonce_hash[..8].try_into().map_err(|_| {
+                    SimulationError::XdrError("Failed to derive nonce from hash".to_string())
+                })?)
+            }
+        };
+
+        // Build the signature map
+        let sig_map = match signature {
+            Some(sig_hex) => {
+                // Caller provided a signature — decode from hex and embed
+                let sig_bytes = hex::decode(sig_hex).map_err(|e| {
+                    SimulationError::NodeError(format!("Invalid signature hex: {e}"))
+                })?;
+                ScVal::Map(Some(
+                    vec![ScMapEntry {
+                        key: ScVal::Bytes(
+                            public_key
+                                .to_vec()
+                                .try_into()
+                                .map_err(|_| SimulationError::XdrError("pubkey bytes".into()))?,
+                        ),
+                        val: ScVal::Bytes(
+                            sig_bytes
+                                .try_into()
+                                .map_err(|_| SimulationError::XdrError("sig bytes".into()))?,
+                        ),
+                    }]
+                    .try_into()
+                    .map_err(|_| SimulationError::XdrError("sig map".into()))?,
+                ))
+            }
+            None => {
+                // No signature — empty map (unsigned, for simulation-only)
+                ScVal::Map(None)
+            }
+        };
+
+        Ok(SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    public_key,
+                )))),
+                nonce,
+                signature_expiration_ledger: expiration_ledger,
+                signature: sig_map,
+            }),
+            root_invocation: invocation.clone(),
+        })
     }
 
     /// Parse a Stellar secret key, build a `SorobanAuthorizationEntry`,
@@ -3379,31 +3508,32 @@ pub fn profile_contract_with_flamegraph(
     let _enter = span.enter();
 
     // ── Attempt binary instrumentation ───────────────────────────────────────
-    let (instrumented, func_names, use_budget_fallback) = match std::panic::catch_unwind(
-        std::panic::AssertUnwindSafe(|| {
+    let (instrumented, func_names, use_budget_fallback) =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             WasmInstrumenter::new(&wasm_bytes).and_then(|instrumenter| {
                 let names = instrumenter.func_names().to_vec();
-                instrumenter.instrument(&wasm_bytes).map(|bytes| (bytes, names))
+                instrumenter
+                    .instrument(&wasm_bytes)
+                    .map(|bytes| (bytes, names))
             })
-        }),
-    ) {
-        Ok(Ok((bytes, names))) => (bytes, names, false),
-        Ok(Err(e)) => {
-            tracing::error!(
-                wasm_size_bytes = wasm_size,
-                error = %e,
-                "WASM instrumentation failed; falling back to budget API"
-            );
-            (wasm_bytes.clone(), vec![], true)
-        }
-        Err(_) => {
-            tracing::error!(
-                wasm_size_bytes = wasm_size,
-                "WASM instrumentation panicked; falling back to budget API"
-            );
-            (wasm_bytes.clone(), vec![], true)
-        }
-    };
+        })) {
+            Ok(Ok((bytes, names))) => (bytes, names, false),
+            Ok(Err(e)) => {
+                tracing::error!(
+                    wasm_size_bytes = wasm_size,
+                    error = %e,
+                    "WASM instrumentation failed; falling back to budget API"
+                );
+                (wasm_bytes.clone(), vec![], true)
+            }
+            Err(_) => {
+                tracing::error!(
+                    wasm_size_bytes = wasm_size,
+                    "WASM instrumentation panicked; falling back to budget API"
+                );
+                (wasm_bytes.clone(), vec![], true)
+            }
+        };
 
     // ── Execute in soroban-sdk Env ────────────────────────────────────────────
     let env = Env::default();
@@ -3986,10 +4116,7 @@ mod tests {
 
     #[test]
     fn test_extract_soroban_budget_limits_missing_values_returns_none() {
-        assert_eq!(
-            extract_soroban_budget_limits("budget: cpu: 123"),
-            None
-        );
+        assert_eq!(extract_soroban_budget_limits("budget: cpu: 123"), None);
     }
 
     #[test]
@@ -4342,6 +4469,254 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_signer_custom_entry_serialization() {
+        let signer = AuthSigner::CustomEntry {
+            address: "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_string(),
+            nonce: Some(12345),
+            signature_expiration_ledger: Some(1000),
+            signature: None,
+        };
+        let json = serde_json::to_string(&signer).unwrap();
+        assert!(json.contains("custom_entry"));
+        assert!(json.contains("GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"));
+        let deserialized: AuthSigner = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            AuthSigner::CustomEntry { address, nonce, .. } => {
+                assert_eq!(
+                    address,
+                    "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+                );
+                assert_eq!(nonce, Some(12345));
+            }
+            _ => panic!("Expected CustomEntry variant"),
+        }
+    }
+
+    #[test]
+    fn test_build_custom_auth_entry_unsigned() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+
+        // Use a well-known testnet public key
+        let addr = "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let entry = engine
+            .build_custom_auth_entry(addr, None, 1000, None, &dummy_inv)
+            .expect("custom auth entry builds");
+
+        // Verify it's an Address credentials type
+        match entry.credentials {
+            SorobanCredentials::Address(ref creds) => {
+                // Verify address is an Account
+                match &creds.address {
+                    ScAddress::Account(_) => {}
+                    _ => panic!("Expected Account address"),
+                }
+                // Verify expiration ledger
+                assert_eq!(creds.signature_expiration_ledger, 1000);
+                // Verify nonce was derived (non-zero)
+                assert!(creds.nonce != 0);
+                // Verify signature is empty (unsigned)
+                match &creds.signature {
+                    ScVal::Map(None) => {}
+                    _ => panic!("Expected empty signature map for unsigned entry"),
+                }
+            }
+            _ => panic!("Expected Address credentials"),
+        }
+
+        // Verify root invocation is preserved
+        assert_eq!(
+            entry.root_invocation.to_xdr(Limits::none()).unwrap(),
+            dummy_inv.to_xdr(Limits::none()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_build_custom_auth_entry_with_explicit_nonce() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+
+        let addr = "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let entry = engine
+            .build_custom_auth_entry(addr, Some(999), 500, None, &dummy_inv)
+            .expect("custom auth entry builds");
+
+        match entry.credentials {
+            SorobanCredentials::Address(ref creds) => {
+                assert_eq!(creds.nonce, 999);
+                assert_eq!(creds.signature_expiration_ledger, 500);
+            }
+            _ => panic!("Expected Address credentials"),
+        }
+    }
+
+    #[test]
+    fn test_build_custom_auth_entry_with_signature() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+
+        let addr = "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        // 64-byte dummy signature in hex
+        let sig_hex = hex::encode(&[0xAAu8; 64]);
+        let entry = engine
+            .build_custom_auth_entry(addr, None, 1000, Some(&sig_hex), &dummy_inv)
+            .expect("custom auth entry builds with signature");
+
+        match entry.credentials {
+            SorobanCredentials::Address(ref creds) => {
+                match &creds.signature {
+                    ScVal::Map(Some(map)) => {
+                        // Should have exactly one entry (pubkey -> sig)
+                        assert_eq!(map.len(), 1);
+                    }
+                    _ => panic!("Expected non-empty signature map"),
+                }
+            }
+            _ => panic!("Expected Address credentials"),
+        }
+    }
+
+    #[test]
+    fn test_build_custom_auth_entry_invalid_address_rejected() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+
+        let result = engine.build_custom_auth_entry("NOT_AN_ADDRESS", None, 1000, None, &dummy_inv);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_custom_auth_entry_contract_address_rejected() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+
+        // C... is a contract address, not an account — must be rejected
+        let result = engine.build_custom_auth_entry(
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+            None,
+            1000,
+            None,
+            &dummy_inv,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_collect_auth_entries_with_custom_entry() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+
+        let signers = vec![AuthSigner::CustomEntry {
+            address: "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_string(),
+            nonce: Some(42),
+            signature_expiration_ledger: None,
+            signature: None,
+        }];
+
+        let entries = engine
+            .collect_auth_entries(&signers, &dummy_inv, "Test", 2000)
+            .expect("collect succeeds");
+
+        assert_eq!(entries.len(), 1);
+        match &entries[0].credentials {
+            SorobanCredentials::Address(creds) => {
+                assert_eq!(creds.nonce, 42);
+                // expiration_ledger should default to the one passed to collect_auth_entries
+                assert_eq!(creds.signature_expiration_ledger, 2000);
+            }
+            _ => panic!("Expected Address credentials"),
+        }
+    }
+
+    #[test]
+    fn test_collect_auth_entries_mixed_signers() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+
+        // Mix of CustomEntry (unsigned) and PreSignedXdr (will fail decode, but tests dispatch)
+        let signers = vec![AuthSigner::CustomEntry {
+            address: "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC".to_string(),
+            nonce: None,
+            signature_expiration_ledger: Some(500),
+            signature: None,
+        }];
+
+        let entries = engine
+            .collect_auth_entries(&signers, &dummy_inv, "Test", 1000)
+            .expect("collect succeeds");
+
+        assert_eq!(entries.len(), 1);
+        match &entries[0].credentials {
+            SorobanCredentials::Address(creds) => {
+                // Should use the explicit 500, not the default 1000
+                assert_eq!(creds.signature_expiration_ledger, 500);
+            }
+            _ => panic!("Expected Address credentials"),
+        }
+    }
+
+    #[test]
+    fn test_build_custom_auth_entry_serializes_to_xdr() {
+        let engine = SimulationEngine::new("https://test.com".to_string());
+        let dummy_inv = SimulationEngine::build_root_invocation(
+            ScAddress::Contract(Hash([0u8; 32])),
+            "fn".try_into().unwrap(),
+            VecM::default(),
+        );
+
+        let addr = "GDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let entry = engine
+            .build_custom_auth_entry(addr, Some(123), 1000, None, &dummy_inv)
+            .expect("custom auth entry builds");
+
+        // Must serialize to valid XDR
+        let xdr_bytes = entry
+            .to_xdr(Limits::none())
+            .expect("auth entry serializes to XDR");
+        assert!(!xdr_bytes.is_empty());
+
+        // Must round-trip back from XDR
+        let round_tripped = SorobanAuthorizationEntry::from_xdr(&xdr_bytes, Limits::none())
+            .expect("auth entry deserializes from XDR");
+
+        match round_tripped.credentials {
+            SorobanCredentials::Address(creds) => {
+                assert_eq!(creds.nonce, 123);
+                assert_eq!(creds.signature_expiration_ledger, 1000);
+            }
+            _ => panic!("Expected Address credentials after XDR round-trip"),
+        }
+    }
+
+    #[test]
     fn test_build_extend_ttl_suggestions_flags_low_ttl_entries() {
         let entries = vec![
             TtlEntryReport {
@@ -4485,7 +4860,8 @@ mod tests {
             if let Ok(Payload::ExportSection(reader)) = payload {
                 for export in reader {
                     let export = export.unwrap();
-                    if export.kind == ExternalKind::Func && export.name == "sky_moon_scope_count_0" {
+                    if export.kind == ExternalKind::Func && export.name == "sky_moon_scope_count_0"
+                    {
                         found = true;
                     }
                 }
@@ -4774,7 +5150,9 @@ mod tests {
     fn test_wasm_instrumenter_custom_sections_preserved() {
         let wasm = soroban_wasm_with_custom_sections();
         let instr = WasmInstrumenter::new(&wasm).expect("instrumenter creation should succeed");
-        let instrumented = instr.instrument(&wasm).expect("instrumentation should succeed");
+        let instrumented = instr
+            .instrument(&wasm)
+            .expect("instrumentation should succeed");
         assert!(instrumented.len() > wasm.len());
 
         // Verify custom sections are present in instrumented binary
@@ -4809,7 +5187,10 @@ mod tests {
                 let _ = instr.instrument(&wasm);
             }
         }));
-        assert!(result.is_ok(), "instrumentation should never panic on custom sections");
+        assert!(
+            result.is_ok(),
+            "instrumentation should never panic on custom sections"
+        );
     }
 
     #[test]
@@ -4818,7 +5199,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             profile_contract_with_flamegraph(wasm, "add".to_string(), vec![])
         }));
-        assert!(result.is_ok(), "profiling must not panic when WASM contains custom sections");
+        assert!(
+            result.is_ok(),
+            "profiling must not panic when WASM contains custom sections"
+        );
         let (resources, profile) = result.unwrap().expect("profiling should succeed");
         assert!(resources.cpu_instructions > 0);
         assert!(!profile.per_function.is_empty());
@@ -4848,7 +5232,8 @@ pub fn extract_soroban_budget_from_logs(logs: &str) -> ExtractedSorobanBudget {
     for line in logs.lines() {
         let line_lower = line.to_lowercase();
 
-        if line_lower.contains("cpu") || line_lower.contains("mem") || line_lower.contains("budget") {
+        if line_lower.contains("cpu") || line_lower.contains("mem") || line_lower.contains("budget")
+        {
             if let Some(idx) = line_lower.find("cpu:") {
                 if let Some(val) = parse_trailing_number(&line[idx + 4..]) {
                     result.cpu_instructions = val;
@@ -4902,4 +5287,3 @@ fn parse_trailing_number(s: &str) -> Option<u64> {
         .collect();
     digits.parse().ok()
 }
-

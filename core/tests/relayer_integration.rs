@@ -76,7 +76,12 @@ impl MockContractState {
 #[test]
 fn test_relayer_pipeline_build_post_verify() {
     // Stage 1: Build tree
-    let leaves = vec![b"message_0".to_vec(), b"message_1".to_vec(), b"message_2".to_vec(), b"message_3".to_vec()];
+    let leaves = vec![
+        b"message_0".to_vec(),
+        b"message_1".to_vec(),
+        b"message_2".to_vec(),
+        b"message_3".to_vec(),
+    ];
     let mut tree = MerkleTree::new(32);
     tree.build(leaves).expect("tree builds");
 
@@ -94,7 +99,7 @@ fn test_relayer_pipeline_build_post_verify() {
     // Stage 3: Generate and verify proofs
     for leaf_index in 0..tree.leaf_count() {
         let proof = tree.generate_proof(leaf_index).expect("proof generates");
-        
+
         // Verify locally
         assert!(proof.verify());
         assert!(MerkleTree::verify_proof(&proof, &tree.root));
@@ -121,7 +126,11 @@ fn test_relayer_pipeline_with_power_of_two_leaves() {
 
         for leaf_index in 0..leaf_count {
             let proof = tree.generate_proof(leaf_index).expect("proof generates");
-            assert!(proof.verify(), "Proof should verify for leaf_index {}", leaf_index);
+            assert!(
+                proof.verify(),
+                "Proof should verify for leaf_index {}",
+                leaf_index
+            );
         }
     }
 }
@@ -142,10 +151,16 @@ fn test_relayer_pipeline_with_odd_leaf_counts() {
 
         for leaf_index in 0..leaf_count {
             let proof = tree.generate_proof(leaf_index).expect("proof generates");
-            assert!(proof.verify(), "Proof should verify for leaf_index {}", leaf_index);
-            
+            assert!(
+                proof.verify(),
+                "Proof should verify for leaf_index {}",
+                leaf_index
+            );
+
             // Verify against contract root
-            let posted_root = contract_state.get_root(leaf_count as u32).expect("root exists");
+            let posted_root = contract_state
+                .get_root(leaf_count as u32)
+                .expect("root exists");
             assert!(MerkleTree::verify_proof(&proof, &posted_root));
         }
     }
@@ -221,7 +236,7 @@ fn test_batch_verification_all_valid() {
     let mut verified_count = 0;
     for leaf_index in 0..leaf_count {
         let proof = tree.generate_proof(leaf_index).expect("proof generates");
-        
+
         if MerkleTree::verify_proof(&proof, &contract_state.get_root(block_height).unwrap()) {
             verified_count += 1;
         }
@@ -232,9 +247,7 @@ fn test_batch_verification_all_valid() {
 
 #[test]
 fn test_batch_verification_with_replay() {
-    let leaves: Vec<Vec<u8>> = (0..5)
-        .map(|i| format!("msg_{}", i).into_bytes())
-        .collect();
+    let leaves: Vec<Vec<u8>> = (0..5).map(|i| format!("msg_{}", i).into_bytes()).collect();
 
     let mut tree = MerkleTree::new(32);
     tree.build(leaves).expect("tree builds");
@@ -272,7 +285,11 @@ fn test_batch_verification_with_replay() {
         }
     }
 
-    assert_eq!(replayed_count, tree.leaf_count(), "All should be detected as replays");
+    assert_eq!(
+        replayed_count,
+        tree.leaf_count(),
+        "All should be detected as replays"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -316,14 +333,14 @@ fn test_large_tree_1024_leaves() {
 fn test_proof_depth_matches_tree_size() {
     // Proof depth should be ceil(log2(leaf_count))
     let test_cases = vec![
-        (1, 0),   // 1 leaf: depth 0
-        (2, 1),   // 2 leaves: depth 1
-        (3, 2),   // 3 leaves: depth 2
-        (4, 2),   // 4 leaves: depth 2
-        (5, 3),   // 5 leaves: depth 3
-        (8, 3),   // 8 leaves: depth 3
-        (9, 4),   // 9 leaves: depth 4
-        (16, 4),  // 16 leaves: depth 4
+        (1, 0),  // 1 leaf: depth 0
+        (2, 1),  // 2 leaves: depth 1
+        (3, 2),  // 3 leaves: depth 2
+        (4, 2),  // 4 leaves: depth 2
+        (5, 3),  // 5 leaves: depth 3
+        (8, 3),  // 8 leaves: depth 3
+        (9, 4),  // 9 leaves: depth 4
+        (16, 4), // 16 leaves: depth 4
     ];
 
     for (leaf_count, expected_depth) in test_cases {
@@ -335,7 +352,12 @@ fn test_proof_depth_matches_tree_size() {
         tree.build(leaves).expect("tree builds");
 
         let proof = tree.generate_proof(0).expect("proof generates");
-        assert_eq!(proof.proof.len(), expected_depth, "Leaf count: {}", leaf_count);
+        assert_eq!(
+            proof.proof.len(),
+            expected_depth,
+            "Leaf count: {}",
+            leaf_count
+        );
     }
 }
 
@@ -347,18 +369,24 @@ fn test_proof_depth_matches_tree_size() {
 fn test_build_empty_tree_fails() {
     let mut tree = MerkleTree::new(32);
     let result = tree.build(vec![]);
-    
+
     assert!(result.is_err(), "Building with empty leaves should fail");
-    assert_eq!(result.unwrap_err(), "Cannot build a Merkle tree from zero leaves.");
+    assert_eq!(
+        result.unwrap_err(),
+        "Cannot build a Merkle tree from zero leaves."
+    );
 }
 
 #[test]
 fn test_generate_proof_before_build_fails() {
     let tree = MerkleTree::new(32);
     let result = tree.generate_proof(0);
-    
+
     assert!(result.is_err(), "Generating proof before build should fail");
-    assert_eq!(result.unwrap_err(), "Cannot generate proof before building the tree.");
+    assert_eq!(
+        result.unwrap_err(),
+        "Cannot generate proof before building the tree."
+    );
 }
 
 #[test]
@@ -368,7 +396,10 @@ fn test_generate_proof_out_of_bounds_fails() {
     tree.build(leaves).expect("tree builds");
 
     let result = tree.generate_proof(1); // Only index 0 exists
-    assert!(result.is_err(), "Generating proof for out-of-bounds index should fail");
+    assert!(
+        result.is_err(),
+        "Generating proof for out-of-bounds index should fail"
+    );
     assert_eq!(result.unwrap_err(), "Leaf index is out of bounds.");
 }
 
@@ -383,7 +414,7 @@ fn test_verify_proof_wrong_root_fails() {
     tree2.build(different_leaves).expect("tree2 builds");
 
     let proof = tree1.generate_proof(0).expect("proof generates");
-    
+
     // Proof should fail against a different tree's root
     assert!(!MerkleTree::verify_proof(&proof, &tree2.root));
 }
@@ -395,12 +426,12 @@ fn test_tampered_proof_fails_verification() {
     tree.build(leaves).expect("tree builds");
 
     let mut proof = tree.generate_proof(0).expect("proof generates");
-    
+
     // Tamper with the proof
     if !proof.proof.is_empty() {
         proof.proof[0].hash[0] ^= 0xFF; // Flip bits in first hash
     }
-    
+
     // Tampered proof should fail
     assert!(!proof.verify());
     assert!(!MerkleTree::verify_proof(&proof, &tree.root));
@@ -409,14 +440,18 @@ fn test_tampered_proof_fails_verification() {
 #[test]
 fn test_leaf_exceeds_capacity() {
     let mut tree = MerkleTree::new(2); // Max 4 leaves
-    
-    let leaves: Vec<Vec<u8>> = (0..5)
-        .map(|i| format!("leaf_{}", i).into_bytes())
-        .collect();
-    
+
+    let leaves: Vec<Vec<u8>> = (0..5).map(|i| format!("leaf_{}", i).into_bytes()).collect();
+
     let result = tree.build(leaves);
-    assert!(result.is_err(), "Building tree with more leaves than capacity should fail");
-    assert_eq!(result.unwrap_err(), "Leaf count exceeds configured tree capacity.");
+    assert!(
+        result.is_err(),
+        "Building tree with more leaves than capacity should fail"
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        "Leaf count exceeds configured tree capacity."
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -433,9 +468,10 @@ fn test_proof_serialization_roundtrip() {
 
     // Serialize to JSON
     let json = serde_json::to_string(&original_proof).expect("serialization succeeds");
-    
+
     // Deserialize from JSON
-    let deserialized_proof: MerkleProof = serde_json::from_str(&json).expect("deserialization succeeds");
+    let deserialized_proof: MerkleProof =
+        serde_json::from_str(&json).expect("deserialization succeeds");
 
     // Verify round-tripped proof
     assert_eq!(original_proof.leaf_index, deserialized_proof.leaf_index);
@@ -467,15 +503,27 @@ fn test_multiple_root_versions() {
 
     // Verify proof from v1 against v1 root
     let proof_v1 = tree_v1.generate_proof(0).expect("proof generates");
-    assert!(MerkleTree::verify_proof(&proof_v1, &contract_state.get_root(100).unwrap()));
+    assert!(MerkleTree::verify_proof(
+        &proof_v1,
+        &contract_state.get_root(100).unwrap()
+    ));
 
     // Verify proof from v2 against v2 root
     let proof_v2 = tree_v2.generate_proof(0).expect("proof generates");
-    assert!(MerkleTree::verify_proof(&proof_v2, &contract_state.get_root(200).unwrap()));
+    assert!(MerkleTree::verify_proof(
+        &proof_v2,
+        &contract_state.get_root(200).unwrap()
+    ));
 
     // Cross-verification should fail
-    assert!(!MerkleTree::verify_proof(&proof_v1, &contract_state.get_root(200).unwrap()));
-    assert!(!MerkleTree::verify_proof(&proof_v2, &contract_state.get_root(100).unwrap()));
+    assert!(!MerkleTree::verify_proof(
+        &proof_v1,
+        &contract_state.get_root(200).unwrap()
+    ));
+    assert!(!MerkleTree::verify_proof(
+        &proof_v2,
+        &contract_state.get_root(100).unwrap()
+    ));
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -493,7 +541,10 @@ fn test_tree_consistency_with_data_leaf_preservation() {
         .map(|i| (i, tree.generate_proof(i).expect("proof generates")))
         .collect::<Vec<_>>()
     {
-        assert_eq!(proof.leaf, original_data[index], "Leaf data should be preserved");
+        assert_eq!(
+            proof.leaf, original_data[index],
+            "Leaf data should be preserved"
+        );
         assert_eq!(proof.leaf_index, index);
     }
 }

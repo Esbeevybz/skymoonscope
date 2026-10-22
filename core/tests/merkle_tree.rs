@@ -23,11 +23,7 @@ fn test_merkle_even() {
 
 #[test]
 fn test_merkle_odd_leaves() {
-    let leaves: Vec<Vec<u8>> = vec![
-        b"leaf_0".to_vec(),
-        b"leaf_1".to_vec(),
-        b"leaf_2".to_vec(),
-    ];
+    let leaves: Vec<Vec<u8>> = vec![b"leaf_0".to_vec(), b"leaf_1".to_vec(), b"leaf_2".to_vec()];
     let mut tree = MerkleTree::new(32);
     tree.build(leaves).unwrap();
     assert_eq!(tree.leaf_count(), 3);

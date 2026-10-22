@@ -240,7 +240,8 @@ async fn wasm_upload_simulation_and_resource_profile_end_to_end() {
         "the profile must record the RAM cost of the first simulation"
     );
     assert_eq!(
-        historical.avg_ledger_footprint, first_metric.ledger_footprint as f64
+        historical.avg_ledger_footprint,
+        first_metric.ledger_footprint as f64
     );
 
     // Running the same artifact again is not a code change, so the drift

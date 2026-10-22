@@ -141,8 +141,10 @@ impl MerkleTree {
         }
 
         // Hash the new leaves
-        let new_leaf_hashes: Vec<[u8; 32]> =
-            new_leaves.iter().map(|leaf| Self::hash_leaf(leaf)).collect();
+        let new_leaf_hashes: Vec<[u8; 32]> = new_leaves
+            .iter()
+            .map(|leaf| Self::hash_leaf(leaf))
+            .collect();
 
         // Append the new leaf hashes to the leaf level
         self.leaf_hashes.extend_from_slice(&new_leaf_hashes);
@@ -170,7 +172,11 @@ impl MerkleTree {
     /// # Returns
     /// * `Ok(())` on success
     /// * `Err` if index is out of bounds or tree is uninitialized
-    pub fn update_leaf(&mut self, leaf_index: usize, new_leaf_data: Vec<u8>) -> Result<(), &'static str> {
+    pub fn update_leaf(
+        &mut self,
+        leaf_index: usize,
+        new_leaf_data: Vec<u8>,
+    ) -> Result<(), &'static str> {
         if self.nodes.is_empty() {
             return Err("Cannot update leaf in uninitialized tree. Call build() first.");
         }
@@ -458,24 +464,12 @@ impl MerkleTree {
             // Left child
             if left_idx < self.nodes[child_level].len() {
                 let left_is_last = !has_right && !is_odd_promoted;
-                self.render_hierarchy_node(
-                    out,
-                    child_level,
-                    left_idx,
-                    &next_prefix,
-                    left_is_last,
-                );
+                self.render_hierarchy_node(out, child_level, left_idx, &next_prefix, left_is_last);
             }
 
             // Right child
             if has_right {
-                self.render_hierarchy_node(
-                    out,
-                    child_level,
-                    right_idx,
-                    &next_prefix,
-                    true,
-                );
+                self.render_hierarchy_node(out, child_level, right_idx, &next_prefix, true);
             } else if is_odd_promoted {
                 // Sibling promoted from odd child (paired with itself)
                 let branch = "└── ";
@@ -611,6 +605,850 @@ impl MerkleTree {
     }
 }
 
+// ── Batch proof generation (#347) ─────────────────────────────────────────────
+
+/// A batch of Merkle inclusion proofs for multiple leaves.
+///
+/// Produces proofs for a set of leaf indices in a single call, which is
+/// more efficient than calling `generate_proof` repeatedly because it
+/// avoids redundant tree traversals when leaves share ancestor nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchMerkleProof {
+    /// The root hash that all proofs commit to.
+    pub root: [u8; 32],
+    /// Individual proofs, one per requested leaf index.
+    pub proofs: Vec<MerkleProof>,
+}
+
+impl MerkleTree {
+    /// Generate inclusion proofs for multiple leaves in a single call.
+    ///
+    /// This is the batch proof generation feature (#347). It validates all
+    /// indices first, then generates proofs for each. The proofs are
+    /// returned in the same order as the requested indices.
+    ///
+    /// # Arguments
+    /// * `leaf_indices` - Indices of leaves to generate proofs for
+    ///
+    /// # Returns
+    /// * `Ok(BatchMerkleProof)` containing all proofs
+    /// * `Err` if the tree is not built or any index is out of bounds
+    pub fn generate_batch_proofs(
+        &self,
+        leaf_indices: &[usize],
+    ) -> Result<BatchMerkleProof, &'static str> {
+        if self.nodes.is_empty() {
+            return Err("Cannot generate proofs before building the tree.");
+        }
+
+        if leaf_indices.is_empty() {
+            return Ok(BatchMerkleProof {
+                root: self.root,
+                proofs: Vec::new(),
+            });
+        }
+
+        // Validate all indices first
+        for &idx in leaf_indices {
+            if idx >= self.leaf_count {
+                return Err("Leaf index is out of bounds.");
+            }
+        }
+
+        let proofs: Result<Vec<MerkleProof>, &'static str> = leaf_indices
+            .iter()
+            .map(|&idx| self.generate_proof(idx))
+            .collect();
+
+        let proofs = proofs?;
+
+        Ok(BatchMerkleProof {
+            root: self.root,
+            proofs,
+        })
+    }
+
+    /// Verify a batch of proofs against the same root.
+    ///
+    /// Returns `true` only if every proof in the batch verifies.
+    pub fn verify_batch_proofs(batch: &BatchMerkleProof) -> bool {
+        batch.proofs.iter().all(|p| p.verify())
+    }
+}
+
+// ── Sparse Merkle Tree (#348) ─────────────────────────────────────────────────
+//
+// A sparse Merkle tree is optimized for large key spaces where most positions
+// are empty. Instead of materializing all 2^height leaves, it only stores
+// non-empty nodes and computes default hashes for missing branches on demand.
+//
+// This implementation uses a depth of 256 (for 32-byte keys) by default, with
+// O(log n) insertion and proof generation where n is the number of *set* leaves,
+// not the theoretical maximum.
+
+/// A sparse Merkle tree that stores key-value pairs efficiently.
+///
+/// Only non-empty nodes are kept in memory; default (zero) hashes for absent
+/// subtrees are precomputed up to the tree height. This makes the tree
+/// practical for very large leaf sets (e.g. 2^256 positions) while only
+/// using memory proportional to the number of *set* leaves.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SparseMerkleTree {
+    /// The root hash of the tree.
+    pub root: [u8; 32],
+    /// Tree depth (number of levels from root to leaves).
+    pub depth: usize,
+    /// Precomputed default hashes for each level (default_hashes[0] = leaf default).
+    default_hashes: Vec<[u8; 32]>,
+    /// Stored leaves: key -> value hash.
+    leaves: std::collections::BTreeMap<[u8; 32], [u8; 32]>,
+}
+
+impl SparseMerkleTree {
+    /// Create a new sparse Merkle tree with the given depth.
+    ///
+    /// A depth of 256 supports 32-byte keys (the default for SHA-256 based
+    /// systems). For smaller key spaces, a smaller depth reduces proof size.
+    pub fn new(depth: usize) -> Self {
+        let default_hashes = Self::compute_default_hashes(depth);
+        let root = default_hashes[depth];
+        SparseMerkleTree {
+            root,
+            depth,
+            default_hashes,
+            leaves: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Create a sparse Merkle tree with the standard 256-bit depth.
+    pub fn new_256() -> Self {
+        Self::new(256)
+    }
+
+    /// Insert a key-value pair into the tree.
+    ///
+    /// The key is hashed to produce a 32-byte leaf position identifier.
+    /// The value is hashed with double SHA-256 (matching the binary tree's
+    /// `hash_leaf` convention).
+    pub fn insert(&mut self, key: &[u8], value: &[u8]) {
+        let key_hash = Self::hash_key(key);
+        let leaf_hash = Self::hash_leaf_value(value);
+        self.leaves.insert(key_hash, leaf_hash);
+        self.recompute_root();
+    }
+
+    /// Insert multiple key-value pairs, then recompute the root once.
+    pub fn insert_batch(&mut self, entries: &[(Vec<u8>, Vec<u8>)]) {
+        for (key, value) in entries {
+            let key_hash = Self::hash_key(key);
+            let leaf_hash = Self::hash_leaf_value(value);
+            self.leaves.insert(key_hash, leaf_hash);
+        }
+        self.recompute_root();
+    }
+
+    /// Remove a key from the tree.
+    pub fn remove(&mut self, key: &[u8]) -> bool {
+        let key_hash = Self::hash_key(key);
+        let removed = self.leaves.remove(&key_hash).is_some();
+        if removed {
+            self.recompute_root();
+        }
+        removed
+    }
+
+    /// Get the value hash for a key, if it exists.
+    pub fn get(&self, key: &[u8]) -> Option<[u8; 32]> {
+        let key_hash = Self::hash_key(key);
+        self.leaves.get(&key_hash).copied()
+    }
+
+    /// Return the root hash as a hex string.
+    pub fn get_root_hex(&self) -> String {
+        hex::encode(self.root)
+    }
+
+    /// Return the number of leaves currently stored.
+    pub fn leaf_count(&self) -> usize {
+        self.leaves.len()
+    }
+
+    /// Generate an inclusion proof for a key.
+    ///
+    /// The proof consists of one sibling hash per level, from leaf to root.
+    /// For empty sibling subtrees, the precomputed default hash is used.
+    pub fn generate_proof(&self, key: &[u8]) -> Result<SparseMerkleProof, &'static str> {
+        let key_hash = Self::hash_key(key);
+        let leaf_hash = match self.leaves.get(&key_hash) {
+            Some(h) => *h,
+            None => return Err("Key not found in sparse Merkle tree."),
+        };
+
+        let mut proof_siblings = Vec::with_capacity(self.depth);
+        let mut current_key = key_hash;
+
+        for level in 0..self.depth {
+            // Determine which direction: 0 = left child, 1 = right child
+            let bit = Self::get_bit(&current_key, level);
+            let sibling_key = Self::flip_bit(current_key, level);
+
+            // Look up sibling at this level
+            let sibling_hash = if bit == 0 {
+                // Current is left, sibling is right
+                self.find_subtree_root(level + 1, sibling_key)
+            } else {
+                // Current is right, sibling is left
+                self.find_subtree_root(level + 1, sibling_key)
+            };
+
+            proof_siblings.push(SparseProofNode {
+                hash: sibling_hash,
+                is_left: bit == 1, // sibling is on the left if current is right
+            });
+
+            // Move up: clear the bit at this level
+            current_key = Self::clear_bit(current_key, level);
+        }
+
+        Ok(SparseMerkleProof {
+            key_hash,
+            leaf_hash,
+            root: self.root,
+            siblings: proof_siblings,
+        })
+    }
+
+    /// Recompute the root from the current set of leaves.
+    fn recompute_root(&mut self) {
+        if self.leaves.is_empty() {
+            self.root = self.default_hashes[self.depth];
+            return;
+        }
+
+        // Build the tree bottom-up, level by level.
+        // At each level, we only compute nodes that have at least one non-empty
+        // descendant. We use the precomputed default hashes for empty subtrees.
+        let mut current: std::collections::BTreeMap<[u8; 32], [u8; 32]> = self
+            .leaves
+            .iter()
+            .map(|(k, v)| {
+                // Truncate key to depth bits for level-0 positioning
+                let pos = Self::truncate_to_depth(k, 0);
+                (pos, *v)
+            })
+            .collect();
+
+        for level in 0..self.depth {
+            let mut next: std::collections::BTreeMap<[u8; 32], [u8; 32]> =
+                std::collections::BTreeMap::new();
+
+            for (pos, hash) in &current {
+                let parent_pos = Self::clear_bit(*pos, level);
+                let bit = Self::get_bit(pos, level);
+
+                let left_hash;
+                let right_hash;
+
+                if bit == 0 {
+                    // This node is the left child
+                    left_hash = *hash;
+                    // Look for right sibling
+                    let sibling_pos = Self::flip_bit(*pos, level);
+                    right_hash = current
+                        .get(&sibling_pos)
+                        .copied()
+                        .unwrap_or(self.default_hashes[level]);
+                } else {
+                    // This node is the right child
+                    right_hash = *hash;
+                    // Look for left sibling
+                    let sibling_pos = Self::flip_bit(*pos, level);
+                    left_hash = current
+                        .get(&sibling_pos)
+                        .copied()
+                        .unwrap_or(self.default_hashes[level]);
+                }
+
+                let parent_hash = Self::hash_pair(&left_hash, &right_hash);
+                next.insert(parent_pos, parent_hash);
+            }
+
+            current = next;
+        }
+
+        // After processing all levels, there should be exactly one node at the root
+        self.root = current
+            .values()
+            .next()
+            .copied()
+            .unwrap_or(self.default_hashes[self.depth]);
+    }
+
+    /// Find the root hash of a subtree at the given level for a given position.
+    /// Returns the default hash if the subtree is entirely empty.
+    fn find_subtree_root(&self, level: usize, pos: [u8; 32]) -> [u8; 32] {
+        if level >= self.depth {
+            return self.default_hashes[self.depth];
+        }
+
+        // Check if any leaf exists in this subtree
+        let mask = Self::make_mask(level);
+        for (leaf_key, leaf_hash) in &self.leaves {
+            if Self::key_matches_prefix(leaf_key, &pos, level) {
+                // There's at least one leaf in this subtree; compute the root
+                return self.compute_subtree_root(level, pos, mask);
+            }
+        }
+
+        // No leaves in this subtree — return the default hash for this level
+        self.default_hashes[self.depth - level]
+    }
+
+    /// Compute the root of a subtree that contains at least one leaf.
+    fn compute_subtree_root(&self, level: usize, pos: [u8; 32], _mask: [u8; 32]) -> [u8; 32] {
+        // Collect all leaves in this subtree
+        let subtree_leaves: Vec<([u8; 32], [u8; 32])> = self
+            .leaves
+            .iter()
+            .filter(|(k, _)| Self::key_matches_prefix(k, &pos, level))
+            .map(|(k, v)| (*k, *v))
+            .collect();
+
+        if subtree_leaves.is_empty() {
+            return self.default_hashes[self.depth - level];
+        }
+
+        // Build from the current level up to the root
+        let mut current: std::collections::BTreeMap<[u8; 32], [u8; 32]> =
+            subtree_leaves.iter().map(|(k, v)| (*k, *v)).collect();
+
+        for l in level..self.depth {
+            let mut next: std::collections::BTreeMap<[u8; 32], [u8; 32]> =
+                std::collections::BTreeMap::new();
+
+            for (node_pos, hash) in &current {
+                let parent_pos = Self::clear_bit(*node_pos, l);
+                let bit = Self::get_bit(node_pos, l);
+
+                let left_hash;
+                let right_hash;
+
+                if bit == 0 {
+                    left_hash = *hash;
+                    let sibling_pos = Self::flip_bit(*node_pos, l);
+                    right_hash = current
+                        .get(&sibling_pos)
+                        .copied()
+                        .unwrap_or(self.default_hashes[l]);
+                } else {
+                    right_hash = *hash;
+                    let sibling_pos = Self::flip_bit(*node_pos, l);
+                    left_hash = current
+                        .get(&sibling_pos)
+                        .copied()
+                        .unwrap_or(self.default_hashes[l]);
+                }
+
+                next.insert(parent_pos, Self::hash_pair(&left_hash, &right_hash));
+            }
+
+            current = next;
+        }
+
+        current
+            .values()
+            .next()
+            .copied()
+            .unwrap_or(self.default_hashes[self.depth])
+    }
+
+    // ── Hashing helpers ───────────────────────────────────────────────────
+
+    fn hash_leaf_value(data: &[u8]) -> [u8; 32] {
+        let mut h1 = Sha256::new();
+        h1.update(data);
+        let d1 = h1.finalize();
+        let mut h2 = Sha256::new();
+        h2.update(d1);
+        h2.finalize().into()
+    }
+
+    fn hash_key(key: &[u8]) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(key);
+        h.finalize().into()
+    }
+
+    fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut h = Sha256::new();
+        if left <= right {
+            h.update(left);
+            h.update(right);
+        } else {
+            h.update(right);
+            h.update(left);
+        }
+        h.finalize().into()
+    }
+
+    /// Compute default (empty subtree) hashes for all levels.
+    /// default_hashes[0] = hash of empty leaf
+    /// default_hashes[i] = hash(default_hashes[i-1], default_hashes[i-1])
+    fn compute_default_hashes(depth: usize) -> Vec<[u8; 32]> {
+        let mut hashes = Vec::with_capacity(depth + 1);
+        // Level 0: hash of empty data (double SHA-256 of empty bytes)
+        hashes.push(Self::hash_leaf_value(&[]));
+
+        for i in 1..=depth {
+            let prev = hashes[i - 1];
+            hashes.push(Self::hash_pair(&prev, &prev));
+        }
+
+        hashes
+    }
+
+    // ── Bit manipulation helpers ──────────────────────────────────────────
+
+    /// Get the bit at position `level` (MSB-first within the 32-byte key).
+    fn get_bit(key: &[u8; 32], level: usize) -> u8 {
+        let byte_idx = level / 8;
+        let bit_idx = 7 - (level % 8);
+        (key[byte_idx] >> bit_idx) & 1
+    }
+
+    /// Flip the bit at position `level`.
+    fn flip_bit(mut key: [u8; 32], level: usize) -> [u8; 32] {
+        let byte_idx = level / 8;
+        let bit_idx = 7 - (level % 8);
+        key[byte_idx] ^= 1 << bit_idx;
+        key
+    }
+
+    /// Clear the bit at position `level` (set to 0).
+    fn clear_bit(mut key: [u8; 32], level: usize) -> [u8; 32] {
+        let byte_idx = level / 8;
+        let bit_idx = 7 - (level % 8);
+        key[byte_idx] &= !(1 << bit_idx);
+        key
+    }
+
+    /// Create a mask that covers bits from `level` to the end.
+    fn make_mask(level: usize) -> [u8; 32] {
+        let mut mask = [0u8; 32];
+        let byte_idx = level / 8;
+        for i in 0..byte_idx {
+            mask[i] = 0xFF;
+        }
+        let remaining_bits = level % 8;
+        if remaining_bits > 0 {
+            mask[byte_idx] = 0xFF << (8 - remaining_bits);
+        }
+        mask
+    }
+
+    /// Check if a key matches a prefix at the given level.
+    fn key_matches_prefix(key: &[u8; 32], prefix: &[u8; 32], level: usize) -> bool {
+        for l in 0..level {
+            if Self::get_bit(key, l) != Self::get_bit(prefix, l) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Truncate a key to only the bits below `level` (clear bits at and above level).
+    fn truncate_to_depth(key: &[u8; 32], level: usize) -> [u8; 32] {
+        let mut result = *key;
+        for l in level..256 {
+            result = Self::clear_bit(result, l);
+        }
+        result
+    }
+}
+
+/// A proof node in a sparse Merkle tree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SparseProofNode {
+    /// The sibling hash at this level.
+    pub hash: [u8; 32],
+    /// Whether the sibling is on the left side.
+    pub is_left: bool,
+}
+
+/// An inclusion proof for a sparse Merkle tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SparseMerkleProof {
+    /// The hashed key of the leaf.
+    pub key_hash: [u8; 32],
+    /// The hash of the leaf value.
+    pub leaf_hash: [u8; 32],
+    /// The root hash this proof commits to.
+    pub root: [u8; 32],
+    /// Sibling hashes from leaf to root.
+    pub siblings: Vec<SparseProofNode>,
+}
+
+impl SparseMerkleProof {
+    /// Verify this proof against the claimed root.
+    pub fn verify(&self) -> bool {
+        let mut current = self.leaf_hash;
+
+        for node in &self.siblings {
+            current = if node.is_left {
+                SparseMerkleTree::hash_pair(&node.hash, &current)
+            } else {
+                SparseMerkleTree::hash_pair(&current, &node.hash)
+            };
+        }
+
+        current == self.root
+    }
+}
+
+// ── Tests for batch proof generation (#347) and sparse Merkle tree (#348) ─────
+
+#[cfg(test)]
+mod batch_proof_tests {
+    use super::*;
+
+    #[test]
+    fn test_batch_proofs_all_valid() {
+        let tree = make_tree(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let batch = tree
+            .generate_batch_proofs(&[0, 1, 2, 3, 4, 5, 6, 7])
+            .expect("batch proofs generate");
+        assert_eq!(batch.proofs.len(), 8);
+        assert_eq!(batch.root, tree.root);
+        assert!(MerkleTree::verify_batch_proofs(&batch));
+    }
+
+    #[test]
+    fn test_batch_proofs_subset() {
+        let tree = make_tree(&["a", "b", "c", "d", "e"]);
+        let batch = tree
+            .generate_batch_proofs(&[0, 2, 4])
+            .expect("batch proofs generate");
+        assert_eq!(batch.proofs.len(), 3);
+        assert!(MerkleTree::verify_batch_proofs(&batch));
+        // Each proof should individually verify
+        for proof in &batch.proofs {
+            assert!(proof.verify());
+            assert!(MerkleTree::verify_proof(proof, &tree.root));
+        }
+    }
+
+    #[test]
+    fn test_batch_proofs_empty_indices() {
+        let tree = make_tree(&["a", "b", "c"]);
+        let batch = tree.generate_batch_proofs(&[]).expect("empty batch ok");
+        assert!(batch.proofs.is_empty());
+        assert!(MerkleTree::verify_batch_proofs(&batch));
+    }
+
+    #[test]
+    fn test_batch_proofs_unbuilt_tree_errors() {
+        let tree = MerkleTree::new(32);
+        assert!(tree.generate_batch_proofs(&[0]).is_err());
+    }
+
+    #[test]
+    fn test_batch_proofs_out_of_bounds_errors() {
+        let tree = make_tree(&["a", "b"]);
+        assert!(tree.generate_batch_proofs(&[0, 5]).is_err());
+    }
+
+    #[test]
+    fn test_batch_proofs_single_element() {
+        let tree = make_tree(&["x", "y", "z"]);
+        let batch = tree.generate_batch_proofs(&[1]).expect("batch ok");
+        assert_eq!(batch.proofs.len(), 1);
+        assert!(MerkleTree::verify_batch_proofs(&batch));
+    }
+
+    #[test]
+    fn test_batch_proofs_duplicates() {
+        let tree = make_tree(&["a", "b", "c", "d"]);
+        let batch = tree
+            .generate_batch_proofs(&[0, 0, 1, 1, 2])
+            .expect("batch ok");
+        assert_eq!(batch.proofs.len(), 5);
+        assert!(MerkleTree::verify_batch_proofs(&batch));
+    }
+
+    #[test]
+    fn test_batch_proofs_large_tree() {
+        let leaves: Vec<Vec<u8>> = (0..32).map(|i| format!("leaf-{i}").into_bytes()).collect();
+        let mut tree = MerkleTree::new(32);
+        tree.build(leaves).unwrap();
+        let indices: Vec<usize> = vec![0, 7, 15, 23, 31];
+        let batch = tree.generate_batch_proofs(&indices).expect("batch ok");
+        assert_eq!(batch.proofs.len(), 5);
+        assert!(MerkleTree::verify_batch_proofs(&batch));
+    }
+
+    #[test]
+    fn test_batch_proofs_matches_individual_proofs() {
+        let tree = make_tree(&["a", "b", "c", "d", "e"]);
+        let indices = [0, 2, 4];
+        let batch = tree.generate_batch_proofs(&indices).expect("batch ok");
+        for (i, &idx) in indices.iter().enumerate() {
+            let individual = tree.generate_proof(idx).unwrap();
+            assert_eq!(batch.proofs[i].leaf_index, individual.leaf_index);
+            assert_eq!(batch.proofs[i].root, individual.root);
+            assert_eq!(batch.proofs[i].leaf_hash, individual.leaf_hash);
+            assert_eq!(batch.proofs[i].proof.len(), individual.proof.len());
+        }
+    }
+
+    #[test]
+    fn test_verify_batch_proofs_tampered_fails() {
+        let tree = make_tree(&["a", "b", "c", "d"]);
+        let mut batch = tree.generate_batch_proofs(&[0, 1, 2, 3]).expect("batch ok");
+        batch.proofs[0].leaf_hash[0] ^= 0xFF;
+        assert!(!MerkleTree::verify_batch_proofs(&batch));
+    }
+}
+
+#[cfg(test)]
+mod sparse_merkle_tree_tests {
+    use super::*;
+
+    #[test]
+    fn test_sparse_tree_empty_root_matches_default() {
+        let tree = SparseMerkleTree::new(256);
+        // Root of an empty tree should be the precomputed default root
+        assert_eq!(tree.leaf_count(), 0);
+        assert!(!tree.get_root_hex().is_empty());
+    }
+
+    #[test]
+    fn test_sparse_tree_insert_and_get() {
+        let mut tree = SparseMerkleTree::new_256();
+        tree.insert(b"key1", b"value1");
+        assert_eq!(tree.leaf_count(), 1);
+        assert!(tree.get(b"key1").is_some());
+        assert!(tree.get(b"key2").is_none());
+    }
+
+    #[test]
+    fn test_sparse_tree_insert_changes_root() {
+        let mut tree = SparseMerkleTree::new_256();
+        let empty_root = tree.root;
+        tree.insert(b"key1", b"value1");
+        assert_ne!(tree.root, empty_root);
+    }
+
+    #[test]
+    fn test_sparse_tree_remove() {
+        let mut tree = SparseMerkleTree::new_256();
+        tree.insert(b"key1", b"value1");
+        assert_eq!(tree.leaf_count(), 1);
+        assert!(tree.remove(b"key1"));
+        assert_eq!(tree.leaf_count(), 0);
+        assert!(tree.get(b"key1").is_none());
+    }
+
+    #[test]
+    fn test_sparse_tree_remove_nonexistent() {
+        let mut tree = SparseMerkleTree::new_256();
+        assert!(!tree.remove(b"nonexistent"));
+    }
+
+    #[test]
+    fn test_sparse_tree_insert_batch() {
+        let mut tree = SparseMerkleTree::new_256();
+        let entries = vec![
+            (b"key1".to_vec(), b"val1".to_vec()),
+            (b"key2".to_vec(), b"val2".to_vec()),
+            (b"key3".to_vec(), b"val3".to_vec()),
+        ];
+        tree.insert_batch(&entries);
+        assert_eq!(tree.leaf_count(), 3);
+        assert!(tree.get(b"key1").is_some());
+        assert!(tree.get(b"key2").is_some());
+        assert!(tree.get(b"key3").is_some());
+    }
+
+    #[test]
+    fn test_sparse_tree_batch_matches_individual_inserts() {
+        let entries = vec![
+            (b"key1".to_vec(), b"val1".to_vec()),
+            (b"key2".to_vec(), b"val2".to_vec()),
+            (b"key3".to_vec(), b"val3".to_vec()),
+        ];
+
+        let mut tree_batch = SparseMerkleTree::new_256();
+        tree_batch.insert_batch(&entries);
+
+        let mut tree_individual = SparseMerkleTree::new_256();
+        for (k, v) in &entries {
+            tree_individual.insert(k, v);
+        }
+
+        assert_eq!(tree_batch.root, tree_individual.root);
+    }
+
+    #[test]
+    fn test_sparse_tree_deterministic_root() {
+        let entries = vec![
+            (b"key1".to_vec(), b"val1".to_vec()),
+            (b"key2".to_vec(), b"val2".to_vec()),
+        ];
+
+        let mut t1 = SparseMerkleTree::new_256();
+        let mut t2 = SparseMerkleTree::new_256();
+        t1.insert_batch(&entries);
+        t2.insert_batch(&entries);
+        assert_eq!(t1.root, t2.root);
+    }
+
+    #[test]
+    fn test_sparse_tree_proof_verifies() {
+        let mut tree = SparseMerkleTree::new_256();
+        tree.insert(b"key1", b"value1");
+        tree.insert(b"key2", b"value2");
+        tree.insert(b"key3", b"value3");
+
+        let proof = tree.generate_proof(b"key1").expect("proof exists");
+        assert_eq!(proof.root, tree.root);
+        assert!(proof.verify());
+    }
+
+    #[test]
+    fn test_sparse_tree_proof_multiple_leaves() {
+        let mut tree = SparseMerkleTree::new_256();
+        for i in 0..10 {
+            tree.insert(format!("key{i}").as_bytes(), format!("val{i}").as_bytes());
+        }
+
+        for i in 0..10 {
+            let key = format!("key{i}");
+            let proof = tree.generate_proof(key.as_bytes()).expect("proof exists");
+            assert_eq!(proof.root, tree.root);
+            assert!(proof.verify(), "proof for key{i} should verify");
+        }
+    }
+
+    #[test]
+    fn test_sparse_tree_proof_nonexistent_key_errors() {
+        let mut tree = SparseMerkleTree::new_256();
+        tree.insert(b"key1", b"value1");
+        assert!(tree.generate_proof(b"nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_sparse_tree_proof_tampered_fails() {
+        let mut tree = SparseMerkleTree::new_256();
+        tree.insert(b"key1", b"value1");
+        tree.insert(b"key2", b"value2");
+
+        let mut proof = tree.generate_proof(b"key1").expect("proof exists");
+        proof.leaf_hash[0] ^= 0xFF;
+        assert!(!proof.verify());
+    }
+
+    #[test]
+    fn test_sparse_tree_proof_wrong_root_fails() {
+        let mut tree = SparseMerkleTree::new_256();
+        tree.insert(b"key1", b"value1");
+        let mut proof = tree.generate_proof(b"key1").expect("proof exists");
+        proof.root = [0xAB; 32];
+        assert!(!proof.verify());
+    }
+
+    #[test]
+    fn test_sparse_tree_remove_changes_root() {
+        let mut tree = SparseMerkleTree::new_256();
+        tree.insert(b"key1", b"value1");
+        tree.insert(b"key2", b"value2");
+        let root_before = tree.root;
+        tree.remove(b"key1");
+        assert_ne!(tree.root, root_before);
+        // The remaining leaf should still have a valid proof
+        let proof = tree.generate_proof(b"key2").expect("proof exists");
+        assert!(proof.verify());
+    }
+
+    #[test]
+    fn test_sparse_tree_small_depth() {
+        // Use a small depth (4 = 16 possible positions) for testing
+        let mut tree = SparseMerkleTree::new(4);
+        tree.insert(b"a", b"val_a");
+        tree.insert(b"b", b"val_b");
+        assert_eq!(tree.leaf_count(), 2);
+        let proof = tree.generate_proof(b"a").expect("proof exists");
+        assert_eq!(proof.siblings.len(), 4);
+        assert!(proof.verify());
+    }
+
+    #[test]
+    fn test_sparse_tree_update_value() {
+        let mut tree = SparseMerkleTree::new_256();
+        tree.insert(b"key1", b"value1");
+        let root1 = tree.root;
+        tree.insert(b"key1", b"value2"); // overwrite
+        assert_ne!(tree.root, root1);
+        assert_eq!(tree.leaf_count(), 1);
+        // New value should be reflected
+        let proof = tree.generate_proof(b"key1").expect("proof exists");
+        assert!(proof.verify());
+    }
+
+    #[test]
+    fn test_sparse_tree_get_root_hex_length() {
+        let tree = SparseMerkleTree::new_256();
+        assert_eq!(tree.get_root_hex().len(), 64);
+    }
+
+    #[test]
+    fn test_sparse_tree_large_number_of_leaves() {
+        let mut tree = SparseMerkleTree::new_256();
+        for i in 0..100 {
+            tree.insert(format!("key{i}").as_bytes(), format!("val{i}").as_bytes());
+        }
+        assert_eq!(tree.leaf_count(), 100);
+        // Sample a few proofs
+        for i in [0, 25, 50, 75, 99] {
+            let key = format!("key{i}");
+            let proof = tree.generate_proof(key.as_bytes()).expect("proof exists");
+            assert!(proof.verify(), "proof for key{i} should verify");
+        }
+    }
+
+    #[test]
+    fn test_sparse_tree_empty_after_all_removals() {
+        let mut tree = SparseMerkleTree::new_256();
+        let empty_root = tree.root;
+        tree.insert(b"key1", b"value1");
+        tree.remove(b"key1");
+        assert_eq!(tree.root, empty_root);
+        assert_eq!(tree.leaf_count(), 0);
+    }
+
+    #[test]
+    fn test_sparse_tree_proof_siblings_use_defaults_for_empty() {
+        let mut tree = SparseMerkleTree::new_256();
+        tree.insert(b"key1", b"value1");
+
+        // With only one leaf, most siblings should be default hashes
+        let proof = tree.generate_proof(b"key1").expect("proof exists");
+        assert!(proof.verify());
+
+        // Count how many siblings are default hashes (non-leaf level defaults)
+        let default_hashes = SparseMerkleTree::compute_default_hashes(256);
+        let default_count = proof
+            .siblings
+            .iter()
+            .filter(|s| default_hashes.contains(&s.hash))
+            .count();
+        // With a single leaf, nearly all siblings should be defaults
+        assert!(
+            default_count > 250,
+            "expected most siblings to be default hashes, got {default_count}"
+        );
+    }
+}
+
 #[cfg(test)]
 fn make_tree(leaves: &[&str]) -> MerkleTree {
     let mut tree = MerkleTree::new(32);
@@ -665,9 +1503,10 @@ mod tests {
     fn test_append_leaves_single_leaf() {
         let mut tree = make_tree(&["a", "b"]);
         let original_root = tree.root;
-        
-        tree.append_leaves(vec![b"c".to_vec()]).expect("append succeeds");
-        
+
+        tree.append_leaves(vec![b"c".to_vec()])
+            .expect("append succeeds");
+
         // Root should have changed
         assert_ne!(tree.root, original_root);
         // Count should be updated
@@ -683,10 +1522,10 @@ mod tests {
     fn test_append_leaves_multiple() {
         let mut tree = make_tree(&["a", "b"]);
         let original_root = tree.root;
-        
+
         tree.append_leaves(vec![b"c".to_vec(), b"d".to_vec(), b"e".to_vec()])
             .expect("append succeeds");
-        
+
         assert_ne!(tree.root, original_root);
         assert_eq!(tree.leaf_count(), 5);
         for i in 0..5 {
@@ -699,9 +1538,9 @@ mod tests {
     fn test_append_leaves_empty_is_noop() {
         let mut tree = make_tree(&["a", "b", "c"]);
         let original_root = tree.root;
-        
+
         tree.append_leaves(vec![]).expect("empty append is ok");
-        
+
         assert_eq!(tree.root, original_root);
         assert_eq!(tree.leaf_count(), 3);
     }
@@ -717,7 +1556,7 @@ mod tests {
         let mut tree = MerkleTree::new(2); // Max 4 leaves
         tree.build(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
             .expect("build succeeds");
-        
+
         // Trying to append more than capacity allows should fail
         assert!(tree
             .append_leaves(vec![b"d".to_vec(), b"e".to_vec()])
@@ -729,9 +1568,9 @@ mod tests {
         let mut tree = make_tree(&["a", "b", "c"]);
         let original_root = tree.root;
         let original_leaf_1 = tree.generate_proof(1).unwrap().leaf_hash;
-        
+
         tree.update_leaf(1, b"x".to_vec()).expect("update succeeds");
-        
+
         // Root should have changed
         assert_ne!(tree.root, original_root);
         // Leaf hash at index 1 should have changed
@@ -748,9 +1587,9 @@ mod tests {
     fn test_update_leaf_same_data_is_noop() {
         let mut tree = make_tree(&["a", "b", "c"]);
         let original_root = tree.root;
-        
+
         tree.update_leaf(1, b"b".to_vec()).expect("update succeeds");
-        
+
         // Root should NOT have changed since we updated with the same data
         assert_eq!(tree.root, original_root);
     }
@@ -771,13 +1610,10 @@ mod tests {
     fn test_update_leaves_multiple() {
         let mut tree = make_tree(&["a", "b", "c", "d"]);
         let original_root = tree.root;
-        
-        tree.update_leaves(vec![
-            (0, b"w".to_vec()),
-            (2, b"y".to_vec()),
-        ])
-        .expect("bulk update succeeds");
-        
+
+        tree.update_leaves(vec![(0, b"w".to_vec()), (2, b"y".to_vec())])
+            .expect("bulk update succeeds");
+
         assert_ne!(tree.root, original_root);
         assert_eq!(tree.leaf_count(), 4);
         for i in 0..4 {
@@ -790,9 +1626,9 @@ mod tests {
     fn test_update_leaves_empty_is_noop() {
         let mut tree = make_tree(&["a", "b", "c"]);
         let original_root = tree.root;
-        
+
         tree.update_leaves(vec![]).expect("empty update is ok");
-        
+
         assert_eq!(tree.root, original_root);
     }
 
@@ -800,13 +1636,10 @@ mod tests {
     fn test_update_leaves_all_same_data_is_noop() {
         let mut tree = make_tree(&["a", "b", "c"]);
         let original_root = tree.root;
-        
-        tree.update_leaves(vec![
-            (0, b"a".to_vec()),
-            (1, b"b".to_vec()),
-        ])
-        .expect("update with same data succeeds");
-        
+
+        tree.update_leaves(vec![(0, b"a".to_vec()), (1, b"b".to_vec())])
+            .expect("update with same data succeeds");
+
         // Root should NOT have changed
         assert_eq!(tree.root, original_root);
     }
@@ -814,34 +1647,30 @@ mod tests {
     #[test]
     fn test_update_leaves_out_of_bounds() {
         let mut tree = make_tree(&["a", "b"]);
-        assert!(tree
-            .update_leaves(vec![(5, b"x".to_vec())])
-            .is_err());
+        assert!(tree.update_leaves(vec![(5, b"x".to_vec())]).is_err());
     }
 
     #[test]
     fn test_update_leaves_uninitialized_tree() {
         let mut tree = MerkleTree::new(32);
-        assert!(tree
-            .update_leaves(vec![(0, b"x".to_vec())])
-            .is_err());
+        assert!(tree.update_leaves(vec![(0, b"x".to_vec())]).is_err());
     }
 
     #[test]
     fn test_incremental_update_preserves_proof_validity() {
         // Start with 4 leaves
         let mut tree = make_tree(&["a", "b", "c", "d"]);
-        
+
         // Get proof for leaf 0 before update
         let proof_before = tree.generate_proof(0).unwrap();
         assert!(proof_before.verify());
-        
+
         // Update leaf 2 (not affecting leaf 0 data, but changing tree structure)
         tree.update_leaf(2, b"x".to_vec()).expect("update succeeds");
-        
+
         // Get proof for leaf 0 after update
         let proof_after = tree.generate_proof(0).unwrap();
-        
+
         // The proofs should be different since tree changed
         assert_ne!(proof_before.root, proof_after.root);
         // But the new proof should still verify
@@ -851,21 +1680,21 @@ mod tests {
     #[test]
     fn test_append_then_update_sequence() {
         let mut tree = make_tree(&["a", "b"]);
-        
+
         // Append new leaves
         tree.append_leaves(vec![b"c".to_vec(), b"d".to_vec()])
             .expect("append succeeds");
         assert_eq!(tree.leaf_count(), 4);
-        
+
         // Verify all proofs
         for i in 0..4 {
             assert!(tree.generate_proof(i).unwrap().verify());
         }
-        
+
         // Update a leaf
         tree.update_leaf(1, b"x".to_vec()).expect("update succeeds");
         assert_eq!(tree.leaf_count(), 4);
-        
+
         // Verify all proofs again
         for i in 0..4 {
             assert!(tree.generate_proof(i).unwrap().verify());
@@ -876,15 +1705,14 @@ mod tests {
     fn test_large_append() {
         let mut tree = make_tree(&["a"]);
         let original_count = tree.leaf_count();
-        
+
         // Append 100 new leaves
-        let new_leaves: Vec<Vec<u8>> = (0..100)
-            .map(|i| format!("leaf-{i}").into_bytes())
-            .collect();
-        
-        tree.append_leaves(new_leaves).expect("large append succeeds");
+        let new_leaves: Vec<Vec<u8>> = (0..100).map(|i| format!("leaf-{i}").into_bytes()).collect();
+
+        tree.append_leaves(new_leaves)
+            .expect("large append succeeds");
         assert_eq!(tree.leaf_count(), original_count + 100);
-        
+
         // Sample verify some proofs
         for i in vec![0, 50, 99, 100] {
             let proof = tree.generate_proof(i).expect("proof exists");
@@ -896,13 +1724,13 @@ mod tests {
     fn test_bulk_update_all_leaves() {
         let mut tree = make_tree(&["a", "b", "c", "d", "e"]);
         let original_root = tree.root;
-        
+
         let updates: Vec<(usize, Vec<u8>)> = (0..5)
             .map(|i| (i, format!("new-{i}").into_bytes()))
             .collect();
-        
+
         tree.update_leaves(updates).expect("bulk update succeeds");
-        
+
         assert_ne!(tree.root, original_root);
         for i in 0..5 {
             let proof = tree.generate_proof(i).expect("proof exists");
@@ -1084,7 +1912,10 @@ mod reference_vector_tests {
                     .unwrap_or_else(|_| panic!("proof for leaf {i} in {count}-leaf tree exists"));
                 assert_eq!(proof.leaf_index, i);
                 assert_eq!(proof.root, tree.root);
-                assert!(proof.verify(), "proof for leaf {i} in {count}-leaf tree failed verify()");
+                assert!(
+                    proof.verify(),
+                    "proof for leaf {i} in {count}-leaf tree failed verify()"
+                );
                 assert!(
                     MerkleTree::verify_proof(&proof, &tree.root),
                     "proof for leaf {i} in {count}-leaf tree failed MerkleTree::verify_proof"
@@ -1234,7 +2065,6 @@ mod fuzz_tests {
     }
 }
 
-
 // ── Integration tests for incremental vs. full rebuild equivalence ────────────
 #[cfg(test)]
 mod incremental_equivalence_tests {
@@ -1277,11 +2107,7 @@ mod incremental_equivalence_tests {
     #[test]
     fn test_incremental_append_equals_full_rebuild_multiple_leaves() {
         let initial_leaves: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec()];
-        let new_leaves: Vec<Vec<u8>> = vec![
-            b"c".to_vec(),
-            b"d".to_vec(),
-            b"e".to_vec(),
-        ];
+        let new_leaves: Vec<Vec<u8>> = vec![b"c".to_vec(), b"d".to_vec(), b"e".to_vec()];
         let all_leaves = [&initial_leaves[..], &new_leaves[..]].concat();
 
         // Build incrementally
@@ -1306,12 +2132,7 @@ mod incremental_equivalence_tests {
 
     #[test]
     fn test_incremental_update_equals_full_rebuild() {
-        let leaves: Vec<Vec<u8>> = vec![
-            b"a".to_vec(),
-            b"b".to_vec(),
-            b"c".to_vec(),
-            b"d".to_vec(),
-        ];
+        let leaves: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()];
 
         // Build incrementally and update
         let mut tree_incremental = MerkleTree::new(32);
@@ -1348,11 +2169,13 @@ mod incremental_equivalence_tests {
         // Build incrementally and update multiple leaves
         let mut tree_incremental = MerkleTree::new(32);
         tree_incremental.build(leaves.clone()).unwrap();
-        tree_incremental.update_leaves(vec![
-            (0, b"w".to_vec()),
-            (2, b"x".to_vec()),
-            (4, b"z".to_vec()),
-        ]).unwrap();
+        tree_incremental
+            .update_leaves(vec![
+                (0, b"w".to_vec()),
+                (2, b"x".to_vec()),
+                (4, b"z".to_vec()),
+            ])
+            .unwrap();
 
         // Build from scratch with updated leaves
         let mut updated_leaves = leaves.clone();
@@ -1377,14 +2200,18 @@ mod incremental_equivalence_tests {
     fn test_complex_sequence_incremental_equals_full_rebuild() {
         // Start with 2 leaves
         let initial_leaves: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec()];
-        
+
         // Incremental path
         let mut tree_inc = MerkleTree::new(32);
         tree_inc.build(initial_leaves.clone()).unwrap();
-        tree_inc.append_leaves(vec![b"c".to_vec(), b"d".to_vec()]).unwrap();
+        tree_inc
+            .append_leaves(vec![b"c".to_vec(), b"d".to_vec()])
+            .unwrap();
         tree_inc.update_leaf(1, b"b_updated".to_vec()).unwrap();
         tree_inc.append_leaves(vec![b"e".to_vec()]).unwrap();
-        tree_inc.update_leaves(vec![(0, b"a_updated".to_vec()), (3, b"d_updated".to_vec())]).unwrap();
+        tree_inc
+            .update_leaves(vec![(0, b"a_updated".to_vec()), (3, b"d_updated".to_vec())])
+            .unwrap();
 
         // Full rebuild path
         let final_leaves = vec![
@@ -1415,9 +2242,8 @@ mod incremental_equivalence_tests {
     #[test]
     fn test_large_tree_incremental_append_equals_full_rebuild() {
         // Create a large initial tree
-        let initial_leaves: Vec<Vec<u8>> = (0..50)
-            .map(|i| format!("leaf-{i}").into_bytes())
-            .collect();
+        let initial_leaves: Vec<Vec<u8>> =
+            (0..50).map(|i| format!("leaf-{i}").into_bytes()).collect();
         let new_leaves: Vec<Vec<u8>> = (50..100)
             .map(|i| format!("leaf-{i}").into_bytes())
             .collect();

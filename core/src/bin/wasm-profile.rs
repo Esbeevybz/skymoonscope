@@ -37,7 +37,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    if let Err(error) = run_profile(&args.wasm_file, wasm_bytes.clone(), &args.function, &args.args) {
+    if let Err(error) = run_profile(
+        &args.wasm_file,
+        wasm_bytes.clone(),
+        &args.function,
+        &args.args,
+    ) {
         eprintln!("Profiling failed: {error}");
         if !args.watch {
             std::process::exit(1);
@@ -47,10 +52,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    println!(
-        "Watching {} for changes...",
-        args.wasm_file.display()
-    );
+    println!("Watching {} for changes...", args.wasm_file.display());
     let mut previous_hash = content_hash(&wasm_bytes);
     let interval = Duration::from_millis(args.watch_interval_ms.max(1));
 
@@ -70,12 +72,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         previous_hash = current_hash;
         println!("\nWASM file changed; profiling again...");
-        if let Err(error) = run_profile(
-            &args.wasm_file,
-            current_bytes,
-            &args.function,
-            &args.args,
-        ) {
+        if let Err(error) = run_profile(&args.wasm_file, current_bytes, &args.function, &args.args)
+        {
             eprintln!("Profiling failed: {error}");
         }
     }
@@ -88,18 +86,16 @@ fn run_profile(
     args: &[String],
 ) -> Result<(), Box<dyn Error>> {
     let profile_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        profile_contract_with_flamegraph(
-            wasm_bytes,
-            function.to_owned(),
-            args.to_vec(),
-        )
+        profile_contract_with_flamegraph(wasm_bytes, function.to_owned(), args.to_vec())
     }));
 
     let (resources, profile) = match profile_res {
         Ok(Ok(pair)) => pair,
         Ok(Err(err)) => return Err(Box::new(err)),
         Err(_) => {
-            return Err("profiling panicked unexpectedly; check contract custom sections and ABI".into());
+            return Err(
+                "profiling panicked unexpectedly; check contract custom sections and ABI".into(),
+            );
         }
     };
 
@@ -144,6 +140,9 @@ mod tests {
         let bad_wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
         let path = PathBuf::from("mock.wasm");
         let res = run_profile(&path, bad_wasm, "nonexistent", &[]);
-        assert!(res.is_err(), "should gracefully return error for invalid wasm");
+        assert!(
+            res.is_err(),
+            "should gracefully return error for invalid wasm"
+        );
     }
 }
