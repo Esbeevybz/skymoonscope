@@ -404,6 +404,20 @@ pub struct LiquidityPool;
 impl LiquidityPool {
     // Initialisation
 
+    /// Initialises the liquidity pool with two token addresses and an admin.
+    ///
+    /// Must be called exactly once. Subsequent calls return
+    /// [`Error::AlreadyInitialized`]. Sets up the [`PoolState`] with zero
+    /// reserves and the default fee, and initialises the [`EmergencyGuard`]
+    /// with `admin` as the sole guard admin at threshold 1.
+    ///
+    /// # Parameters
+    /// - `admin`   – Address that controls fee updates and emergency pauses.
+    /// - `token_a` – Address of the first Stellar asset in the pool.
+    /// - `token_b` – Address of the second Stellar asset in the pool.
+    ///
+    /// # Errors
+    /// - [`Error::AlreadyInitialized`] if the pool has already been set up.
     pub fn initialize(
         e: Env,
         admin: Address,
@@ -434,9 +448,16 @@ impl LiquidityPool {
 
     // Admin accessors
 
+    /// Returns the primary admin address stored for this pool.
+    ///
+    /// Panics with "not initialized" if [`initialize`](Self::initialize) has
+    /// not yet been called.
     pub fn get_admin(e: Env) -> Address {
         load_admin(&e).expect("not initialized")
     }
+
+    /// Returns the current multi-sig threshold required for emergency guard
+    /// operations (e.g. [`emergency_pause`](Self::emergency_pause)).
     pub fn get_admin_threshold(e: Env) -> u32 {
         EmergencyGuard::get_threshold(e)
     }
@@ -447,9 +468,13 @@ impl LiquidityPool {
     pub fn guard_pause(e: Env, admin: Address, operation: u32, paused: bool) -> Result<(), Error> {
         EmergencyGuard::set_pause(e, admin, operation, paused).map_err(map_guard_err)
     }
+    /// Returns `true` if the given `operation` bitmask is currently paused.
     pub fn guard_is_paused(e: Env, operation: u32) -> bool {
         EmergencyGuard::is_paused(e, operation)
     }
+
+    /// Single-bit pause toggle — equivalent to [`guard_pause`](Self::guard_pause)
+    /// but named after the pause-operation pattern used elsewhere.
     pub fn set_operation_paused(
         e: Env,
         admin: Address,
@@ -467,26 +492,37 @@ impl LiquidityPool {
         let admin = load_admin(&e)?;
         EmergencyGuard::set_pause(e, admin, CORE_PAUSE_OPS, paused).map_err(map_guard_err)
     }
+    /// Pauses the swap operation. Only the primary admin may call this.
     pub fn pause_swaps(e: Env) -> Result<(), Error> {
         let admin = load_admin(&e)?;
         EmergencyGuard::set_pause(e, admin, PauseType::SWAP, true).map_err(map_guard_err)
     }
+
+    /// Resumes the swap operation. Only the primary admin may call this.
     pub fn resume_swaps(e: Env) -> Result<(), Error> {
         let admin = load_admin(&e)?;
         EmergencyGuard::set_pause(e, admin, PauseType::SWAP, false).map_err(map_guard_err)
     }
+
+    /// Pauses the deposit operation. Only the primary admin may call this.
     pub fn pause_deposits(e: Env) -> Result<(), Error> {
         let admin = load_admin(&e)?;
         EmergencyGuard::set_pause(e, admin, PauseType::DEPOSIT, true).map_err(map_guard_err)
     }
+
+    /// Resumes the deposit operation. Only the primary admin may call this.
     pub fn resume_deposits(e: Env) -> Result<(), Error> {
         let admin = load_admin(&e)?;
         EmergencyGuard::set_pause(e, admin, PauseType::DEPOSIT, false).map_err(map_guard_err)
     }
+
+    /// Pauses the withdrawal operation. Only the primary admin may call this.
     pub fn pause_withdrawals(e: Env) -> Result<(), Error> {
         let admin = load_admin(&e)?;
         EmergencyGuard::set_pause(e, admin, PauseType::WITHDRAW, true).map_err(map_guard_err)
     }
+
+    /// Resumes the withdrawal operation. Only the primary admin may call this.
     pub fn resume_withdrawals(e: Env) -> Result<(), Error> {
         let admin = load_admin(&e)?;
         EmergencyGuard::set_pause(e, admin, PauseType::WITHDRAW, false).map_err(map_guard_err)
@@ -495,9 +531,16 @@ impl LiquidityPool {
     pub fn emergency_pause(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
         EmergencyGuard::emergency_pause(e, approvers).map_err(map_guard_err)
     }
+    /// Resumes all paused operations via multi-sig. Requires at least
+    /// `get_admin_threshold()` approvers from the guard admin set.
     pub fn resume(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
         EmergencyGuard::resume(e, approvers).map_err(map_guard_err)
     }
+
+    /// Returns the bitmask of currently paused operations.
+    ///
+    /// Each bit corresponds to a [`PauseType`] constant. A set bit means that
+    /// operation is paused.
     pub fn get_pause_mask(e: Env) -> u32 {
         EmergencyGuard::get_pause_state(e)
     }
@@ -505,9 +548,15 @@ impl LiquidityPool {
     pub fn guard_unpause(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
         EmergencyGuard::resume(e, approvers).map_err(map_guard_err)
     }
+    /// Returns `true` if the given `operation` bitmask is currently paused.
+    /// Alias for [`guard_is_paused`](Self::guard_is_paused).
     pub fn is_paused_op(e: Env, operation: u32) -> bool {
         EmergencyGuard::is_paused(e, operation)
     }
+
+    /// Adds `new_admin` to the emergency guard admin set.
+    ///
+    /// Requires multi-sig from at least `get_admin_threshold()` current admins.
     pub fn add_guard_admin(
         e: Env,
         approvers: Vec<Address>,
@@ -515,6 +564,11 @@ impl LiquidityPool {
     ) -> Result<(), Error> {
         EmergencyGuard::add_admin(e, approvers, new_admin).map_err(map_guard_err)
     }
+
+    /// Removes `admin` from the emergency guard admin set.
+    ///
+    /// Requires multi-sig from at least `get_admin_threshold()` current admins.
+    /// Fails if removal would drop the admin count below the threshold.
     pub fn remove_guard_admin(
         e: Env,
         approvers: Vec<Address>,
@@ -522,20 +576,41 @@ impl LiquidityPool {
     ) -> Result<(), Error> {
         EmergencyGuard::remove_admin(e, approvers, admin).map_err(map_guard_err)
     }
+
+    /// Returns the full list of current emergency guard admins.
     pub fn get_guard_admins(e: Env) -> Vec<Address> {
         EmergencyGuard::get_admins(e)
     }
+
+    /// Returns the minimum number of guard admin signatures required for
+    /// privileged multi-sig operations such as [`emergency_pause`](Self::emergency_pause).
     pub fn get_guard_threshold(e: Env) -> u32 {
         EmergencyGuard::get_threshold(e)
     }
 
     // Fee management
 
+    /// Returns the current swap fee in basis points (0–100).
+    ///
+    /// Defaults to [`DEFAULT_BASE_FEE_BPS`] if the pool has not been
+    /// initialised.
     pub fn get_fee(e: Env) -> i128 {
         load_pool(&e)
             .map(|p| p.fee_bps)
             .unwrap_or(DEFAULT_BASE_FEE_BPS)
     }
+
+    /// Sets the swap fee to `fee_bps` basis points.
+    ///
+    /// Only the primary admin may call this. Emits a [`FeeChangedEvent`].
+    ///
+    /// # Parameters
+    /// - `fee_bps` – New fee in basis points. Must be in `0..=MAX_FEE_BPS`.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidFee`] if `fee_bps` is out of range.
+    /// - [`Error::NotInitialized`] if the pool has not been set up yet.
+    /// - [`Error::Unauthorized`] if the caller is not the admin.
     pub fn set_fee(e: Env, fee_bps: i128) -> Result<(), Error> {
         if !(0..=MAX_FEE_BPS).contains(&fee_bps) {
             return Err(Error::InvalidFee);
@@ -557,6 +632,8 @@ impl LiquidityPool {
         Ok(())
     }
 
+    /// Returns the LP protocol fee in basis points charged on deposits and
+    /// withdrawals. Defaults to [`DEFAULT_LP_FEE_BPS`] if not explicitly set.
     pub fn get_lp_fee_bps(e: Env) -> i128 {
         e.storage()
             .instance()
@@ -564,6 +641,12 @@ impl LiquidityPool {
             .unwrap_or(DEFAULT_LP_FEE_BPS)
     }
 
+    /// Sets the LP protocol fee to `fee_bps` basis points.
+    ///
+    /// Only the primary admin may call this.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidFee`] if `fee_bps` is outside `0..=MAX_LP_FEE_BPS`.
     pub fn set_lp_fee_bps(e: Env, fee_bps: i128) -> Result<(), Error> {
         if !(0..=MAX_LP_FEE_BPS).contains(&fee_bps) {
             return Err(Error::InvalidFee);
@@ -574,6 +657,19 @@ impl LiquidityPool {
         Ok(())
     }
 
+    /// Attaches a price oracle and configures dynamic-fee parameters.
+    ///
+    /// When an oracle is configured, calling [`refresh_oracle_fee`](Self::refresh_oracle_fee)
+    /// will read the latest price, compute volatility, and schedule a fee
+    /// update via the timelock if the target fee differs from the current one.
+    ///
+    /// # Parameters
+    /// - `oracle`          – Contract address implementing [`PriceOracle`].
+    /// - `base_fee_bps`    – Baseline fee used when volatility is below the low threshold.
+    /// - `timelock_ledgers` – Ledgers the scheduled fee update must wait before it can be executed.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidFee`] if `base_fee_bps` is outside `0..=MAX_FEE_BPS`.
     pub fn configure_fee_oracle(
         e: Env,
         oracle: Address,
@@ -764,6 +860,15 @@ impl LiquidityPool {
             .unwrap_or(0);
         earned.saturating_sub(claimed)
     }
+    /// Stakes `amount` LP shares from `user`'s balance, locking them to
+    /// accumulate staking rewards.
+    ///
+    /// Transfers the shares from the user's liquid balance to their staked
+    /// balance. Rewards begin accruing from the next ledger.
+    ///
+    /// # Errors
+    /// - [`Error::InsufficientBalance`] if `user` holds fewer liquid shares.
+    /// - [`Error::Paused`] if the stake operation has been paused.
     pub fn stake(e: Env, user: Address, amount: i128) -> Result<(), Error> {
         require_not_paused(&e, PauseType::STAKE)?;
         user.require_auth();
@@ -800,6 +905,15 @@ impl LiquidityPool {
         );
         Ok(())
     }
+    /// Unstakes `amount` LP shares from `user`'s staked balance back to their
+    /// liquid balance.
+    ///
+    /// Pending rewards are snapshotted before the transfer so the user does
+    /// not lose earned rewards.
+    ///
+    /// # Errors
+    /// - [`Error::InsufficientShares`] if `user`'s staked balance is below `amount`.
+    /// - [`Error::Paused`] if the stake operation has been paused.
     pub fn unstake(e: Env, user: Address, amount: i128) -> Result<(), Error> {
         require_not_paused(&e, PauseType::STAKE)?;
         user.require_auth();
@@ -836,6 +950,16 @@ impl LiquidityPool {
         );
         Ok(())
     }
+    /// Claims all pending staking rewards accumulated by `user` and transfers
+    /// them from the pool's reward reserve.
+    ///
+    /// Returns `0` immediately if no rewards have been earned yet.
+    ///
+    /// # Returns
+    /// The amount of rewards tokens transferred to `user`.
+    ///
+    /// # Errors
+    /// - [`Error::Paused`] if the claim-rewards operation has been paused.
     pub fn claim_rewards(e: Env, user: Address) -> Result<i128, Error> {
         require_not_paused(&e, PauseType::CLAIM_REWARDS)?;
         user.require_auth();
@@ -866,17 +990,21 @@ impl LiquidityPool {
         );
         Ok(pending)
     }
+    /// Returns the amount of LP shares `user` has currently staked.
     pub fn get_staked_balance(e: Env, user: Address) -> i128 {
         e.storage()
             .persistent()
             .get(&DataKey::StakedBalance(user))
             .unwrap_or(0)
     }
+    /// Returns the unclaimed staking rewards currently owed to `user`, based
+    /// on their staked share and the global reward-per-share accumulator.
     pub fn get_pending_rewards(e: Env, user: Address) -> i128 {
         let staked_key = DataKey::StakedBalance(user.clone());
         let staked_amount: i128 = e.storage().persistent().get(&staked_key).unwrap_or(0);
         Self::calculate_pending_rewards(&e, &user, staked_amount)
     }
+    /// Returns the total number of LP shares currently staked across all users.
     pub fn get_total_staked(e: Env) -> i128 {
         e.storage()
             .instance()
@@ -886,6 +1014,29 @@ impl LiquidityPool {
 
     // Core AMM operations
 
+    /// Deposits `amount_a` of token A and `amount_b` of token B into the pool
+    /// and mints LP shares to `to`.
+    ///
+    /// On the first deposit (empty pool), shares are calculated as
+    /// `sqrt(amount_a * amount_b)`. On subsequent deposits the minimum of the
+    /// proportional share for each reserve is used, so the deposit must match
+    /// the current pool ratio to avoid leaving value behind.
+    ///
+    /// An LP protocol fee ([`get_lp_fee_bps`](Self::get_lp_fee_bps)) is
+    /// deducted from the gross shares before they are credited to `to`.
+    ///
+    /// # Parameters
+    /// - `to`       – Recipient of the newly minted shares; must authorize the call.
+    /// - `amount_a` – Amount of token A to deposit. Must be positive.
+    /// - `amount_b` – Amount of token B to deposit. Must be positive.
+    ///
+    /// # Returns
+    /// The net number of LP shares minted to `to` after the LP fee.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidAmount`] if `amount_a` or `amount_b` is ≤ 0.
+    /// - [`Error::InsufficientLiquidity`] if arithmetic overflows or gross shares round to 0.
+    /// - [`Error::Paused`] if the deposit operation has been paused.
     pub fn deposit(e: Env, to: Address, amount_a: i128, amount_b: i128) -> Result<i128, Error> {
         require_not_paused(&e, PauseType::DEPOSIT)?;
         to.require_auth();
@@ -973,6 +1124,28 @@ impl LiquidityPool {
         Ok(net_shares)
     }
 
+    /// Swaps tokens using the exact-output model: the caller specifies how much
+    /// they want to receive (`out`) and the maximum they are willing to pay
+    /// (`in_max`).
+    ///
+    /// Uses a constant-product AMM formula with the current pool fee. The
+    /// required input amount is computed first; if it exceeds `in_max` the
+    /// transaction is rejected to protect against slippage.
+    ///
+    /// # Parameters
+    /// - `to`     – Address sending tokens and receiving the output; must authorize.
+    /// - `buy_a`  – `true` to receive token A (paying token B); `false` for the reverse.
+    /// - `out`    – Exact amount of output token desired. Must be positive.
+    /// - `in_max` – Maximum amount of input token the caller will spend.
+    ///
+    /// # Returns
+    /// The actual amount of input token transferred from `to`.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidAmount`] if `out` ≤ 0.
+    /// - [`Error::SlippageExceeded`] if the required input exceeds `in_max`.
+    /// - [`Error::InsufficientLiquidity`] if reserves are too low.
+    /// - [`Error::Paused`] if the swap operation has been paused.
     pub fn swap(e: Env, to: Address, buy_a: bool, out: i128, in_max: i128) -> Result<i128, Error> {
         require_not_paused(&e, PauseType::SWAP)?;
         to.require_auth();
@@ -991,6 +1164,24 @@ impl LiquidityPool {
         Ok(amount_in)
     }
 
+    /// Swaps tokens using the exact-input model: the caller specifies exactly
+    /// how much they will pay (`amount_in`) and the minimum they expect to
+    /// receive (`min_amount_out`).
+    ///
+    /// # Parameters
+    /// - `to`             – Address sending tokens and receiving output; must authorize.
+    /// - `buy_a`          – `true` to receive token A (paying token B); `false` for the reverse.
+    /// - `amount_in`      – Exact amount of input token to spend. Must be positive.
+    /// - `min_amount_out` – Minimum acceptable output amount (slippage guard).
+    ///
+    /// # Returns
+    /// The actual amount of output token received by `to`.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidAmount`] if `amount_in` ≤ 0.
+    /// - [`Error::SlippageExceeded`] if the computed output is below `min_amount_out`.
+    /// - [`Error::InsufficientLiquidity`] if reserves are too low.
+    /// - [`Error::Paused`] if the swap operation has been paused.
     pub fn swap_exact_in(
         e: Env,
         to: Address,
@@ -1040,6 +1231,10 @@ impl LiquidityPool {
         )
     }
 
+    /// Returns the current token reserves as `(reserve_a, reserve_b)`.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialized`] if the pool has not been set up yet.
     pub fn get_reserves(e: Env) -> Result<(i128, i128), Error> {
         let pool = load_pool(&e)?;
         Ok((pool.reserve_a, pool.reserve_b))
@@ -1083,6 +1278,27 @@ impl LiquidityPool {
             },
         );
     }
+    /// Burns `share_amount` LP shares owned by `to` and returns the
+    /// proportional amounts of token A and token B.
+    ///
+    /// An LP protocol fee ([`get_lp_fee_bps`](Self::get_lp_fee_bps)) is
+    /// deducted from the gross output before tokens are transferred. If the
+    /// position was opened within [`MIN_HOLDING_PERIOD`] ledgers of the
+    /// current ledger, an early-withdrawal penalty is also applied.
+    ///
+    /// # Parameters
+    /// - `to`           – Owner of the shares to burn; must authorize the call.
+    /// - `share_amount` – Number of LP shares to redeem. Must be positive and
+    ///                    not exceed `to`'s current balance.
+    ///
+    /// # Returns
+    /// A tuple `(amount_a, amount_b)` — the net token amounts transferred to `to`.
+    ///
+    /// # Errors
+    /// - [`Error::InvalidAmount`] if `share_amount` ≤ 0.
+    /// - [`Error::InsufficientShares`] if `to` holds fewer shares than requested.
+    /// - [`Error::InsufficientLiquidity`] if the pool has zero total shares.
+    /// - [`Error::Paused`] if the withdrawal operation has been paused.
     pub fn withdraw(e: Env, to: Address, share_amount: i128) -> Result<(i128, i128), Error> {
         require_not_paused(&e, PauseType::WITHDRAW)?;
         to.require_auth();
@@ -1190,6 +1406,16 @@ impl LiquidityPool {
 
         Ok((net_amount_a, net_amount_b))
     }
+    /// Burns `amount` LP shares from `from`, permanently removing them from
+    /// circulation without returning any underlying tokens.
+    ///
+    /// This is distinct from [`withdraw`](Self::withdraw), which redeems
+    /// shares for tokens. `burn` is primarily used by governance or protocol
+    /// mechanics that need to destroy shares directly.
+    ///
+    /// # Errors
+    /// - [`Error::InsufficientShares`] if `from` holds fewer shares than `amount`.
+    /// - [`Error::Paused`] if the burn operation has been paused.
     pub fn burn(e: Env, from: Address, amount: i128) -> Result<(), Error> {
         require_not_paused(&e, PauseType::BURN)?;
         from.require_auth();
@@ -1237,6 +1463,14 @@ impl LiquidityPool {
     pub fn total_supply(e: Env) -> i128 {
         load_pool(&e).map(|p| p.total_shares).unwrap_or(0)
     }
+    /// Transfers `amount` LP shares from `from` to `to`.
+    ///
+    /// `from` must authorize the call. Transfers do not affect staked balances
+    /// — only liquid (unstaked) shares can be transferred.
+    ///
+    /// # Errors
+    /// - [`Error::InsufficientBalance`] if `from` holds fewer liquid shares.
+    /// - [`Error::Paused`] if the transfer operation has been paused.
     pub fn transfer(e: Env, from: Address, to: Address, amount: i128) -> Result<(), Error> {
         require_not_paused(&e, PauseType::TRANSFER)?;
         from.require_auth();

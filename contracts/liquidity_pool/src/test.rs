@@ -2401,3 +2401,127 @@ fn test_amount_in_quote_round_trips_against_amount_out() {
         "round trip under-charged: {quoted_in} for {quoted_out} out"
     );
 }
+
+// --- Issue #42: zero-amount deposit edge case ---
+
+#[test]
+fn test_deposit_zero_amount() {
+    // Both zero-amount deposits must be rejected with Error::InvalidAmount
+    // (error code 15) to guard against the pool issuing zero shares or
+    // accepting dust that would corrupt the constant-product invariant.
+
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    // Give the user enough tokens to deposit if the validation were wrong
+    token_a_admin.mint(&user, &1000);
+    token_b_admin.mint(&user, &1000);
+
+    // Case 1: amount_a = 0, amount_b > 0 — must fail with InvalidAmount
+    assert_eq!(
+        client.try_deposit(&user, &0, &500),
+        Err(Ok(Error::InvalidAmount)),
+        "expected InvalidAmount when amount_a is zero"
+    );
+
+    // Case 2: amount_a > 0, amount_b = 0 — must fail with InvalidAmount
+    assert_eq!(
+        client.try_deposit(&user, &500, &0),
+        Err(Ok(Error::InvalidAmount)),
+        "expected InvalidAmount when amount_b is zero"
+    );
+
+    // Case 3: both amounts zero — must fail with InvalidAmount
+    assert_eq!(
+        client.try_deposit(&user, &0, &0),
+        Err(Ok(Error::InvalidAmount)),
+        "expected InvalidAmount when both amounts are zero"
+    );
+
+    // Sanity-check: a valid deposit with positive amounts succeeds and user
+    // balances remain unchanged after the failing calls above.
+    let shares = client.deposit(&user, &500, &500);
+    assert!(shares > 0, "valid deposit should mint positive shares");
+}
+
+// --- Issue #42: zero-amount deposit edge case ---
+
+#[test]
+fn test_deposit_zero_amount() {
+    // Both zero-amount deposits must be rejected with Error::InvalidAmount
+    // (error code 15) to guard against the pool issuing zero shares or
+    // accepting dust that would corrupt the constant-product invariant.
+
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let user = Address::generate(&e);
+
+    e.cost_estimate().budget().reset_unlimited();
+
+    client.initialize(&admin, &token_a, &token_b);
+
+    let token_a_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_a);
+    let token_b_admin = soroban_sdk::token::StellarAssetClient::new(&e, &token_b);
+
+    // Give the user enough tokens to deposit if validation were absent
+    token_a_admin.mint(&user, &1000);
+    token_b_admin.mint(&user, &1000);
+
+    // Case 1: amount_a = 0, amount_b > 0 — must fail with InvalidAmount
+    assert_eq!(
+        client.try_deposit(&user, &0, &500),
+        Err(Ok(Error::InvalidAmount)),
+        "expected InvalidAmount when amount_a is zero"
+    );
+
+    // Case 2: amount_a > 0, amount_b = 0 — must fail with InvalidAmount
+    assert_eq!(
+        client.try_deposit(&user, &500, &0),
+        Err(Ok(Error::InvalidAmount)),
+        "expected InvalidAmount when amount_b is zero"
+    );
+
+    // Case 3: both amounts zero — must fail with InvalidAmount
+    assert_eq!(
+        client.try_deposit(&user, &0, &0),
+        Err(Ok(Error::InvalidAmount)),
+        "expected InvalidAmount when both amounts are zero"
+    );
+
+    // Sanity-check: a valid deposit with positive amounts succeeds,
+    // proving the pool is functional after the rejected calls above.
+    let shares = client.deposit(&user, &500, &500);
+    assert!(shares > 0, "valid deposit should mint positive shares");
+}
