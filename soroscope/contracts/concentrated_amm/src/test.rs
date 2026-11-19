@@ -141,6 +141,22 @@ fn test_mint_invalid_tick_range() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_mint_zero_width_tick_range() {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let (token_a, token_b, admin_a, _) = setup_tokens(&e);
+    let client = setup_amm(&e, &token_a, &token_b);
+
+    let user = Address::generate(&e);
+    admin_a.mint(&user, &1_000_000);
+
+    client.mint(&user, &100i32, &100i32, &100_000u128, &100_000u128);
+}
+
+#[test]
 fn test_burn_recovers_tokens() {
     let e = Env::default();
     e.mock_all_auths();
