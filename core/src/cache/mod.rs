@@ -110,8 +110,28 @@ impl SimulationCache {
         args: &[String],
         network: &str,
     ) -> String {
+        Self::generate_key_with_network_and_wasm_hash(
+            contract_id,
+            function_name,
+            args,
+            network,
+            None,
+        )
+    }
+
+    pub fn generate_key_with_network_and_wasm_hash(
+        contract_id: &str,
+        function_name: &str,
+        args: &[String],
+        network: &str,
+        wasm_hash: Option<&[u8; 32]>,
+    ) -> String {
         let args_json = serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string());
-        let input = format!("{}{}{}{}", contract_id, function_name, args_json, network);
+        let wasm_hash = wasm_hash.map(hex::encode).unwrap_or_default();
+        let input = format!(
+            "{}{}{}{}{}",
+            contract_id, function_name, args_json, network, wasm_hash
+        );
         let digest = Sha256::digest(input.as_bytes());
         hex::encode(digest)
     }
@@ -403,6 +423,40 @@ mod tests {
             key1, key2,
             "Same inputs with same network should produce same cache key"
         );
+    }
+
+    #[test]
+    fn cache_key_with_network_includes_wasm_hash() {
+        let contract_id = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let function_name = "transfer";
+        let args = vec!["arg1".to_string()];
+        let wasm_hash_v1: [u8; 32] = Sha256::digest(b"wasm-v1").into();
+        let wasm_hash_v2: [u8; 32] = Sha256::digest(b"wasm-v2").into();
+
+        let key_v1 = SimulationCache::generate_key_with_network_and_wasm_hash(
+            contract_id,
+            function_name,
+            &args,
+            "network",
+            Some(&wasm_hash_v1),
+        );
+        let key_v1_again = SimulationCache::generate_key_with_network_and_wasm_hash(
+            contract_id,
+            function_name,
+            &args,
+            "network",
+            Some(&wasm_hash_v1),
+        );
+        let key_v2 = SimulationCache::generate_key_with_network_and_wasm_hash(
+            contract_id,
+            function_name,
+            &args,
+            "network",
+            Some(&wasm_hash_v2),
+        );
+
+        assert_eq!(key_v1, key_v1_again);
+        assert_ne!(key_v1, key_v2);
     }
 }
 
