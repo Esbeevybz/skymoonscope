@@ -44,6 +44,19 @@ pub trait InsightRule: Send + Sync {
 
 // ── Built-in rules ────────────────────────────────────────────────────────────
 
+/// Warn when ledger writes exceed the full transaction-size baseline.
+///
+/// This heuristic uses a 1:1 ratio: above this point, bytes written to the
+/// ledger outweigh the transaction data submitted.
+const STORAGE_WRITE_WARNING_RATIO: f64 = 1.0;
+
+/// Mark storage writes critical once they exceed twice the transaction-size baseline.
+///
+/// The 2:1 ratio is the escalation point above the warning threshold, indicating
+/// that ledger writes are more than double the submitted transaction data. These
+/// ratios are analysis heuristics, not Soroban protocol limits.
+const STORAGE_WRITE_CRITICAL_RATIO: f64 = 2.0;
+
 /// Flags disproportionately high ledger write bytes relative to overall
 /// transaction data, suggesting inefficient storage patterns.
 pub struct StorageEfficiencyRule;
@@ -63,7 +76,7 @@ impl InsightRule for StorageEfficiencyRule {
 
         let write_ratio = r.ledger_write_bytes as f64 / r.transaction_size_bytes as f64;
 
-        if write_ratio > 2.0 {
+        if write_ratio > STORAGE_WRITE_CRITICAL_RATIO {
             out.push(Insight {
                 severity: Severity::Critical,
                 rule: self.name().to_string(),
@@ -76,7 +89,7 @@ impl InsightRule for StorageEfficiencyRule {
                                 and batch writes where possible."
                     .to_string(),
             });
-        } else if write_ratio > 1.0 {
+        } else if write_ratio > STORAGE_WRITE_WARNING_RATIO {
             out.push(Insight {
                 severity: Severity::Warning,
                 rule: self.name().to_string(),
