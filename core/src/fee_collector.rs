@@ -593,35 +593,7 @@ impl FeeCollector {
         }
 
         // Try the first healthy provider
-                let provider = &providers[0];
-
-        // Use the RPC fee statistics for real-time fee tracking.
-        if let Ok(fee_stats) = self.fetch_fee_stats(provider).await {
-            if let Some(p50) = fee_stats["p50"].as_str().and_then(|v| v.parse::<i64>().ok()) {
-                let p95 = fee_stats["p95"]
-                    .as_str()
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(p50);
-
-                let transaction_count = fee_stats["transactionCount"]
-                    .as_str()
-                    .and_then(|v| v.parse::<i32>().ok())
-                    .unwrap_or(0);
-
-                return Ok(LedgerFeeSample {
-                    ledger_sequence: sequence as i64,
-                    collected_at: Utc::now(),
-                    base_reserve: 0,
-                    base_fee: p50,
-                    max_fee: p95,
-                    fee_charged: 0,
-                    transaction_count,
-                    ledger_close_time: Utc::now(),
-                });
-            }
-        }
-
-        
+        let provider = &providers[0];
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -669,43 +641,35 @@ impl FeeCollector {
         Ok(sequence)
     }
 
-    /// Fetch detailed fee data for a specific ledger
-        /// Fetch real-time fee statistics from Stellar RPC.
-    async fn fetch_fee_stats(
+    /// Fetch detailed fee data for a specific ledger.
+    ///
+    /// `getLedgers` can legitimately return an empty `ledgers` array (for
+    /// example while the ledger is still closing, or when the RPC has a
+    /// shorter retention window). In that case fall back to `getTransactions`,
+    /// which returns a default sample when the ledger has no transactions
+    /// instead of propagating an empty-histogram error.
+    async fn fetch_ledger_fee_data(
         &self,
-        provider: &crate::rpc_provider::RpcProvider,
-    ) -> Result<serde_json::Value, FeeCollectorError> {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getFeeStats",
-            "params": null
-        });
-
-        let mut req = self.client.post(&provider.url).json(&body);
-
-        if let (Some(header), Some(value)) = (&provider.auth_header, &provider.auth_value) {
-            req = req.header(header.as_str(), value.as_str());
+        sequence: u64,
+    ) -> Result<LedgerFeeSample, FeeCollectorError> {
+        let providers = self.registry.healthy_providers().await;
+        if providers.is_empty() {
+            return Err(FeeCollectorError::NoHealthyProviders);
         }
 
-        let response = req
-            .send()
-            .await
-            .map_err(|e| FeeCollectorError::RpcRequestFailed(e.to_string()))?;
+        let provider = &providers[0];
 
-        if !response.status().is_success() {
-            return Err(FeeCollectorError::RpcRequestFailed(format!(
-                "HTTP {}",
-                response.status()
-            )));
+        match self.fetch_from_get_ledgers(provider, sequence).await {
+            Ok(sample) => Ok(sample),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    ledger = sequence,
+                    "getLedgers returned no usable fee data, falling back to getTransactions"
+                );
+                self.fetch_from_get_transactions(provider, sequence).await
+            }
         }
-
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| FeeCollectorError::ParseError(e.to_string()))?;
-
-        Ok(json["result"]["inclusionFee"].clone())
     }
 
     /// Fetch fee data using getLedgers RPC method
@@ -805,7 +769,19 @@ impl FeeCollector {
             FeeCollectorError::ParseError("Missing transactions array".to_string())
         })?;
 
-        // Calculate fee statistics from transactions
+        Ok(Self::sample_from_transactions(sequence, transactions))
+    }
+
+    /// Build a fee sample from `getTransactions` results.
+    ///
+    /// An empty result is valid: it means the ledger closed without
+    /// transactions or the RPC returned an empty histogram. Use the protocol
+    /// base fee (100 stroops) as a safe default instead of panicking or
+    /// propagating an empty-data error.
+    fn sample_from_transactions(
+        sequence: u64,
+        transactions: &[serde_json::Value],
+    ) -> LedgerFeeSample {
         let mut total_fee_charged: i64 = 0;
         let mut max_fee: i64 = 0;
         let mut tx_count: i32 = 0;
@@ -823,10 +799,10 @@ impl FeeCollector {
         let avg_fee = if tx_count > 0 {
             total_fee_charged / tx_count as i64
         } else {
-            100 // Default base fee
+            100 // Protocol base fee
         };
 
-        Ok(LedgerFeeSample {
+        LedgerFeeSample {
             ledger_sequence: sequence as i64,
             collected_at: Utc::now(),
             base_reserve: 0, // Not available from this endpoint
@@ -835,7 +811,7 @@ impl FeeCollector {
             fee_charged: total_fee_charged,
             transaction_count: tx_count,
             ledger_close_time: Utc::now(),
-        })
+        }
     }
 
     /// Parse ledger sample from getLedgers response
@@ -932,6 +908,46 @@ mod tests {
         assert_eq!(config.collection_interval_secs, 5);
         assert_eq!(config.batch_size, 10);
         assert_eq!(config.request_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn empty_fee_histogram_uses_protocol_base_fee() {
+        let sample = FeeCollector::sample_from_transactions(42, &[]);
+
+        assert_eq!(sample.ledger_sequence, 42);
+        assert_eq!(sample.base_fee, 100);
+        assert_eq!(sample.max_fee, 100);
+        assert_eq!(sample.fee_charged, 0);
+        assert_eq!(sample.transaction_count, 0);
+    }
+
+    #[test]
+    fn transaction_fees_are_aggregated() {
+        let transactions = vec![
+            serde_json::json!({ "feeCharged": "150" }),
+            serde_json::json!({ "feeCharged": "250" }),
+        ];
+
+        let sample = FeeCollector::sample_from_transactions(43, &transactions);
+
+        assert_eq!(sample.base_fee, 200);
+        assert_eq!(sample.max_fee, 250);
+        assert_eq!(sample.fee_charged, 400);
+        assert_eq!(sample.transaction_count, 2);
+    }
+
+    #[test]
+    fn malformed_transaction_fees_are_ignored() {
+        let transactions = vec![
+            serde_json::json!({ "feeCharged": "not-a-number" }),
+            serde_json::json!({}),
+        ];
+
+        let sample = FeeCollector::sample_from_transactions(44, &transactions);
+
+        assert_eq!(sample.base_fee, 100);
+        assert_eq!(sample.fee_charged, 0);
+        assert_eq!(sample.transaction_count, 0);
     }
 
     #[tokio::test]

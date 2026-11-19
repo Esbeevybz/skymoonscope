@@ -249,8 +249,8 @@ impl WasmInstrumenter {
     pub fn instrument(&self, wasm_bytes: &[u8]) -> Result<Vec<u8>, SimulationError> {
         use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
         use wasm_encoder::{
-            CodeSection, ConstExpr, ExportKind, ExportSection, Function, FunctionSection,
-            GlobalSection, GlobalType, Instruction, Module, TypeSection, ValType,
+            CodeSection, ConstExpr, CustomSection, ExportKind, ExportSection, Function,
+            FunctionSection, GlobalSection, GlobalType, Instruction, Module, TypeSection, ValType,
         };
         use wasmparser::{Parser, Payload};
 
@@ -639,11 +639,25 @@ impl WasmInstrumenter {
                 }
 
                 Payload::CustomSection(reader) => {
-                    reencoder
-                        .parse_custom_section(&mut module, reader)
-                        .map_err(|e| {
-                            SimulationError::InvalidContract(format!("Custom section error: {e}"))
-                        })?;
+                    // Custom sections may be standard (e.g. `name`, Soroban metadata)
+                    // or non-standard/arbitrary. We try re-encoding via `RoundtripReencoder`.
+                    // If parsing or re-encoding fails or panics (e.g. malformed Name subsections
+                    // or unknown custom formatting), we fall back to preserving the custom
+                    // section as raw bytes so instrumentation never fails or panics on custom sections.
+                    let reencode_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        reencoder.parse_custom_section(&mut module, reader)
+                    }));
+                    match reencode_res {
+                        Ok(Ok(())) => {}
+                        _ => {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                module.section(&CustomSection {
+                                    name: reader.name().into(),
+                                    data: reader.data().into(),
+                                });
+                            }));
+                        }
+                    }
                 }
 
                 Payload::End(_) => {
@@ -3263,7 +3277,18 @@ pub fn profile_contract(
     }
 
     env.mock_all_auths();
-    let contract_id = env.register(&*wasm_bytes, ());
+    let register_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.register(&*wasm_bytes, ())
+    }));
+    let contract_id = match register_result {
+        Ok(id) => id,
+        Err(_) => {
+            return Err(SimulationError::InvalidContract(
+                "Contract registration panicked; WASM may be missing required Soroban metadata or have invalid custom sections"
+                    .to_string(),
+            ));
+        }
+    };
 
     // Build the argument list for the invocation.
     let mut sdk_args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
@@ -3354,26 +3379,27 @@ pub fn profile_contract_with_flamegraph(
     let _enter = span.enter();
 
     // ── Attempt binary instrumentation ───────────────────────────────────────
-    let (instrumented, func_names, use_budget_fallback) = match WasmInstrumenter::new(&wasm_bytes) {
-        Ok(instrumenter) => match instrumenter.instrument(&wasm_bytes) {
-            Ok(bytes) => {
+    let (instrumented, func_names, use_budget_fallback) = match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| {
+            WasmInstrumenter::new(&wasm_bytes).and_then(|instrumenter| {
                 let names = instrumenter.func_names().to_vec();
-                (bytes, names, false)
-            }
-            Err(e) => {
-                tracing::error!(
-                    wasm_size_bytes = wasm_size,
-                    error = %e,
-                    "WASM instrumentation failed; falling back to budget API"
-                );
-                (wasm_bytes.clone(), vec![], true)
-            }
-        },
-        Err(e) => {
+                instrumenter.instrument(&wasm_bytes).map(|bytes| (bytes, names))
+            })
+        }),
+    ) {
+        Ok(Ok((bytes, names))) => (bytes, names, false),
+        Ok(Err(e)) => {
             tracing::error!(
                 wasm_size_bytes = wasm_size,
                 error = %e,
                 "WASM instrumentation failed; falling back to budget API"
+            );
+            (wasm_bytes.clone(), vec![], true)
+        }
+        Err(_) => {
+            tracing::error!(
+                wasm_size_bytes = wasm_size,
+                "WASM instrumentation panicked; falling back to budget API"
             );
             (wasm_bytes.clone(), vec![], true)
         }
@@ -4680,6 +4706,130 @@ mod tests {
         let parsed_legacy = extract_soroban_budget_from_logs(legacy_logs);
         assert_eq!(parsed_legacy.cpu_instructions, 500000);
         assert_eq!(parsed_legacy.memory_bytes, 250000);
+    }
+
+    fn soroban_wasm_with_custom_sections() -> Vec<u8> {
+        use soroban_sdk::xdr::{Limits, ScEnvMetaEntry, ScEnvMetaEntryInterfaceVersion, WriteXdr};
+        use wasm_encoder::{
+            CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
+            Module, TypeSection, ValType,
+        };
+
+        let meta_entry =
+            ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(ScEnvMetaEntryInterfaceVersion {
+                protocol: 22,
+                pre_release: 0,
+            });
+        let meta_bytes = meta_entry
+            .to_xdr(Limits::none())
+            .expect("XDR encode failed");
+
+        let mut module = Module::new();
+
+        // 1. Custom section before Type section
+        module.section(&CustomSection {
+            name: "contractenvmetav0".into(),
+            data: meta_bytes.as_slice().into(),
+        });
+
+        let mut types = TypeSection::new();
+        types.ty().function([], [ValType::I64]);
+        module.section(&types);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        module.section(&functions);
+
+        let mut exports = ExportSection::new();
+        exports.export("add", ExportKind::Func, 0);
+        module.section(&exports);
+
+        // 2. Custom section between Export and Code sections
+        module.section(&CustomSection {
+            name: "custom_between_export_and_code".into(),
+            data: b"intermediate-data".as_slice().into(),
+        });
+
+        let mut codes = CodeSection::new();
+        let mut f = Function::new(vec![]);
+        f.instruction(&wasm_encoder::Instruction::I64Const(2));
+        f.instruction(&wasm_encoder::Instruction::End);
+        codes.function(&f);
+        module.section(&codes);
+
+        // 3. Custom sections after Code section
+        module.section(&CustomSection {
+            name: "contractmetav0".into(),
+            data: b"\x00\x00\x00\x00".as_slice().into(),
+        });
+        module.section(&CustomSection {
+            name: "custom_tail_payload".into(),
+            data: b"tail-data".as_slice().into(),
+        });
+
+        module.finish()
+    }
+
+    #[test]
+    fn test_wasm_instrumenter_custom_sections_preserved() {
+        let wasm = soroban_wasm_with_custom_sections();
+        let instr = WasmInstrumenter::new(&wasm).expect("instrumenter creation should succeed");
+        let instrumented = instr.instrument(&wasm).expect("instrumentation should succeed");
+        assert!(instrumented.len() > wasm.len());
+
+        // Verify custom sections are present in instrumented binary
+        use wasmparser::{Parser, Payload};
+        let mut custom_names = Vec::new();
+        for payload in Parser::new(0).parse_all(&instrumented) {
+            if let Ok(Payload::CustomSection(reader)) = payload {
+                custom_names.push(reader.name().to_string());
+            }
+        }
+        assert!(custom_names.contains(&"contractenvmetav0".to_string()));
+        assert!(custom_names.contains(&"custom_between_export_and_code".to_string()));
+        assert!(custom_names.contains(&"contractmetav0".to_string()));
+        assert!(custom_names.contains(&"custom_tail_payload".to_string()));
+    }
+
+    #[test]
+    fn test_wasm_instrumenter_malformed_custom_section_does_not_panic() {
+        use wasm_encoder::{CustomSection, Module};
+        let mut wasm = minimal_wasm();
+        // Append a custom section with arbitrary / non-standard name subsection bytes
+        let mut module = Module::new();
+        module.section(&CustomSection {
+            name: "name".into(),
+            data: b"\xff\xff\xff\xff".as_slice().into(),
+        });
+        let custom_bytes = module.finish();
+        wasm.extend_from_slice(&custom_bytes[8..]); // append section to valid wasm
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Ok(instr) = WasmInstrumenter::new(&wasm) {
+                let _ = instr.instrument(&wasm);
+            }
+        }));
+        assert!(result.is_ok(), "instrumentation should never panic on custom sections");
+    }
+
+    #[test]
+    fn test_profile_contract_with_flamegraph_custom_sections_succeeds() {
+        let wasm = soroban_wasm_with_custom_sections();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            profile_contract_with_flamegraph(wasm, "add".to_string(), vec![])
+        }));
+        assert!(result.is_ok(), "profiling must not panic when WASM contains custom sections");
+        let (resources, profile) = result.unwrap().expect("profiling should succeed");
+        assert!(resources.cpu_instructions > 0);
+        assert!(!profile.per_function.is_empty());
+    }
+
+    #[test]
+    fn test_profile_contract_registration_panic_is_handled() {
+        // Corrupt WASM that fails registration
+        let bad_wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let res = profile_contract(bad_wasm, "foo".to_string(), vec![], None, None);
+        assert!(res.is_err(), "should return error rather than panicking");
     }
 }
 

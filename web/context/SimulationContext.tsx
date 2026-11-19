@@ -7,12 +7,14 @@ import { analyzeService, apiUrl, ApiError } from '../lib/api';
 import { createUserFriendlyMessage, extractErrorDetails, formatError } from '../lib/errorHandling';
 import {
   MOCK_CONTRACT_FUNCTIONS,
+  MOCK_CONTRACT_CONFIG,
   generateMockResult,
   generateMockTransactions,
   type ContractFunction,
   type InvocationResult,
   type TransactionStatus
 } from '../lib/sorobantypes';
+import { resolveMockResult } from '../lib/mockContractConfig';
 import { DEFAULT_TRANSACTION_FILTER, type TransactionFilter } from '../lib/transactionFilters';
 import type { GasGolfingSuggestion } from '../lib/gasGolfingSort';
 import type { NavTab } from '../components/HeaderNav';
@@ -81,17 +83,17 @@ export function SimulationProvider({ children }: { children: React.ReactNode }) 
   
   const [tab, setTab] = useState<NavTab>('explorer');
   const [contractId, setContractId] = useState(
-    'CAEZJVJ4N7P7GRUVD5NG5LYYH23AQHJUKQEUHW54LR5PGQX3V7FXD7Q'
+    MOCK_CONTRACT_CONFIG.contractId
   );
   const [selectedFunction, setSelectedFunction] = useState<ContractFunction>(
-    MOCK_CONTRACT_FUNCTIONS[0]
+    MOCK_CONTRACT_CONFIG.functions[0]
   );
   // Holds the functions exported by the currently-loaded contract.
   // Starts as the mock set so the UI is never empty; replaced with real
   // exports when a WASM file is successfully parsed after upload; reset back
   // to the mock set when the user clears the upload.
   const [contractFunctions, setContractFunctions] = useState<ContractFunction[]>(
-    MOCK_CONTRACT_FUNCTIONS
+    MOCK_CONTRACT_CONFIG.functions
   );
   const [currentResult, setCurrentResult] = useState<InvocationResult | null>(null);
   const [loading, setLoading] = useState(false);
@@ -100,7 +102,10 @@ export function SimulationProvider({ children }: { children: React.ReactNode }) 
   const [toastNotification, setToastNotification] = useState<{ message: string; type: 'error' | 'success' } | null>(null);
   const [uploadResetKey, setUploadResetKey] = useState(0);
 
-  const mockTransactions = useMemo(() => generateMockTransactions(47), []);
+  const mockTransactions = useMemo(
+    () => MOCK_CONTRACT_CONFIG.transactions ?? generateMockTransactions(47),
+    [],
+  );
 
   const [transactionStatusFilter, setTransactionStatusFilter] = useState<TransactionStatus | 'all'>(
     DEFAULT_TRANSACTION_FILTER.status,
@@ -123,7 +128,7 @@ export function SimulationProvider({ children }: { children: React.ReactNode }) 
   }, []);
 
   useEffect(() => {
-    if (network?.defaultContractId) {
+    if (network?.defaultContractId && !MOCK_CONTRACT_CONFIG.hasContractIdOverride) {
       setContractId(network.defaultContractId);
     }
   }, [network]);
@@ -200,7 +205,11 @@ export function SimulationProvider({ children }: { children: React.ReactNode }) 
         // when the in-memory File object is no longer available.
         wasmFileName: wasmFile?.name,
         inputs,
-        result: generateMockResult(selectedFunction.name, inputs),
+        result: resolveMockResult(
+          selectedFunction.name,
+          MOCK_CONTRACT_CONFIG.results,
+          () => generateMockResult(selectedFunction.name, inputs),
+        ),
         analysisReport: report,
         resourceCost: report,
         stateSnapshot: report.state_snapshot,
@@ -247,8 +256,8 @@ export function SimulationProvider({ children }: { children: React.ReactNode }) 
     setUploadResetKey((k) => k + 1);
     // Reset to mock functions so the search overlay and sidebar are not empty
     // after the user clears the current contract upload.
-    setContractFunctions(MOCK_CONTRACT_FUNCTIONS);
-    setSelectedFunction(MOCK_CONTRACT_FUNCTIONS[0]);
+    setContractFunctions(MOCK_CONTRACT_CONFIG.functions);
+    setSelectedFunction(MOCK_CONTRACT_CONFIG.functions[0]);
   }, []);
 
   const handleWasmReady = async (file: File) => {

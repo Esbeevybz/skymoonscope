@@ -1026,3 +1026,100 @@ fn test_set_guards_requires_admin_auth() {
     // Guards are unchanged.
     assert_eq!(client.get_guards().max_match_depth, DEFAULT_MAX_MATCH_DEPTH);
 }
+
+
+// ── Inclusion probability estimate ───────────────────────────────────────────
+
+#[test]
+fn test_inclusion_probability_estimate_returns_value_in_unit_interval() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin, token_a, token_b, _) = setup(&e);
+
+    let lp = Address::generate(&e);
+    mint(&e, &admin, &token_a, &lp, 10_000);
+    mint(&e, &admin, &token_b, &lp, 10_000);
+    client.deposit(&lp, &10_000, &10_000);
+
+    let fee_bid = 10i128;
+    let p = client.estimate_inclusion_probability(&fee_bid);
+    assert!(p >= 0);
+    assert!(p <= PRICE_SCALE);
+}
+
+#[test]
+fn test_inclusion_probability_monotonic_in_fee_bid() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin, token_a, token_b, _) = setup(&e);
+
+    let lp = Address::generate(&e);
+    mint(&e, &admin, &token_a, &lp, 10_000);
+    mint(&e, &admin, &token_b, &lp, 10_000);
+    client.deposit(&lp, &10_000, &10_000);
+
+    let low = client.estimate_inclusion_probability(&1i128);
+    let mid = client.estimate_inclusion_probability(&10i128);
+    let high = client.estimate_inclusion_probability(&100i128);
+
+    assert!(low <= mid);
+    assert!(mid <= high);
+}
+
+#[test]
+fn test_inclusion_probability_zero_fee_bid_is_zero() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin, token_a, token_b, _) = setup(&e);
+
+    let lp = Address::generate(&e);
+    mint(&e, &admin, &token_a, &lp, 10_000);
+    mint(&e, &admin, &token_b, &lp, 10_000);
+    client.deposit(&lp, &10_000, &10_000);
+
+    assert_eq!(client.estimate_inclusion_probability(&0i128), 0);
+}
+
+#[test]
+fn test_inclusion_probability_saturates_at_one() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin, token_a, token_b, _) = setup(&e);
+
+    let lp = Address::generate(&e);
+    mint(&e, &admin, &token_a, &lp, 10_000);
+    mint(&e, &admin, &token_b, &lp, 10_000);
+    client.deposit(&lp, &10_000, &10_000);
+
+    let p = client.estimate_inclusion_probability(&i128::MAX / 4);
+    assert_eq!(p, PRICE_SCALE);
+}
+
+#[test]
+fn test_inclusion_probability_without_liquidity_is_zero() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin, _token_a, _token_b, _) = setup(&e);
+
+    // No AMM liquidity and no resting orders: nothing can be included.
+    assert_eq!(client.estimate_inclusion_probability(&10i128), 0);
+}
+
+#[test]
+fn test_inclusion_probability_increases_with_resting_depth() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin, token_a, token_b, _) = setup(&e);
+
+    let lp = Address::generate(&e);
+    mint(&e, &admin, &token_a, &lp, 10_000);
+    mint(&e, &admin, &token_b, &lp, 10_000);
+    client.deposit(&lp, &10_000, &10_000);
+
+    let before = client.estimate_inclusion_probability(&10i128);
+
+    seed_asks(&e, &client, &admin, &token_a, 4, 100);
+
+    let after = client.estimate_inclusion_probability(&10i128);
+    assert!(after >= before);
+}

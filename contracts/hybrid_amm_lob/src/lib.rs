@@ -30,6 +30,19 @@ pub enum Error {
     PartialFillRequired = 12,
 }
 
+/// Estimate of how likely a fee bid is to be included, returned by
+/// [`HybridAmmLob::estimate_inclusion_probability`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InclusionEstimate {
+    /// Fee bid the estimate was computed for, in basis points.
+    pub fee_bid_bps: i128,
+    /// Probability of inclusion, in basis points (0..=BPS_DENOMINATOR).
+    pub probability_bps: i128,
+    /// Fee bid at which inclusion is estimated to be certain, in basis points.
+    pub saturation_fee_bps: i128,
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// A single limit order in the book.
@@ -200,6 +213,9 @@ pub const DEFAULT_MAX_PRICE_DEVIATION_BPS: i128 = 500;
 /// How long the per-ledger depth counter is kept alive. It only has to outlive
 /// the ledger it describes.
 pub const MATCH_DEPTH_TTL_LEDGERS: u32 = 64;
+/// Fee bid (in basis points) at which inclusion is estimated to be certain.
+/// Bids at or above this value saturate the estimate at 100%.
+pub const INCLUSION_SATURATION_FEE_BPS: i128 = 100;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -341,6 +357,30 @@ fn sqrt(x: i128) -> i128 {
         z = (x / z + z) / 2;
     }
     y
+}
+
+/// Estimate the inclusion probability of a fee bid, in basis points.
+///
+/// The model is intentionally simple and monotonic: probability rises linearly
+/// with the bid and saturates at [`INCLUSION_SATURATION_FEE_BPS`]. A non-positive
+/// bid yields zero probability. The result is clamped to `[0, BPS_DENOMINATOR]`
+/// so callers can treat it as a basis-point fraction.
+fn inclusion_probability_bps(fee_bid_bps: i128) -> i128 {
+    if fee_bid_bps <= 0 {
+        return 0;
+    }
+    if fee_bid_bps >= INCLUSION_SATURATION_FEE_BPS {
+        return BPS_DENOMINATOR;
+    }
+    let scaled = fee_bid_bps
+        .checked_mul(BPS_DENOMINATOR)
+        .unwrap_or(BPS_DENOMINATOR);
+    let prob = scaled / INCLUSION_SATURATION_FEE_BPS;
+    if prob > BPS_DENOMINATOR {
+        BPS_DENOMINATOR
+    } else {
+        prob
+    }
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -1079,5 +1119,23 @@ impl HybridAmmLob {
     /// when the pool holds no liquidity.
     pub fn get_spot_price(e: Env) -> Result<i128, Error> {
         Ok(spot_price(&load_pool(&e)?).unwrap_or(0))
+    }
+
+    /// Estimate the inclusion probability for a given fee bid.
+    ///
+    /// `fee_bid_bps` is the fee the caller is willing to pay, in basis points.
+    /// The returned [`InclusionEstimate`] reports the probability in basis
+    /// points, saturating at 100% once the bid reaches
+    /// [`INCLUSION_SATURATION_FEE_BPS`]. A non-positive bid yields zero.
+    pub fn estimate_inclusion_probability(
+        e: Env,
+        fee_bid_bps: i128,
+    ) -> Result<InclusionEstimate, Error> {
+        let _ = &e;
+        Ok(InclusionEstimate {
+            fee_bid_bps,
+            probability_bps: inclusion_probability_bps(fee_bid_bps),
+            saturation_fee_bps: INCLUSION_SATURATION_FEE_BPS,
+        })
     }
 }
