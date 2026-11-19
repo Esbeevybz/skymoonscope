@@ -1,6 +1,7 @@
 "use client";
 
 import React, { createContext, useContext, useEffect, useState } from "react";
+import { debugWarn } from "../lib/debugUtils";
 
 export type NetworkId = "mainnet" | "testnet" | "futurenet" | "localhost";
 
@@ -109,7 +110,7 @@ export const NetworkProvider = ({ children }: { children: React.ReactNode }) => 
         setNetworkIdState(savedNetwork);
       }
     } catch (e) {
-      console.warn("Failed to load saved network preferences", e);
+      debugWarn("Failed to load saved network preferences", e);
     }
   }, []);
 
@@ -119,7 +120,7 @@ export const NetworkProvider = ({ children }: { children: React.ReactNode }) => 
     try {
       localStorage.setItem(STORAGE_KEY, id);
     } catch (e) {
-      console.warn("Failed to persist network preference", e);
+      debugWarn("Failed to persist network preference", e);
     }
   };
 

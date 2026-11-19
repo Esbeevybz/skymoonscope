@@ -124,6 +124,97 @@ fn bench_root_hex(c: &mut Criterion) {
     });
 }
 
+// ── Incremental append benchmarks ─────────────────────────────────────────────
+
+/// Compares full rebuild vs incremental append for growing trees.
+fn bench_append_vs_rebuild(c: &mut Criterion) {
+    let mut group = c.benchmark_group("merkle/incremental");
+    group.sample_size(50);
+
+    let base_sizes = vec![1_000usize, 10_000, 100_000];
+    let append_count = 100;
+
+    for &n in &base_sizes {
+        // Full rebuild: build from scratch with all leaves
+        let all_leaves = make_leaves(n + append_count);
+        group.throughput(Throughput::Elements((n + append_count) as u64));
+        group.bench_with_input(
+            BenchmarkId::new("full_rebuild", n),
+            &n,
+            |b, _| {
+                b.iter(|| {
+                    let mut tree = MerkleTree::new(32);
+                    tree.build(all_leaves.clone()).unwrap();
+                });
+            },
+        );
+
+        // Incremental append
+        let base_leaves = make_leaves(n);
+        let append_leaves: Vec<Vec<u8>> = (n..n + append_count)
+            .map(|i| (i as u64).to_le_bytes().to_vec())
+            .collect();
+        group.bench_with_input(
+            BenchmarkId::new("incremental_append", n),
+            &n,
+            |b, _| {
+                b.iter(|| {
+                    let mut tree = MerkleTree::new(32);
+                    tree.build(base_leaves.clone()).unwrap();
+                    tree.append_leaves(append_leaves.clone()).unwrap();
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Measures single leaf update performance.
+fn bench_update_leaf(c: &mut Criterion) {
+    let mut group = c.benchmark_group("merkle/update");
+    group.sample_size(50);
+
+    for &n in &[1_000usize, 10_000, 100_000] {
+        // Full rebuild
+        let leaves = make_leaves(n);
+        let mut modified_leaves = leaves.clone();
+        modified_leaves[0] = vec![0xffu8; 8];
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(
+            BenchmarkId::new("full_rebuild_update", n),
+            &n,
+            |b, _| {
+                b.iter(|| {
+                    let mut tree = MerkleTree::new(32);
+                    tree.build(modified_leaves.clone()).unwrap();
+                });
+            },
+        );
+
+        // Incremental update
+        group.bench_with_input(
+            BenchmarkId::new("incremental_update_leaf", n),
+            &n,
+            |b, _| {
+                b.iter_batched(
+                    || {
+                        let mut tree = MerkleTree::new(32);
+                        tree.build(leaves.clone()).unwrap();
+                        tree
+                    },
+                    |mut tree| {
+                        tree.update_leaf(0, vec![0xffu8; 8]).unwrap();
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 // ── Registration ──────────────────────────────────────────────────────────────
 
 criterion_group!(
@@ -133,5 +224,7 @@ criterion_group!(
     bench_proof_verification,
     bench_end_to_end,
     bench_root_hex,
+    bench_append_vs_rebuild,
+    bench_update_leaf,
 );
 criterion_main!(benches);

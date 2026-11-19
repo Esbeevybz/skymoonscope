@@ -112,6 +112,10 @@ fn default_simulation_timeout_secs() -> u64 {
     30
 }
 
+fn default_max_total_retry_duration_secs() -> u64 {
+    300
+}
+
 fn default_job_timeout_secs() -> u64 {
     300
 }
@@ -151,6 +155,15 @@ fn default_max_ledger_age() -> u32 {
 
 fn default_event_bus_capacity() -> usize {
     256
+}
+
+/// Default alert deduplication window, in seconds (issue #24).
+///
+/// One minute is long enough to absorb a resource flapping around the alarm
+/// threshold at the default 10 s sampling cadence, and short enough that a
+/// genuinely new breach is still reported promptly.
+fn default_alarm_dedup_window_secs() -> u64 {
+    60
 }
 
 fn default_log_format_json() -> bool {
@@ -283,6 +296,13 @@ pub struct AppConfig {
     #[serde(default = "default_simulation_timeout_secs")]
     pub simulation_timeout_secs: u64,
 
+    /// Maximum total duration (seconds) for all retry attempts across failover + job retries.
+    /// When elapsed, the job fails fast instead of continuing to retry.
+    /// Prevents indefinite hangs on degraded RPC nodes.
+    /// Env: `MAX_TOTAL_RETRY_DURATION_SECS` · Default: `300`
+    #[serde(default = "default_max_total_retry_duration_secs")]
+    pub max_total_retry_duration_secs: u64,
+
     /// Execution mode: `"failover"` or `"consensus"`.
     /// Env: `SIMULATION_MODE` · Default: `"failover"`
     #[serde(default = "default_simulation_mode")]
@@ -350,6 +370,18 @@ pub struct AppConfig {
     /// Env: `EVENT_BUS_CAPACITY` · Default: `256`
     #[serde(default = "default_event_bus_capacity")]
     pub event_bus_capacity: usize,
+
+    // --- System resource alarms ---
+
+    /// Minimum number of seconds between two alerts for the same resource.
+    ///
+    /// The host CPU/RAM alarm monitor is edge-triggered, so without a window a
+    /// resource oscillating around the alarm threshold emits an alert on every
+    /// sampling interval. Set to `0` to disable rate limiting and report every
+    /// edge transition.
+    /// Env: `ALARM_DEDUP_WINDOW_SECS` · Default: `60`
+    #[serde(default = "default_alarm_dedup_window_secs")]
+    pub alarm_dedup_window_secs: u64,
 
     // --- Deployment environment ---
 
@@ -514,6 +546,7 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         .set_default("health_check_interval_secs", default_health_check_interval_secs())?
         .set_default("gossip_interval_secs", default_gossip_interval_secs())?
         .set_default("simulation_timeout_secs", default_simulation_timeout_secs())?
+        .set_default("max_total_retry_duration_secs", default_max_total_retry_duration_secs())?
         .set_default("job_timeout_secs", default_job_timeout_secs())?
         .set_default("max_concurrent_jobs", default_max_concurrent_jobs())?
         .set_default("event_worker_threads", default_event_worker_threads())?
@@ -533,6 +566,12 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         .set_default("cors_allowed_origins", "")?
         .set_default("allowed_origins", "")?
         .set_default("inbound_webhook_secret", "")?
+        // Alert deduplication window (issue #24); resolved at alarm-manager
+        // initialisation in `main.rs`.
+        .set_default(
+            "alarm_dedup_window_secs",
+            default_alarm_dedup_window_secs(),
+        )?
         .set_default("app_env", default_app_env())?
         .build()?
         .try_deserialize()?;
@@ -593,6 +632,29 @@ mod tests {
         );
         assert_eq!(cfg.database_url, "sqlite://Sky Moon Scope.db");
         assert!(!cfg.is_production());
+    }
+
+    #[test]
+    fn alarm_dedup_window_defaults_to_sixty_seconds() {
+        let _guard = EnvGuard(vec!["ALARM_DEDUP_WINDOW_SECS".into()]);
+        env::remove_var("ALARM_DEDUP_WINDOW_SECS");
+
+        let cfg = load_config().expect("load_config should succeed with defaults");
+        assert_eq!(cfg.alarm_dedup_window_secs, 60);
+    }
+
+    #[test]
+    fn alarm_dedup_window_can_be_overridden_from_env() {
+        let _guard = EnvGuard(vec!["ALARM_DEDUP_WINDOW_SECS".into()]);
+
+        env::set_var("ALARM_DEDUP_WINDOW_SECS", "15");
+        let cfg = load_config().expect("load_config should succeed");
+        assert_eq!(cfg.alarm_dedup_window_secs, 15);
+
+        // Zero is valid: it switches rate limiting off.
+        env::set_var("ALARM_DEDUP_WINDOW_SECS", "0");
+        let cfg = load_config().expect("load_config should succeed");
+        assert_eq!(cfg.alarm_dedup_window_secs, 0);
     }
 
     // ------------------------------------------------------------------
@@ -681,6 +743,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            max_total_retry_duration_secs: 300,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,
@@ -720,6 +783,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            max_total_retry_duration_secs: 300,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,
@@ -772,6 +836,7 @@ mod tests {
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
+            max_total_retry_duration_secs: 300,
             simulation_mode: "failover".to_string(),
             job_timeout_secs: 300,
             max_concurrent_jobs: 10,

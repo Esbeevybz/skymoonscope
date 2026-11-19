@@ -6,7 +6,9 @@ use axum::{
 use serde::Serialize;
 use thiserror::Error;
 use utoipa::ToSchema;
+use tracing::error;
 
+use crate::comparison::ComparisonError;
 use crate::simulation::SimulationError;
 
 #[derive(Error, Debug)]
@@ -23,6 +25,14 @@ pub enum AppError {
 
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
+
+    #[error("Too many requests: {0}")]
+    TooManyRequests(String),
+
+    /// HTTP 410 Gone — the resource existed but has been permanently removed
+    /// (e.g. an expired share link).
+    #[error("Gone: {0}")]
+    Gone(String),
 }
 
 /// RFC 7807 "Problem Details for HTTP APIs" response body.
@@ -51,6 +61,8 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::Gone(_) => StatusCode::GONE,
         }
     }
 
@@ -60,6 +72,8 @@ impl AppError {
             Self::NotFound(_) => "not-found",
             Self::BadRequest(_) => "bad-request",
             Self::Unauthorized(_) => "unauthorized",
+            Self::TooManyRequests(_) => "too-many-requests",
+            Self::Gone(_) => "gone",
         }
     }
 
@@ -69,6 +83,8 @@ impl AppError {
             Self::NotFound(_) => "Not Found",
             Self::BadRequest(_) => "Bad Request",
             Self::Unauthorized(_) => "Unauthorized",
+            Self::TooManyRequests(_) => "Too Many Requests",
+            Self::Gone(_) => "Gone",
         }
     }
 }
@@ -76,20 +92,58 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        let body = Json(ErrorResponse {
-            r#type: format!("https://Sky Moon Scope.dev/errors/{}", self.error_type()),
-            title: self.title().to_string(),
-            status: status.as_u16(),
-            detail: self.to_string(),
-            instance: None,
-        });
 
-        let mut response = (status, body).into_response();
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static("application/problem+json"),
-        );
-        response
+        // Log internal errors with full Debug details server-side
+        if status.is_server_error() {
+            error!(
+                error_type = self.error_type(),
+                status = status.as_u16(),
+                error_message = %self,
+                error_debug = ?self,
+                "Server error response: {}",
+                self
+            );
+            
+            // Client receives opaque error message
+            let body = Json(ErrorResponse {
+                r#type: format!(
+                    "https://Sky Moon Scope.dev/errors/{}",
+                    self.error_type()
+                ),
+                title: self.title().to_string(),
+                status: status.as_u16(),
+                // Return opaque error message for server errors (5xx)
+                detail: "An internal server error occurred. Please try again later.".to_string(),
+                instance: None,
+            });
+
+            let mut response = (status, body).into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/problem+json"),
+            );
+            response
+        } else {
+            // For client errors (4xx), preserve the original error message
+            // since it typically reflects user-controlled input validation
+            let body = Json(ErrorResponse {
+                r#type: format!(
+                    "https://Sky Moon Scope.dev/errors/{}",
+                    self.error_type()
+                ),
+                title: self.title().to_string(),
+                status: status.as_u16(),
+                detail: self.to_string(),
+                instance: None,
+            });
+
+            let mut response = (status, body).into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/problem+json"),
+            );
+            response
+        }
     }
 }
 
@@ -143,6 +197,23 @@ impl From<SimulationError> for AppError {
             SimulationError::ConsensusMismatch(msg) => {
                 AppError::Internal(format!("Consensus mismatch: {}", msg))
             }
+        }
+    }
+}
+
+/// Convert a [`ComparisonError`] to an [`AppError`].
+///
+/// A missing baseline snapshot is a client-visible "not found" condition — the
+/// caller asked to diff against a snapshot that does not exist — so it maps to
+/// [`AppError::NotFound`] (HTTP 404) rather than a generic 500. Simulation
+/// failures delegate to the existing [`SimulationError`] mapping.
+impl From<ComparisonError> for AppError {
+    fn from(err: ComparisonError) -> Self {
+        match err {
+            ComparisonError::BaselineNotFound(snapshot_id) => {
+                AppError::NotFound(format!("Baseline snapshot not found: {}", snapshot_id))
+            }
+            ComparisonError::Simulation(inner) => AppError::from(inner),
         }
     }
 }

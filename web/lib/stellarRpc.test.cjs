@@ -8,26 +8,29 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const FeeBumpLevel = Object.freeze({
-  LOW: 'low',
-  MEDIUM: 'medium',
-  HIGH: 'high',
+  ECONOMY: 'economy',
+  STANDARD: 'standard',
+  FAST: 'fast',
 });
 
 const BUMP_CONFIG = Object.freeze({
-  [FeeBumpLevel.LOW]: {
-    label: 'Low (Min)',
+  [FeeBumpLevel.ECONOMY]: {
+    label: 'Economy',
     multiplier: 1.0,
-    description: 'Minimum fee, slower confirmation',
+    description: 'Lowest cost, may take longer to confirm',
+    estimatedTime: '~30-60s',
   },
-  [FeeBumpLevel.MEDIUM]: {
-    label: 'Medium',
+  [FeeBumpLevel.STANDARD]: {
+    label: 'Standard',
     multiplier: 1.5,
-    description: 'Balanced speed and cost',
+    description: 'Balanced speed and cost for most use cases',
+    estimatedTime: '~15-30s',
   },
-  [FeeBumpLevel.HIGH]: {
-    label: 'High',
+  [FeeBumpLevel.FAST]: {
+    label: 'Fast',
     multiplier: 2.0,
-    description: 'Priority processing',
+    description: 'Priority processing for quick confirmation',
+    estimatedTime: '~5-15s',
   },
 });
 
@@ -63,6 +66,7 @@ function estimateFees(resourceCostStroops, feeStats) {
       feeStroops,
       feeXlm: stroopsToXlm(feeStroops),
       description: cfg.description,
+      estimatedTime: cfg.estimatedTime,
     };
   });
 
@@ -73,9 +77,9 @@ function estimateFees(resourceCostStroops, feeStats) {
     totalFeeXlm: stroopsToXlm(baseTotal),
     feeBumps,
     networkFees: {
-      low: feeBumps[0].feeStroops,
-      medium: feeBumps[1].feeStroops,
-      high: feeBumps[2].feeStroops,
+      economy: feeBumps[0].feeStroops,
+      standard: feeBumps[1].feeStroops,
+      fast: feeBumps[2].feeStroops,
     },
     surgeMultiplier,
   };
@@ -134,13 +138,13 @@ test('estimateFees: generates three fee bump options', () => {
 test('estimateFees: fee bumps increase proportionally', () => {
   const result = estimateFees(1_000_000, null);
 
-  const low = result.networkFees.low;
-  const medium = result.networkFees.medium;
-  const high = result.networkFees.high;
+  const economy = result.networkFees.economy;
+  const standard = result.networkFees.standard;
+  const fast = result.networkFees.fast;
 
-  assert.ok(low < medium, 'Low fee should be less than medium');
-  assert.ok(medium < high, 'Medium fee should be less than high');
-  assert.ok(high >= low * 2 || high >= low * 1.8, 'High should be roughly 2x low');
+  assert.ok(economy < standard, 'Economy fee should be less than standard');
+  assert.ok(standard < fast, 'Standard fee should be less than fast');
+  assert.ok(fast >= economy * 2 || fast >= economy * 1.8, 'Fast should be roughly 2x economy');
 });
 
 test('estimateFees: applies surge multiplier when provided', () => {
@@ -158,7 +162,7 @@ test('estimateFees: applies surge multiplier when provided', () => {
   });
 
   assert.ok(surgedResult.surgeMultiplier > 1);
-  assert.ok(surgedResult.networkFees.low > normalResult.networkFees.low);
+  assert.ok(surgedResult.networkFees.economy > normalResult.networkFees.economy);
 });
 
 test('estimateFees: returns valid XLM strings for all fee bump options', () => {
@@ -168,6 +172,13 @@ test('estimateFees: returns valid XLM strings for all fee bump options', () => {
     assert.ok(bump.feeXlm.length > 0);
     assert.ok(bump.feeXlm.includes('.') || bump.feeXlm === '0');
   }
+});
+
+test('estimateFees: includes estimated time for each tier', () => {
+  const result = estimateFees(750_000, null);
+  assert.ok(result.feeBumps[0].estimatedTime === '~30-60s');
+  assert.ok(result.feeBumps[1].estimatedTime === '~15-30s');
+  assert.ok(result.feeBumps[2].estimatedTime === '~5-15s');
 });
 
 test('estimateFees: handles zero resource cost gracefully', () => {

@@ -401,6 +401,16 @@ impl FlashLoanVault {
         is_borrow_paused(&e)
     }
 
+    /// View: is a flash-loan callback currently executing?
+    ///
+    /// The `ReentrancyLock` instance flag is set before the receiver callback is
+    /// invoked and cleared after, and repayment is verified between those two
+    /// points, so a loan can only ever be settled inside the same invocation
+    /// (issue #67). Exposing it lets integrators observe that window.
+    pub fn is_flash_loan_active(e: Env) -> bool {
+        is_flash_loan_active(&e)
+    }
+
     /// Admin-only: emergency pause all operations.
     pub fn emergency_pause(e: Env, approvers: Vec<Address>) -> Result<(), Error> {
         check_no_flash_loan_active(&e)?;

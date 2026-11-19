@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Copy, Check } from "lucide-react";
+import { debugError } from "../lib/debugUtils";
 
 export interface CopyButtonProps {
   text: string;
@@ -65,7 +66,7 @@ export function CopyButton({
         setCopied(false);
       }, timeout);
     } catch (err) {
-      console.error("Failed to copy text: ", err);
+      debugError("Failed to copy text: ", err);
     }
   };
 

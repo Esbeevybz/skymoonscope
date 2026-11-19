@@ -8,12 +8,25 @@ use std::str::FromStr;
 use thiserror::Error;
 use utoipa::ToSchema;
 use uuid::Uuid;
+use sqlx::Error as SqlxError;
+
+impl From<SqlxError> for FeeStoreError {
+    fn from(err: SqlxError) -> Self {
+        match err {
+            SqlxError::PoolTimedOut(_) => FeeStoreError::PoolTimedOut(err.to_string()),
+            _ => FeeStoreError::Database(err),
+        }
+    }
+}
 
 /// Errors that can occur during fee store operations
 #[derive(Error, Debug)]
 pub enum FeeStoreError {
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(sqlx::Error),
+
+    #[error("Pool timed out: {0}")]
+    PoolTimedOut(String),
 
     #[error("Record not found: {0}")]
     NotFound(String),
@@ -70,6 +83,8 @@ impl FeeStore {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .idle_timeout(std::time::Duration::from_secs(300))
             .connect_with(options)
             .await?;
 

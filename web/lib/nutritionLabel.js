@@ -133,6 +133,47 @@ function formatPercent(percent) {
   return `${num.toFixed(1)}%`;
 }
 
+/**
+ * Sanitise a raw resource object received from the backend.
+ *
+ * On repeated simulations the backend may compute a memory-RSS *delta*
+ * between two calls. If the process freed memory between runs the delta is
+ * negative, which would show a misleading negative bar in the label.
+ * `toSafeNumber` already clamps individual values to ≥ 0, but exposing this
+ * helper makes the intent explicit and lets callers sanitise the entire
+ * object in one shot before passing it anywhere else.
+ *
+ * @param {Partial<import('./nutritionLabel.d').NutritionResources>} resources
+ * @returns {import('./nutritionLabel.d').NutritionResources}
+ */
+function sanitizeResources(resources) {
+  const src = resources || {};
+  return {
+    cpu_instructions: toSafeNumber(src.cpu_instructions),
+    ram_bytes: toSafeNumber(src.ram_bytes),
+    ledger_read_bytes: toSafeNumber(src.ledger_read_bytes),
+    ledger_write_bytes: toSafeNumber(src.ledger_write_bytes),
+    transaction_size_bytes: toSafeNumber(src.transaction_size_bytes),
+  };
+}
+
+/**
+ * Export the nutrition label as a PDF and trigger a browser download.
+ *
+ * Lazy-loads `./pdfExport` so the PDF generation code stays out of the
+ * initial bundle for consumers that only use the calculation helpers.
+ *
+ * @param {import('./nutritionLabel.d').NutritionMetric[]} metrics
+ * @param {{ functionName?: string, costStroops?: number }} [options]
+ * @returns {Promise<void>}
+ */
+async function exportPdf(metrics, options) {
+  const { buildPdfBytes, downloadPdf } = require('./pdfExport');
+  const bytes = buildPdfBytes(metrics, options);
+  const filename = `sky-moon-scope-nutrition-${options?.functionName || 'transaction'}-${Date.now()}.pdf`;
+  downloadPdf(bytes, filename);
+}
+
 module.exports = {
   SOROBAN_LIMITS,
   METRIC_DEFINITIONS,
@@ -143,4 +184,6 @@ module.exports = {
   overallPercent,
   formatValue,
   formatPercent,
+  sanitizeResources,
+  exportPdf,
 };

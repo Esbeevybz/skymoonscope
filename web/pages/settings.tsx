@@ -21,7 +21,10 @@ import {
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip } from 'recharts';
 
 import { useNetwork } from '../context/NetworkContext';
+import type { NetworkId, NetworkConfig } from '../context/NetworkContext';
+import { NETWORKS, ALL_NETWORKS } from '../context/NetworkContext';
 import { API_URL } from '../lib/api';
+import { probeEndpoint } from '../lib/probeEndpoint';
 import {
   DEFAULT_SETTINGS,
   clearSettings,
@@ -29,8 +32,13 @@ import {
   saveSettings,
   validateEndpointUrl,
   validateSettings,
+  loadNetworkProfile,
+  saveNetworkProfile,
+  clearNetworkProfile,
 } from '../lib/userSettings';
-import type { UserSettings } from '../lib/userSettings';
+import type { UserSettings, NetworkEndpointProfile } from '../lib/userSettings';
+
+// ── Local types ────────────────────────────────────────────────────────────────
 
 type TestState = { status: 'idle' | 'testing' | 'ok' | 'fail'; message?: string; latencyMs?: number };
 
@@ -47,7 +55,11 @@ interface PingSession {
 
 type ConnectionQuality = 'excellent' | 'good' | 'fair' | 'poor' | 'offline';
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
 const IDLE: TestState = { status: 'idle' };
+
+// ── Helper functions ──────────────────────────────────────────────────────────
 
 function getConnectionQuality(latencyMs: number | null): ConnectionQuality {
   if (latencyMs === null) return 'offline';
@@ -59,59 +71,44 @@ function getConnectionQuality(latencyMs: number | null): ConnectionQuality {
 
 function getQualityColor(quality: ConnectionQuality): string {
   switch (quality) {
-    case 'excellent':
-      return 'text-emerald-400';
-    case 'good':
-      return 'text-green-400';
-    case 'fair':
-      return 'text-yellow-400';
-    case 'poor':
-      return 'text-orange-400';
-    case 'offline':
-      return 'text-red-400';
+    case 'excellent': return 'text-emerald-400';
+    case 'good':      return 'text-green-400';
+    case 'fair':      return 'text-yellow-400';
+    case 'poor':      return 'text-orange-400';
+    case 'offline':   return 'text-red-400';
   }
 }
 
 function getQualityLabel(quality: ConnectionQuality): string {
   switch (quality) {
-    case 'excellent':
-      return 'Excellent';
-    case 'good':
-      return 'Good';
-    case 'fair':
-      return 'Fair';
-    case 'poor':
-      return 'Poor';
-    case 'offline':
-      return 'Offline';
+    case 'excellent': return 'Excellent';
+    case 'good':      return 'Good';
+    case 'fair':      return 'Fair';
+    case 'poor':      return 'Poor';
+    case 'offline':   return 'Offline';
   }
 }
 
 function getQualityBg(quality: ConnectionQuality): string {
   switch (quality) {
-    case 'excellent':
-      return 'bg-emerald-500/20 border-emerald-500/30';
-    case 'good':
-      return 'bg-green-500/20 border-green-500/30';
-    case 'fair':
-      return 'bg-yellow-500/20 border-yellow-500/30';
-    case 'poor':
-      return 'bg-orange-500/20 border-orange-500/30';
-    case 'offline':
-      return 'bg-red-500/20 border-red-500/30';
+    case 'excellent': return 'bg-emerald-500/20 border-emerald-500/30';
+    case 'good':      return 'bg-green-500/20 border-green-500/30';
+    case 'fair':      return 'bg-yellow-500/20 border-yellow-500/30';
+    case 'poor':      return 'bg-orange-500/20 border-orange-500/30';
+    case 'offline':   return 'bg-red-500/20 border-red-500/30';
   }
 }
 
-function calculateStats(results: PingResult[]): { min: number; max: number; avg: number; p95: number; loss: number } {
+function calculateStats(results: PingResult[]): {
+  min: number; max: number; avg: number; p95: number; loss: number;
+} {
   const successful = results.filter((r) => r.success);
   const latencies = successful.map((r) => r.latency).sort((a, b) => a - b);
   const total = results.length;
   const failed = total - successful.length;
   const loss = total > 0 ? (failed / total) * 100 : 0;
 
-  if (latencies.length === 0) {
-    return { min: 0, max: 0, avg: 0, p95: 0, loss };
-  }
+  if (latencies.length === 0) return { min: 0, max: 0, avg: 0, p95: 0, loss };
 
   const sum = latencies.reduce((a, b) => a + b, 0);
   const avg = sum / latencies.length;
@@ -127,43 +124,43 @@ function calculateStats(results: PingResult[]): { min: number; max: number; avg:
   };
 }
 
-/** Probe an endpoint and report whether it answered. */
-async function probeEndpoint(url: string, body: object | null, timeoutMs: number): Promise<TestState> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const started = Date.now();
+// ── Network tab badge helpers ─────────────────────────────────────────────────
 
-  try {
-    const response = await fetch(url, {
-      method: body ? 'POST' : 'GET',
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
-      body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-    });
+/** Active tab ring colour keyed by network badge colour. */
+const NETWORK_RING: Record<string, string> = {
+  emerald: 'ring-emerald-500/60 text-emerald-400',
+  cyan:    'ring-cyan-500/60 text-cyan-400',
+  purple:  'ring-purple-500/60 text-purple-400',
+  amber:   'ring-amber-500/60 text-amber-400',
+};
 
-    const latencyMs = Date.now() - started;
+const NETWORK_ACTIVE_BG: Record<string, string> = {
+  emerald: 'bg-emerald-500/10 border-emerald-500/30',
+  cyan:    'bg-cyan-500/10 border-cyan-500/30',
+  purple:  'bg-purple-500/10 border-purple-500/30',
+  amber:   'bg-amber-500/10 border-amber-500/30',
+};
 
-    // Any HTTP answer proves the host is reachable and speaking HTTP; a 404 on
-    // a health path still means the endpoint itself is live.
-    return response.ok || response.status === 404
-      ? { status: 'ok', message: `Reachable (HTTP ${response.status})`, latencyMs }
-      : { status: 'fail', message: `Endpoint responded with HTTP ${response.status}`, latencyMs };
-  } catch (error) {
-    const message =
-      error instanceof DOMException && error.name === 'AbortError'
-        ? `No response within ${timeoutMs}ms`
-        : 'Could not reach the endpoint (network error or CORS blocked)';
-    return { status: 'fail', message };
-  } finally {
-    clearTimeout(timer);
-  }
-}
+// ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function SettingsPage() {
-  const { network } = useNetwork();
-  const [settings, setSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
-  const [errors, setErrors] = useState<Partial<Record<keyof UserSettings, string>>>({});
+  const { network: activeGlobalNetwork, networkId: activeGlobalNetworkId, setNetworkId } = useNetwork();
+
+  // The tab the user is looking at in this page — defaults to the globally
+  // active network but can be switched independently.
+  const [selectedNetworkId, setSelectedNetworkId] = useState<NetworkId>(activeGlobalNetworkId);
+  const selectedNetwork: NetworkConfig = NETWORKS[selectedNetworkId] ?? NETWORKS.testnet;
+
+  // Per-network endpoint overrides for the selected tab.
+  const [profile, setProfile] = useState<NetworkEndpointProfile>({ rpcUrl: '', indexerUrl: '' });
+
+  // Global settings (requestTimeoutMs only — shared across all networks).
+  const [globalSettings, setGlobalSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
+
+  const [profileErrors, setProfileErrors] = useState<Partial<Record<keyof NetworkEndpointProfile, string>>>({});
   const [saved, setSaved] = useState(false);
+
+  // Test / ping state.
   const [rpcTest, setRpcTest] = useState<TestState>(IDLE);
   const [indexerTest, setIndexerTest] = useState<TestState>(IDLE);
   const [pingSession, setPingSession] = useState<PingSession | null>(null);
@@ -171,117 +168,217 @@ export default function SettingsPage() {
   const pingCount = 10;
   const pingInterval = 500;
 
-  // LocalStorage is only readable after mount (SSR has no window).
+  // Abort refs.
+  const rpcAbortRef     = useRef<AbortController | null>(null);
+  const indexerAbortRef = useRef<AbortController | null>(null);
+  const pingAbortRef    = useRef<AbortController | null>(null);
+  const mountedRef      = useRef(true);
+
+  // ── Effects ─────────────────────────────────────────────────────────────────
+
+  // Load global settings (timeout etc.) and the initial per-network profile.
   useEffect(() => {
-    setSettings(loadSettings());
+    mountedRef.current = true;
+    setGlobalSettings(loadSettings());
+    setProfile(loadNetworkProfile(selectedNetworkId));
+    return () => {
+      mountedRef.current = false;
+      rpcAbortRef.current?.abort();
+      indexerAbortRef.current?.abort();
+      pingAbortRef.current?.abort();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const update = useCallback((key: keyof UserSettings, value: string | number) => {
-    setSettings((prev) => ({ ...prev, [key]: value }));
+  // When the user switches the tab, reload that network's profile and reset
+  // any in-progress tests / ping sessions.
+  useEffect(() => {
+    rpcAbortRef.current?.abort();
+    indexerAbortRef.current?.abort();
+    pingAbortRef.current?.abort();
+
+    setProfile(loadNetworkProfile(selectedNetworkId));
+    setProfileErrors({});
     setSaved(false);
-    setErrors((prev) => ({ ...prev, [key]: undefined }));
-    if (key === 'rpcUrl') {
-      setRpcTest(IDLE);
-      setPingSession(null);
-    }
+    setRpcTest(IDLE);
+    setIndexerTest(IDLE);
+    setIsPinging(false);
+    setPingSession(null);
+  }, [selectedNetworkId]);
+
+  // ── Handlers ─────────────────────────────────────────────────────────────────
+
+  /** Update a single profile field and clear its validation error. */
+  const updateProfile = useCallback((key: keyof NetworkEndpointProfile, value: string) => {
+    setProfile((prev) => ({ ...prev, [key]: value }));
+    setSaved(false);
+    setProfileErrors((prev) => ({ ...prev, [key]: undefined }));
+    if (key === 'rpcUrl') { setRpcTest(IDLE); setPingSession(null); }
     if (key === 'indexerUrl') setIndexerTest(IDLE);
   }, []);
 
+  /** Update the shared request timeout setting. */
+  const updateTimeout = useCallback((value: number) => {
+    setGlobalSettings((prev) => ({ ...prev, requestTimeoutMs: value }));
+    setSaved(false);
+  }, []);
+
+  /** Save the current tab's profile + the shared timeout. */
   const handleSave = useCallback(() => {
-    const result = validateSettings(settings);
-    if (!result.valid) {
-      setErrors(result.errors);
+    // Validate the endpoint URLs.
+    const rpc = validateEndpointUrl(profile.rpcUrl);
+    const indexer = validateEndpointUrl(profile.indexerUrl);
+    const errors: Partial<Record<keyof NetworkEndpointProfile, string>> = {};
+    if (!rpc.valid) errors.rpcUrl = rpc.error ?? undefined;
+    if (!indexer.valid) errors.indexerUrl = indexer.error ?? undefined;
+
+    if (Object.keys(errors).length > 0) {
+      setProfileErrors(errors);
       setSaved(false);
       return;
     }
 
-    setSettings(saveSettings(settings));
-    setErrors({});
-    setSaved(true);
-  }, [settings]);
+    // Persist the per-network profile.
+    const savedProfile = saveNetworkProfile(selectedNetworkId, profile);
+    setProfile(savedProfile);
 
+    // Also persist the shared global settings (timeout).
+    saveSettings(globalSettings);
+
+    setProfileErrors({});
+    setSaved(true);
+  }, [selectedNetworkId, profile, globalSettings]);
+
+  /**
+   * Reset only the selected network's profile to defaults.
+   * The shared timeout and other networks' profiles are untouched.
+   */
   const handleReset = useCallback(() => {
-    setSettings(clearSettings());
-    setErrors({});
+    // Confirm destructive reset
+    if (!window.confirm('Reset settings for the selected network? This action cannot be undone.')) {
+      return;
+    }
+    rpcAbortRef.current?.abort();
+    indexerAbortRef.current?.abort();
+    pingAbortRef.current?.abort();
+
+    clearNetworkProfile(selectedNetworkId);
+    setProfile({ rpcUrl: '', indexerUrl: '' });
+    setProfileErrors({});
     setSaved(false);
     setRpcTest(IDLE);
     setIndexerTest(IDLE);
+    setIsPinging(false);
     setPingSession(null);
-  }, []);
+  }, [selectedNetworkId]);
+
+  // ── Connection tests ──────────────────────────────────────────────────────
 
   const testRpc = useCallback(async () => {
-    const target = validateEndpointUrl(settings.rpcUrl);
+    const target = validateEndpointUrl(profile.rpcUrl);
     if (!target.valid || target.normalized === '') {
       setRpcTest({ status: 'fail', message: target.error ?? 'Enter an RPC URL to test' });
       return;
     }
 
+    rpcAbortRef.current?.abort();
+    const controller = new AbortController();
+    rpcAbortRef.current = controller;
     setRpcTest({ status: 'testing' });
-    // Soroban RPC speaks JSON-RPC; getHealth is the cheapest liveness probe.
-    setRpcTest(
-      await probeEndpoint(
-        target.normalized,
-        { jsonrpc: '2.0', id: 1, method: 'getHealth' },
-        settings.requestTimeoutMs,
-      ),
+
+    const result = await probeEndpoint(
+      target.normalized,
+      { jsonrpc: '2.0', id: 1, method: 'getHealth' },
+      globalSettings.requestTimeoutMs,
+      controller.signal,
     );
-  }, [settings.rpcUrl, settings.requestTimeoutMs]);
+
+    if (mountedRef.current && !controller.signal.aborted) setRpcTest(result);
+  }, [profile.rpcUrl, globalSettings.requestTimeoutMs]);
 
   const startPing = useCallback(async () => {
-    const target = validateEndpointUrl(settings.rpcUrl);
+    const target = validateEndpointUrl(profile.rpcUrl);
     if (!target.valid || target.normalized === '') {
       setRpcTest({ status: 'fail', message: target.error ?? 'Enter an RPC URL to ping' });
       return;
     }
 
+    pingAbortRef.current?.abort();
+    const controller = new AbortController();
+    pingAbortRef.current = controller;
+
     setIsPinging(true);
     const results: PingResult[] = [];
 
     for (let i = 0; i < pingCount; i++) {
+      if (controller.signal.aborted) break;
+
+      const pingController = new AbortController();
+      const onAbort = () => pingController.abort();
+      controller.signal.addEventListener('abort', onAbort, { once: true });
+
       const started = Date.now();
       try {
-        const response = await fetch(target.normalized, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
-          signal: AbortSignal.timeout(settings.requestTimeoutMs),
-        });
-        const latency = Date.now() - started;
-        results.push({
-          timestamp: Date.now(),
-          latency,
-          success: response.ok || response.status === 404,
-        });
+        const pingTimer = setTimeout(() => pingController.abort(), globalSettings.requestTimeoutMs);
+        try {
+          const response = await fetch(target.normalized, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
+            signal: pingController.signal,
+          });
+          const latency = Date.now() - started;
+          results.push({ timestamp: Date.now(), latency, success: response.ok || response.status === 404 });
+        } finally {
+          clearTimeout(pingTimer);
+        }
       } catch {
-        results.push({
-          timestamp: Date.now(),
-          latency: settings.requestTimeoutMs,
-          success: false,
+        results.push({ timestamp: Date.now(), latency: globalSettings.requestTimeoutMs, success: false });
+      } finally {
+        controller.signal.removeEventListener('abort', onAbort);
+      }
+
+      if (!controller.signal.aborted && i < pingCount - 1) {
+        await new Promise<void>((resolve) => {
+          const sleepTimer = setTimeout(resolve, pingInterval);
+          controller.signal.addEventListener('abort', () => { clearTimeout(sleepTimer); resolve(); }, { once: true });
         });
       }
-      await new Promise((resolve) => setTimeout(resolve, pingInterval));
     }
 
-    setPingSession({ url: target.normalized, results });
-    setIsPinging(false);
-  }, [settings.rpcUrl, settings.requestTimeoutMs]);
+    if (mountedRef.current && !controller.signal.aborted) setPingSession({ url: target.normalized, results });
+    if (mountedRef.current) setIsPinging(false);
+  }, [profile.rpcUrl, globalSettings.requestTimeoutMs]);
 
   const testIndexer = useCallback(async () => {
-    const target = validateEndpointUrl(settings.indexerUrl);
+    const target = validateEndpointUrl(profile.indexerUrl);
     if (!target.valid || target.normalized === '') {
       setIndexerTest({ status: 'fail', message: target.error ?? 'Enter an indexer URL to test' });
       return;
     }
 
+    indexerAbortRef.current?.abort();
+    const controller = new AbortController();
+    indexerAbortRef.current = controller;
     setIndexerTest({ status: 'testing' });
-    setIndexerTest(await probeEndpoint(`${target.normalized}/health`, null, settings.requestTimeoutMs));
-  }, [settings.indexerUrl, settings.requestTimeoutMs]);
+
+    const result = await probeEndpoint(
+      `${target.normalized}/health`,
+      null,
+      globalSettings.requestTimeoutMs,
+      controller.signal,
+    );
+
+    if (mountedRef.current && !controller.signal.aborted) setIndexerTest(result);
+  }, [profile.indexerUrl, globalSettings.requestTimeoutMs]);
+
+  // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <>
       <Head>
         <title>Settings - Sky Moon Scope</title>
-        <meta name="description" content="Configure custom Soroban RPC and indexer endpoints." />
+        <meta name="description" content="Configure custom Soroban RPC and indexer endpoints per network." />
       </Head>
 
       <main className="min-h-screen bg-slate-950 text-slate-100">
@@ -296,57 +393,107 @@ export default function SettingsPage() {
 
           <h1 className="text-2xl font-bold tracking-tight text-white">Settings</h1>
           <p className="mt-1 text-sm text-slate-400">
-            Point Sky Moon Scope at your own self-hosted infrastructure. Preferences are stored in this
-            browser only and never leave your machine.
+            Point Sky Moon Scope at your own self-hosted infrastructure. Each network stores its
+            endpoints independently. Preferences are stored in this browser only and never leave
+            your machine.
           </p>
 
-          <div className="mt-8 space-y-6">
+          {/* ── Network tab switcher ─────────────────────────────────────── */}
+          <div
+            role="tablist"
+            aria-label="Select network"
+            className="mt-6 flex flex-wrap gap-2"
+          >
+            {ALL_NETWORKS.map((net) => {
+              const isSelected = net.id === selectedNetworkId;
+              const isGlobal   = net.id === activeGlobalNetworkId;
+              const ring  = NETWORK_RING[net.badgeColor]  ?? 'ring-slate-500/60 text-slate-400';
+              const bg    = NETWORK_ACTIVE_BG[net.badgeColor] ?? 'bg-slate-800/50 border-slate-700';
+              return (
+                <button
+                  key={net.id}
+                  role="tab"
+                  aria-selected={isSelected}
+                  aria-controls={`panel-${net.id}`}
+                  id={`tab-${net.id}`}
+                  type="button"
+                  onClick={() => setSelectedNetworkId(net.id as NetworkId)}
+                  className={`inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm font-medium transition-colors focus:outline-none focus:ring-2 ${
+                    isSelected
+                      ? `${bg} ring-2 ${ring}`
+                      : 'border-slate-700 bg-slate-900 text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                  }`}
+                >
+                  <span className={`h-2 w-2 rounded-full ${net.dotColor}`} aria-hidden="true" />
+                  {net.shortName}
+                  {isGlobal && (
+                    <span
+                      className="ml-1 rounded bg-slate-700 px-1 py-0.5 text-[10px] leading-none text-slate-300"
+                      title="Currently active network"
+                    >
+                      active
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* ── Per-network endpoint fields ──────────────────────────────── */}
+          <div
+            id={`panel-${selectedNetworkId}`}
+            role="tabpanel"
+            aria-labelledby={`tab-${selectedNetworkId}`}
+            className="mt-6 space-y-6"
+          >
             <EndpointField
               id="rpcUrl"
-              label="Custom Soroban RPC endpoint"
-              placeholder={network.rpcUrl}
-              hint={`Leave blank to use the ${network.shortName} default (${network.rpcUrl}).`}
-              value={settings.rpcUrl}
-              error={errors.rpcUrl}
+              label={`Custom Soroban RPC endpoint — ${selectedNetwork.shortName}`}
+              placeholder={selectedNetwork.rpcUrl}
+              hint={`Leave blank to use the ${selectedNetwork.shortName} default (${selectedNetwork.rpcUrl}).`}
+              value={profile.rpcUrl}
+              error={profileErrors.rpcUrl}
               testState={rpcTest}
-              onChange={(value) => update('rpcUrl', value)}
+              onChange={(value) => updateProfile('rpcUrl', value)}
               onTest={testRpc}
             />
 
             <EndpointField
               id="indexerUrl"
-              label="Custom indexer / analyzer backend URL"
+              label={`Custom indexer / analyzer backend — ${selectedNetwork.shortName}`}
               placeholder={API_URL}
               hint={`Leave blank to use the built-in backend (${API_URL}).`}
-              value={settings.indexerUrl}
-              error={errors.indexerUrl}
+              value={profile.indexerUrl}
+              error={profileErrors.indexerUrl}
               testState={indexerTest}
-              onChange={(value) => update('indexerUrl', value)}
+              onChange={(value) => updateProfile('indexerUrl', value)}
               onTest={testIndexer}
             />
-
-            <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
-              <label htmlFor="requestTimeoutMs" className="text-sm font-medium text-slate-200">
-                Request timeout
-              </label>
-              <p className="mt-1 text-xs text-slate-500">
-                How long to wait for a custom endpoint before giving up (1000–120000&nbsp;ms).
-              </p>
-              <input
-                id="requestTimeoutMs"
-                type="number"
-                min={1000}
-                max={120000}
-                step={500}
-                value={settings.requestTimeoutMs}
-                onChange={(e) => update('requestTimeoutMs', Number(e.target.value))}
-                className="mt-3 w-40 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
-              />
-            </div>
           </div>
 
-          {/* Diagnostic Ping Tool */}
-          <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
+          {/* ── Global settings ───────────────────────────────────────────── */}
+          <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
+            <label htmlFor="requestTimeoutMs" className="text-sm font-medium text-slate-200">
+              Request timeout
+            </label>
+            <p className="mt-1 text-xs text-slate-500">
+              How long to wait for a custom endpoint before giving up (1000–120000&nbsp;ms).
+              Shared across all networks.
+            </p>
+            <input
+              id="requestTimeoutMs"
+              type="number"
+              min={1000}
+              max={120000}
+              step={500}
+              value={globalSettings.requestTimeoutMs}
+              onChange={(e) => updateTimeout(Number(e.target.value))}
+              className="mt-3 w-40 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
+            />
+          </div>
+
+          {/* ── Diagnostic Ping Tool ──────────────────────────────────────── */}
+          <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-900/70 p-5">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Activity className="h-4 w-4 text-cyan-400" />
@@ -355,7 +502,7 @@ export default function SettingsPage() {
               <button
                 type="button"
                 onClick={startPing}
-                disabled={isPinging || !settings.rpcUrl}
+                disabled={isPinging || !profile.rpcUrl}
                 className="inline-flex min-h-[36px] items-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-700 disabled:opacity-60"
               >
                 {isPinging ? (
@@ -372,7 +519,6 @@ export default function SettingsPage() {
 
             {pingSession && (
               <div className="mt-4 space-y-4">
-                {/* Quality Indicator */}
                 {(() => {
                   const stats = calculateStats(pingSession.results);
                   const latest = pingSession.results[pingSession.results.length - 1];
@@ -381,10 +527,8 @@ export default function SettingsPage() {
                     <div className={`rounded-xl border p-4 ${getQualityBg(quality)}`}>
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
-                          {quality === 'offline' ? (
-                            <WifiOff className="h-5 w-5 text-red-400" />
-                          ) : quality === 'poor' ? (
-                            <WifiOff className="h-5 w-5 text-orange-400" />
+                          {quality === 'offline' || quality === 'poor' ? (
+                            <WifiOff className={`h-5 w-5 ${getQualityColor(quality)}`} />
                           ) : (
                             <Wifi className={`h-5 w-5 ${getQualityColor(quality)}`} />
                           )}
@@ -397,18 +541,12 @@ export default function SettingsPage() {
                         </span>
                       </div>
                       <div className="mt-3 grid grid-cols-4 gap-3 text-center">
-                        <div className="rounded-lg bg-slate-950/50 p-2">
-                          <div className="text-xs text-slate-500">Min</div>
-                          <div className="text-sm font-semibold text-emerald-400">{stats.min}ms</div>
-                        </div>
-                        <div className="rounded-lg bg-slate-950/50 p-2">
-                          <div className="text-xs text-slate-500">Avg</div>
-                          <div className="text-sm font-semibold text-cyan-400">{stats.avg}ms</div>
-                        </div>
-                        <div className="rounded-lg bg-slate-950/50 p-2">
-                          <div className="text-xs text-slate-500">P95</div>
-                          <div className="text-sm font-semibold text-yellow-400">{stats.p95}ms</div>
-                        </div>
+                        {([['Min', stats.min, 'text-emerald-400'], ['Avg', stats.avg, 'text-cyan-400'], ['P95', stats.p95, 'text-yellow-400']] as const).map(([label, val, color]) => (
+                          <div key={label} className="rounded-lg bg-slate-950/50 p-2">
+                            <div className="text-xs text-slate-500">{label}</div>
+                            <div className={`text-sm font-semibold ${color}`}>{val}ms</div>
+                          </div>
+                        ))}
                         <div className="rounded-lg bg-slate-950/50 p-2">
                           <div className="text-xs text-slate-500">Loss</div>
                           <div className={`text-sm font-semibold ${stats.loss > 0 ? 'text-red-400' : 'text-emerald-400'}`}>
@@ -420,34 +558,20 @@ export default function SettingsPage() {
                   );
                 })()}
 
-                {/* Latency Chart */}
                 <div className="h-32">
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={pingSession.results.map((r, i) => ({ ...r, index: i + 1 }))}>
                       <defs>
                         <linearGradient id="latencyGradient" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="5%" stopColor="#06b6d4" stopOpacity={0.3} />
+                          <stop offset="5%"  stopColor="#06b6d4" stopOpacity={0.3} />
                           <stop offset="95%" stopColor="#06b6d4" stopOpacity={0} />
                         </linearGradient>
                       </defs>
                       <XAxis dataKey="index" stroke="#64748b" fontSize={10} tickLine={false} />
-                      <YAxis
-                        stroke="#64748b"
-                        fontSize={10}
-                        tickLine={false}
-                        tickFormatter={(v) => `${v}ms`}
-                      />
+                      <YAxis stroke="#64748b" fontSize={10} tickLine={false} tickFormatter={(v) => `${v}ms`} />
                       <Tooltip
-                        contentStyle={{
-                          backgroundColor: '#0f172a',
-                          borderColor: '#1e293b',
-                          borderRadius: '0.5rem',
-                          fontSize: '12px',
-                        }}
-                        formatter={(value: number, name: string) => [
-                          `${value}ms`,
-                          name === 'latency' ? 'Latency' : name,
-                        ]}
+                        contentStyle={{ backgroundColor: '#0f172a', borderColor: '#1e293b', borderRadius: '0.5rem', fontSize: '12px' }}
+                        formatter={(value: number, name: string) => [`${value}ms`, name === 'latency' ? 'Latency' : name]}
                         labelFormatter={(label) => `Ping #${label}`}
                       />
                       <Area
@@ -459,13 +583,9 @@ export default function SettingsPage() {
                         dot={(props) => {
                           const { cx, cy, payload } = props as any;
                           return (
-                            <circle
-                              cx={cx}
-                              cy={cy}
-                              r={3}
+                            <circle cx={cx} cy={cy} r={3}
                               fill={payload.success ? '#06b6d4' : '#ef4444'}
-                              stroke="#0f172a"
-                              strokeWidth={1}
+                              stroke="#0f172a" strokeWidth={1}
                             />
                           );
                         }}
@@ -477,6 +597,7 @@ export default function SettingsPage() {
             )}
           </div>
 
+          {/* ── Action bar ───────────────────────────────────────────────── */}
           <div className="mt-8 flex flex-wrap items-center gap-3">
             <button
               type="button"
@@ -484,7 +605,7 @@ export default function SettingsPage() {
               className="inline-flex min-h-[44px] items-center gap-2 rounded-lg bg-cyan-500 px-4 py-2.5 text-sm font-semibold text-slate-950 transition-colors hover:bg-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
             >
               <Save className="h-4 w-4" />
-              Save preferences
+              Save {selectedNetwork.shortName} settings
             </button>
             <button
               type="button"
@@ -492,12 +613,12 @@ export default function SettingsPage() {
               className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-slate-700 bg-slate-900 px-4 py-2.5 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-800 hover:text-white focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
             >
               <RotateCcw className="h-4 w-4" />
-              Reset to defaults
+              Reset {selectedNetwork.shortName} to defaults
             </button>
             {saved && (
               <span role="status" className="inline-flex items-center gap-1.5 text-sm text-emerald-400">
                 <CheckCircle2 className="h-4 w-4" />
-                Preferences saved
+                {selectedNetwork.shortName} settings saved
               </span>
             )}
           </div>
@@ -506,6 +627,8 @@ export default function SettingsPage() {
     </>
   );
 }
+
+// ── EndpointField component ───────────────────────────────────────────────────
 
 interface EndpointFieldProps {
   id: string;
@@ -560,9 +683,7 @@ function EndpointField({
           disabled={testState.status === 'testing'}
           className="inline-flex min-h-[44px] shrink-0 items-center justify-center gap-2 rounded-lg border border-slate-700 bg-slate-800 px-4 text-sm font-medium text-slate-200 transition-colors hover:bg-slate-700 disabled:opacity-60"
         >
-          {testState.status === 'testing' ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : null}
+          {testState.status === 'testing' && <Loader2 className="h-4 w-4 animate-spin" />}
           Test
         </button>
       </div>

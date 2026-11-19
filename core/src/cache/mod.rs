@@ -28,6 +28,7 @@ use thiserror::Error;
 
 const CACHE_TTL_SECS: u64 = 3_600;
 const CACHE_MAX_CAPACITY: u64 = 1_000;
+const DEFAULT_MAX_CACHE_SIZE_MB: u64 = 100;
 
 /// Default TTL for the in-memory ledger entry cache. Overridable via the
 /// `LEDGER_CACHE_TTL_SECS` env var so deployments can tune freshness vs.
@@ -50,15 +51,34 @@ struct CacheEntry<T> {
     timestamp: u64,
 }
 
+fn current_timestamp_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 pub struct SimulationCache {
     l1: Cache<String, SimulationResult>,
     l2: Tree,
+    max_cache_size_bytes: u64,
     hits: AtomicU64,
     misses: AtomicU64,
 }
 
 impl SimulationCache {
     pub fn new(db: &Db) -> Arc<Self> {
+        Self::new_with_max_cache_size_mb(db, DEFAULT_MAX_CACHE_SIZE_MB)
+    }
+
+    pub fn new_with_max_cache_size_mb(db: &Db, max_cache_size_mb: u64) -> Arc<Self> {
+        Self::new_with_max_cache_size_bytes(
+            db,
+            max_cache_size_mb.saturating_mul(1024 * 1024),
+        )
+    }
+
+    pub fn new_with_max_cache_size_bytes(db: &Db, max_cache_size_bytes: u64) -> Arc<Self> {
         let l1 = Cache::builder()
             .max_capacity(CACHE_MAX_CAPACITY)
             .time_to_live(Duration::from_secs(CACHE_TTL_SECS))
@@ -71,6 +91,7 @@ impl SimulationCache {
         Arc::new(Self {
             l1,
             l2,
+            max_cache_size_bytes,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         })
@@ -93,8 +114,21 @@ impl SimulationCache {
         hex::encode(digest)
     }
 
+    pub fn generate_key_with_network(
+        contract_id: &str,
+        function_name: &str,
+        args: &[String],
+        network: &str,
+    ) -> String {
+        let args_json = serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string());
+        let input = format!("{}{}{}{}", contract_id, function_name, args_json, network);
+        let digest = Sha256::digest(input.as_bytes());
+        hex::encode(digest)
+    }
+
     pub async fn get(&self, key: &str) -> Option<SimulationResult> {
         if let Some(result) = self.l1.get(key).await {
+            self.touch(key);
             self.hits.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(cache.key = %key, "Cache HIT (L1)");
             return Some(result);
@@ -102,6 +136,7 @@ impl SimulationCache {
 
         if let Ok(Some(bytes)) = self.l2.get(key) {
             if let Ok(entry) = serde_json::from_slice::<CacheEntry<SimulationResult>>(&bytes) {
+                self.touch(key);
                 self.l1.insert(key.to_string(), entry.data.clone()).await;
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(cache.key = %key, "Cache HIT (L2)");
@@ -117,17 +152,67 @@ impl SimulationCache {
     pub async fn set(&self, key: String, result: SimulationResult) {
         let entry = CacheEntry {
             ledger_sequence: result.latest_ledger,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp: current_timestamp_millis(),
             data: result.clone(),
         };
 
         if let Ok(bytes) = serde_json::to_vec(&entry) {
-            let _ = self.l2.insert(&key, bytes);
+            if self.l2.insert(&key, bytes).is_ok() {
+                self.evict_to_size();
+            }
         }
         self.l1.insert(key, result).await;
+    }
+
+    fn touch(&self, key: &str) {
+        let Some(bytes) = self.l2.get(key).ok().flatten() else {
+            return;
+        };
+        let Ok(mut entry) = serde_json::from_slice::<CacheEntry<SimulationResult>>(&bytes) else {
+            return;
+        };
+        entry.timestamp = current_timestamp_millis();
+        if let Ok(updated) = serde_json::to_vec(&entry) {
+            let _ = self.l2.insert(key, updated);
+        }
+    }
+
+    fn evict_to_size(&self) {
+        if self.max_cache_size_bytes == 0 {
+            return;
+        }
+
+        let mut entries = Vec::new();
+        let mut total_size = 0u64;
+        for item in self.l2.iter() {
+            let Ok((key, value)) = item else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_slice::<CacheEntry<SimulationResult>>(value.as_ref()) else {
+                continue;
+            };
+            total_size = total_size.saturating_add(key.len() as u64 + value.len() as u64);
+            entries.push((entry.timestamp, key, value.len() as u64));
+        }
+
+        if total_size <= self.max_cache_size_bytes {
+            return;
+        }
+
+        entries.sort_by_key(|(timestamp, _, _)| *timestamp);
+        let mut removed = 0u64;
+        for (_, key, value_size) in entries {
+            if total_size <= self.max_cache_size_bytes {
+                break;
+            }
+            if self.l2.remove(&key).is_ok() {
+                total_size = total_size.saturating_sub(key.len() as u64 + value_size);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::debug!(removed, "evicted least-recently-used simulation cache entries");
+        }
     }
 
     pub fn log_stats(&self) {
@@ -226,6 +311,108 @@ impl ContractCache {
             let _ = self.ledger_tree.insert(key_64.clone(), bytes);
         }
         self.ledger_memory.insert(key_64, entry);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::simulation::SorobanResources;
+    use tempfile::tempdir;
+
+    fn result() -> SimulationResult {
+        SimulationResult {
+            resources: SorobanResources::default(),
+            transaction_hash: None,
+            latest_ledger: 1,
+            cost_stroops: 0,
+            state_dependency: None,
+            ttl_analysis: None,
+            transaction_data: "test".to_string(),
+            call_graph: None,
+            state_snapshot: None,
+            protocol_version: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn evicts_least_recently_accessed_entry_when_size_is_exceeded() {
+        let dir = tempdir().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let unlimited = SimulationCache::new_with_max_cache_size_bytes(&db, 0);
+        unlimited.set("old".to_string(), result()).await;
+        assert!(unlimited.get("old").await.is_some());
+
+        let tree = db.open_tree("simulation_results").unwrap();
+        let old_size = tree.get("old").unwrap().unwrap().len() as u64 + 3;
+        let bounded = SimulationCache::new_with_max_cache_size_bytes(&db, old_size);
+        bounded.set("new".to_string(), result()).await;
+
+        assert!(bounded.get("old").await.is_none());
+        assert!(bounded.get("new").await.is_some());
+    }
+
+    #[test]
+    fn cache_key_generation_is_deterministic() {
+        let contract_id = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let function_name = "transfer";
+        let args = vec!["arg1".to_string(), "arg2".to_string()];
+
+        let key1 = SimulationCache::generate_key(contract_id, function_name, &args);
+        let key2 = SimulationCache::generate_key(contract_id, function_name, &args);
+
+        assert_eq!(key1, key2, "Same inputs should produce same cache key");
+    }
+
+    #[test]
+    fn cache_key_includes_all_parameters() {
+        let contract_id = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let function_name = "transfer";
+        let args = vec!["arg1".to_string()];
+
+        let key1 = SimulationCache::generate_key(contract_id, function_name, &args);
+        let key2 = SimulationCache::generate_key("DIFFERENT_CONTRACT", function_name, &args);
+        let key3 = SimulationCache::generate_key(contract_id, "different_function", &args);
+        let key4 = SimulationCache::generate_key(contract_id, function_name, &[]);
+
+        assert_ne!(key1, key2, "Different contract IDs should produce different keys");
+        assert_ne!(key1, key3, "Different function names should produce different keys");
+        assert_ne!(key1, key4, "Different args should produce different keys");
+    }
+
+    #[test]
+    fn cache_key_with_network_differentiates_networks() {
+        let contract_id = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let function_name = "transfer";
+        let args = vec!["arg1".to_string()];
+        let testnet = "Test SDF Network ; September 2015";
+        let mainnet = "Public Global Stellar Network ; September 2015";
+
+        let key_testnet =
+            SimulationCache::generate_key_with_network(contract_id, function_name, &args, testnet);
+        let key_mainnet =
+            SimulationCache::generate_key_with_network(contract_id, function_name, &args, mainnet);
+
+        assert_ne!(
+            key_testnet, key_mainnet,
+            "Different networks should produce different cache keys"
+        );
+    }
+
+    #[test]
+    fn cache_key_with_network_is_deterministic() {
+        let contract_id = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
+        let function_name = "transfer";
+        let args = vec!["arg1".to_string()];
+        let network = "Test SDF Network ; September 2015";
+
+        let key1 = SimulationCache::generate_key_with_network(contract_id, function_name, &args, network);
+        let key2 = SimulationCache::generate_key_with_network(contract_id, function_name, &args, network);
+
+        assert_eq!(
+            key1, key2,
+            "Same inputs with same network should produce same cache key"
+        );
     }
 }
 

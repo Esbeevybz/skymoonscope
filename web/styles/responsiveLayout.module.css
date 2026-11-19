@@ -1,0 +1,108 @@
+/* Responsive Layout Module - Prevents layout shift on sidebar collapse/expand */
+
+/* Container for main content that prevents horizontal shift */
+.mainContentContainer {
+  /* Allow scrollbar to take space without affecting layout */
+  scrollbar-gutter: stable;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Prevents nested elements from causing layout shifts */
+.responsiveGridContainer {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1.5rem; /* gap-6 in Tailwind */
+  width: 100%;
+  box-sizing: border-box;
+  
+  /* Ensure grid doesn't shift when switching to 2 columns */
+  & > * {
+    box-sizing: border-box;
+    min-width: 0; /* Prevent overflow of flex/grid children */
+  }
+}
+
+/* Two-column layout for lg screens */
+@media (min-width: 1024px) {
+  .responsiveGridContainer {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+/* Fixed-width container that maintains consistent width */
+.consistentWidthContainer {
+  margin-left: auto;
+  margin-right: auto;
+  width: 100%;
+  max-width: 84rem; /* max-w-6xl = 64rem, we use larger for dashboard */
+  padding-left: 1rem; /* px-4 */
+  padding-right: 1rem;
+  box-sizing: border-box;
+
+  @media (min-width: 640px) {
+    padding-left: 1.5rem; /* sm:px-6 */
+    padding-right: 1.5rem;
+  }
+
+  @media (min-width: 1024px) {
+    padding-left: 2rem; /* lg:px-8 */
+    padding-right: 2rem;
+  }
+}
+
+/* Sidebar wrapper that doesn't cause shifts when collapsing */
+.sidebarContainer {
+  box-sizing: border-box;
+  /* Ensure sidebar width doesn't affect parent layout */
+  flex-shrink: 0;
+}
+
+/* Main content area that adapts to sidebar changes */
+.mainContent {
+  box-sizing: border-box;
+  width: 100%;
+  /* Prevent content from overflowing when sidebar changes */
+  overflow-x: hidden;
+  min-width: 0; /* Crucial for flex/grid overflow prevention */
+}
+
+/* Header that maintains width consistency */
+.headerContainer {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  width: 100vw; /* Full viewport width */
+  left: 50%;
+  right: 50%;
+  margin-left: -50vw;
+  margin-right: -50vw;
+  box-sizing: border-box;
+}
+
+/* Scrollable content area with stable scrollbar */
+.scrollableContent {
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  box-sizing: border-box;
+}
+
+/* Flex container that prevents layout shift */
+.stableFlexContainer {
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: 100%;
+  
+  & > * {
+    box-sizing: border-box;
+  }
+}
+
+/* Grid cell with overflow prevention */
+.gridCell {
+  box-sizing: border-box;
+  min-width: 0; /* Prevents overflow in grid/flex */
+  overflow-wrap: break-word;
+}

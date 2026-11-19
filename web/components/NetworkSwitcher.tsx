@@ -11,6 +11,8 @@ export function NetworkSwitcher({ className = "", isMobile = false }: NetworkSwi
   const { network, networkId, setNetworkId, networks } = useNetwork();
   const [isOpen, setIsOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   // Close dropdown on click outside
   useEffect(() => {
@@ -23,25 +25,69 @@ export function NetworkSwitcher({ className = "", isMobile = false }: NetworkSwi
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  // Close dropdown on Escape key
+  // Close dropdown on Escape key; arrow keys navigate the list
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && isOpen) {
+      if (!isOpen) return;
+
+      if (event.key === "Escape") {
+        event.preventDefault();
         setIsOpen(false);
+        triggerRef.current?.focus();
+        return;
+      }
+
+      const buttons = listRef.current?.querySelectorAll<HTMLButtonElement>("button[data-net-idx]");
+      if (!buttons || buttons.length === 0) return;
+
+      const currentFocus = document.activeElement as HTMLElement;
+      const focusedBtn = Array.from(buttons).findIndex(b => b === currentFocus);
+
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        const nextIdx = focusedBtn < 0 ? 0 : (focusedBtn + 1) % buttons.length;
+        buttons[nextIdx]?.focus();
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        const prevIdx = focusedBtn <= 0 ? buttons.length - 1 : focusedBtn - 1;
+        buttons[prevIdx]?.focus();
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        buttons[0]?.focus();
+      } else if (event.key === "End") {
+        event.preventDefault();
+        buttons[buttons.length - 1]?.focus();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [isOpen]);
 
+  // Focus first item when dropdown opens
+  useEffect(() => {
+    if (isOpen) {
+      // Defer to after render so the list is present in the DOM
+      const timer = setTimeout(() => {
+        const buttons = listRef.current?.querySelectorAll<HTMLButtonElement>("button[data-net-idx]");
+        // Focus the currently selected option
+        const selectedIdx = networks.findIndex(n => n.id === networkId);
+        const focusIdx = selectedIdx >= 0 ? selectedIdx : 0;
+        buttons?.[focusIdx]?.focus();
+      }, 0);
+      return () => clearTimeout(timer);
+    }
+  }, [isOpen, networkId, networks]);
+
   const handleSelect = (id: NetworkId) => {
     setNetworkId(id);
     setIsOpen(false);
+    triggerRef.current?.focus();
   };
 
   return (
     <div ref={dropdownRef} className={`relative inline-block text-left ${className}`}>
       <button
+        ref={triggerRef}
         type="button"
         onClick={() => setIsOpen(!isOpen)}
         aria-haspopup="listbox"
@@ -81,8 +127,8 @@ export function NetworkSwitcher({ className = "", isMobile = false }: NetworkSwi
             </p>
           </div>
 
-          <div className="py-1">
-            {networks.map((net: NetworkConfig) => {
+          <div ref={listRef} className="py-1">
+            {networks.map((net: NetworkConfig, idx: number) => {
               const isSelected = net.id === networkId;
               return (
                 <button
@@ -90,11 +136,13 @@ export function NetworkSwitcher({ className = "", isMobile = false }: NetworkSwi
                   type="button"
                   role="option"
                   aria-selected={isSelected}
+                  data-net-idx={idx}
+                  tabIndex={isSelected ? 0 : -1}
                   onClick={() => handleSelect(net.id)}
                   className={`group flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-xs transition-colors ${
                     isSelected
                       ? `${net.badgeBg} text-white font-semibold border ${net.badgeBorder}`
-                      : "text-slate-300 hover:bg-slate-800/80 hover:text-white"
+                      : "text-slate-300 hover:bg-slate-800/80 hover:text-white focus:bg-slate-800/80 focus:text-white focus:outline-none"
                   }`}
                 >
                   <div className="flex items-center gap-2.5">

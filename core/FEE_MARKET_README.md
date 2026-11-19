@@ -153,6 +153,7 @@ Add these environment variables to your `.env` file:
 ```bash
 # Fee Market Configuration
 FEE_COLLECTION_INTERVAL_SECS=5        # How often to collect fee data (default: 5)
+FEE_MARKET_CACHE_TTL_SECS=1           # Cache getLatestLedger RPC result (default: 1; 0 disables)
 FEE_RETENTION_DAYS=30                 # How long to keep fee data (default: 30)
 FEE_ANALYSIS_ENABLED=true             # Enable/disable fee analysis (default: true)
 DATABASE_URL=sqlite://Sky Moon Scope.db    # Database URL for storing fee data
@@ -162,7 +163,7 @@ DATABASE_URL=sqlite://Sky Moon Scope.db    # Database URL for storing fee data
 
 ### Data Collection Pipeline
 1. **Background Collector** runs every 5 seconds (aligned with Stellar's ~5s ledger close time)
-2. Fetches latest ledger via `getLatestLedger` RPC call
+2. Fetches the latest ledger via `getLatestLedger` RPC call (the result is reused for the configured cache TTL)
 3. Retrieves detailed fee data via `getLedgers` or `getTransactions`
 4. Extracts metrics: base_fee, max_fee, fee_charged, transaction_count
 5. Stores in SQLite database with timestamp

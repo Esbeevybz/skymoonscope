@@ -1,12 +1,14 @@
 use crate::escrow::{has_config, read_config, require_active, require_funded, write_config};
 use crate::guardian::{
-    approval_count, guardian_index, has_quorum, read_approvals, read_epoch, read_guardians,
-    set_approval, validate_guardians, write_approvals, write_epoch, write_guardians,
+    approval_count, clear_pending_rotation, guardian_index, has_quorum, read_approvals,
+    read_epoch, read_guardians, read_pending_rotation, read_rotation_delay, set_approval,
+    validate_guardians, write_approvals, write_epoch, write_guardians, write_pending_rotation,
     REQUIRED_APPROVALS,
 };
 use crate::storage_types::{
-    ApprovalEvent, CancelEvent, DepositEvent, Error, EscrowConfig, GuardianRotationEvent,
-    MutualCancelEvent, ReleaseEvent,
+    ApprovalEvent, CancelEvent, DepositEvent, Error, EscrowConfig, GuardianRotationCancelledEvent,
+    GuardianRotationEvent, GuardianRotationProposedEvent, MutualCancelEvent,
+    PendingGuardianRotation, ReleaseEvent,
 };
 use soroban_sdk::{contract, contractimpl, token, Address, Env, Symbol, Vec};
 
@@ -267,13 +269,13 @@ impl TimelockEscrow {
         Ok(())
     }
 
-    /// Rotates the guardian set. Requires exactly 3 current guardians to authorize.
-    /// Resets all pending approvals and bumps the epoch.
-    pub fn rotate_guardians(
+    /// Proposes a new guardian set. Requires exactly 3 current guardians to authorize.
+    /// Initiates a time-lock delay before the rotation can be executed.
+    pub fn propose_guardian_rotation(
         e: Env,
         new_guardians: Vec<Address>,
         approving_guardians: Vec<Address>,
-    ) -> Result<(), Error> {
+    ) -> Result<u32, Error> {
         let config = read_config(&e)?;
         require_active(&config)?;
 
@@ -298,8 +300,43 @@ impl TimelockEscrow {
             approver_bitmap |= mask;
         }
 
+        let delay = read_rotation_delay(&e);
+        let eta = e.ledger().sequence().saturating_add(delay);
+        let proposal = PendingGuardianRotation {
+            new_guardians: new_guardians.clone(),
+            eta,
+        };
+        write_pending_rotation(&e, &proposal);
+
+        e.events().publish(
+            (Symbol::new(&e, "guardian_rotation_proposed"),),
+            GuardianRotationProposedEvent {
+                new_guardians,
+                eta,
+            },
+        );
+
+        e.storage().instance().extend_ttl(100, 100);
+        Ok(eta)
+    }
+
+    /// Executes a pending guardian rotation once the time-lock delay has elapsed.
+    /// Can be triggered permissionlessly by any caller once mature.
+    /// Resets all pending approvals and bumps the epoch.
+    pub fn execute_guardian_rotation(e: Env) -> Result<(), Error> {
+        let config = read_config(&e)?;
+        require_active(&config)?;
+
+        let proposal = read_pending_rotation(&e).ok_or(Error::NoPendingRotation)?;
+
+        if e.ledger().sequence() < proposal.eta {
+            return Err(Error::RotationTimelockNotElapsed);
+        }
+
+        let current_guardians = read_guardians(&e);
         let old_guardians = current_guardians;
-        write_guardians(&e, &new_guardians);
+        write_guardians(&e, &proposal.new_guardians);
+        clear_pending_rotation(&e);
         write_approvals(&e, 0u32);
         let new_epoch = read_epoch(&e) + 1;
         write_epoch(&e, new_epoch);
@@ -308,13 +345,47 @@ impl TimelockEscrow {
             (Symbol::new(&e, "guardian_rotation"),),
             GuardianRotationEvent {
                 old_guardians,
-                new_guardians,
+                new_guardians: proposal.new_guardians,
                 new_epoch,
             },
         );
 
         e.storage().instance().extend_ttl(100, 100);
         Ok(())
+    }
+
+    /// Cancels a pending guardian rotation. Requires authorization from any current guardian.
+    pub fn cancel_guardian_rotation(e: Env, caller: Address) -> Result<(), Error> {
+        let config = read_config(&e)?;
+        require_active(&config)?;
+
+        caller.require_auth();
+
+        let current_guardians = read_guardians(&e);
+        guardian_index(&current_guardians, &caller)?;
+
+        if read_pending_rotation(&e).is_none() {
+            return Err(Error::NoPendingRotation);
+        }
+
+        clear_pending_rotation(&e);
+
+        e.events().publish(
+            (Symbol::new(&e, "guardian_rotation_cancelled"), caller.clone()),
+            GuardianRotationCancelledEvent { canceller: caller },
+        );
+
+        e.storage().instance().extend_ttl(100, 100);
+        Ok(())
+    }
+
+    /// Backwards-compatible convenience wrapper that proposes the rotation.
+    pub fn rotate_guardians(
+        e: Env,
+        new_guardians: Vec<Address>,
+        approving_guardians: Vec<Address>,
+    ) -> Result<u32, Error> {
+        Self::propose_guardian_rotation(e, new_guardians, approving_guardians)
     }
 
     // ── View Functions ──────────────────────────────────────
@@ -325,6 +396,14 @@ impl TimelockEscrow {
 
     pub fn get_guardians(e: Env) -> Vec<Address> {
         read_guardians(&e)
+    }
+
+    pub fn get_pending_guardian_rotation(e: Env) -> Option<PendingGuardianRotation> {
+        read_pending_rotation(&e)
+    }
+
+    pub fn get_rotation_delay_ledgers(e: Env) -> u32 {
+        read_rotation_delay(&e)
     }
 
     pub fn get_approval_bitmap(e: Env) -> u32 {

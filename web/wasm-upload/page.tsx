@@ -1,4 +1,5 @@
 import WasmUpload from "../components/WasmUpload";
+import { debugLog } from "../lib/debugUtils";
 
 export default function WasmUploadPage() {
   return (
@@ -17,10 +18,10 @@ export default function WasmUploadPage() {
           maxFiles={3}
           maxFileSize={5 * 1024 * 1024}
           onFileSelect={(files) => {
-            console.log("Files selected:", files.map((f) => f.name));
+            debugLog("Files selected:", files.map((f) => f.name));
           }}
           onUploadComplete={(files) => {
-            console.log(
+            debugLog(
               "Ready for analysis:",
               files.map((f) => ({
                 name: f.file.name,

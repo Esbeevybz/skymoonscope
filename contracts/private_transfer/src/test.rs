@@ -6,7 +6,7 @@ use super::*;
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Events},
-    Address, Bytes, BytesN, Env, TryIntoVal,
+    Address, Bytes, BytesN, Env, String, TryIntoVal,
 };
 
 #[contract]
@@ -179,6 +179,79 @@ fn rejects_transfer_when_verifier_fails() {
     let err =
         client.try_apply_private_transfer(&relayer, &transfer, &Bytes::from_slice(&env, &[1]));
     assert_eq!(err, Err(Ok(Error::ProofVerificationFailed)));
+}
+
+// ── Proof material validation (issue #078) ───────────────────────────────────
+
+#[test]
+fn rejects_empty_proof_even_when_verifier_would_accept() {
+    let (env, contract_id, verifier_id, relayer, vk_hash) = setup();
+    let client = PrivateTransferContractClient::new(&env, &contract_id);
+
+    let current_root = client.current_root();
+    let transfer = make_transfer(&env, current_root.clone());
+    // The mock is configured to accept this exact statement.
+    configure_accepting_verifier(&env, &contract_id, &verifier_id, &vk_hash, &transfer);
+
+    // An empty proof carries no witness, so it is rejected on the contract's own
+    // terms rather than being handed to the verifier.
+    let empty = Bytes::new(&env);
+    let err = client.try_apply_private_transfer(&relayer, &transfer, &empty);
+    assert_eq!(err, Err(Ok(Error::EmptyProof)));
+
+    // Nothing moved.
+    assert_eq!(client.current_root(), current_root);
+    assert!(!client.is_nullifier_used(&transfer.nullifier));
+}
+
+#[test]
+fn rejects_replay_of_the_same_proof_against_a_new_statement() {
+    let (env, contract_id, verifier_id, relayer, vk_hash) = setup();
+    let client = PrivateTransferContractClient::new(&env, &contract_id);
+
+    let current_root = client.current_root();
+    let transfer = make_transfer(&env, current_root.clone());
+    configure_accepting_verifier(&env, &contract_id, &verifier_id, &vk_hash, &transfer);
+
+    let proof = Bytes::from_slice(&env, &[42, 42]);
+    client.apply_private_transfer(&relayer, &transfer, &proof);
+
+    // A second transfer reusing the identical proof bytes, but built on the new
+    // root so the nullifier and commitments differ, must not be accepted.
+    let mut replay = make_transfer(&env, client.current_root());
+    replay.nullifier = bytes32(&env, 55);
+    replay.sender_update.commitment = bytes32(&env, 66);
+    replay.recipient_update.commitment = bytes32(&env, 77);
+    configure_accepting_verifier(&env, &contract_id, &verifier_id, &vk_hash, &replay);
+
+    let err = client.try_apply_private_transfer(&relayer, &replay, &proof);
+    assert_eq!(err, Err(Ok(Error::ProofAlreadyUsed)));
+    assert!(!client.is_nullifier_used(&replay.nullifier));
+}
+
+#[test]
+fn rejects_zero_address_verifier_installation() {
+    let (env, contract_id, _, _, _) = setup();
+    let client = PrivateTransferContractClient::new(&env, &contract_id);
+
+    // The all-zero account address: unusable as a verifier.
+    let zero_addr = Address::from_string(&String::from_str(
+        &env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    let vk = bytes32(&env, 2);
+    let err = client.try_set_verifier(&zero_addr, &vk);
+    assert_eq!(err, Err(Ok(Error::VerifierNotConfigured)));
+}
+
+#[test]
+fn verifier_config_is_readable() {
+    let (env, contract_id, verifier_id, _, vk_hash) = setup();
+    let client = PrivateTransferContractClient::new(&env, &contract_id);
+
+    let (verifier, vk) = client.verifier_config();
+    assert_eq!(verifier, verifier_id);
+    assert_eq!(vk, vk_hash);
 }
 
 #[test]

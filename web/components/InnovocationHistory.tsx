@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import type { InvocationResult } from '../lib/sorobantypes';
 import { getEncryptedLocalStorage } from '../lib/encryptedStorage';
+import { debugWarn } from '../lib/debugUtils';
 
 interface InvocationHistoryProps {
   onSelectResult: (result: InvocationResult) => void;
@@ -45,7 +46,7 @@ export function useInvocationHistory() {
         void getEncryptedLocalStorage()
           ?.setItem(HISTORY_KEY, JSON.stringify(updated))
           .catch((error: unknown) => {
-            console.warn('Failed to save invocation history:', error);
+            debugWarn('Failed to save invocation history:', error);
           });
       }
       return updated;

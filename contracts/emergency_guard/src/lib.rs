@@ -22,6 +22,9 @@ impl PauseType {
     /// Pause borrow / flash loan operations
     pub const BORROW: u32 = 1 << 8;
 
+    /// Pause reward claim operations
+    pub const CLAIM_REWARDS: u32 = 1 << 9;
+
     pub fn new(value: u32) -> Self {
         PauseType(value)
     }
@@ -61,6 +64,7 @@ impl PauseType {
 pub enum GuardDataKey {
     PauseState,
     Admins,
+    Guardians,
     SignatureThreshold,
 }
 
@@ -75,7 +79,24 @@ pub enum GuardError {
     InvalidThreshold = 4,
     AdminNotFound = 5,
     AlreadyInitialized = 6,
+    /// The guardian list is already at `MAX_GUARDIANS` (#077).
+    TooManyGuardians = 7,
+    /// The requested address is not a member of the guardian set.
+    GuardianNotFound = 8,
 }
+
+/// Hard ceiling on the size of the guardian set (issue #77).
+/// Guardians live in `instance` storage and every emergency_pause check iterates
+/// the guardian list, so an unbounded set inflates per-call ledger footprint and
+/// enables storage-flooding attacks. The cap is enforced at initialization and on
+/// every `add_guardian` call.
+///
+/// Guardians live in `instance` storage, and every guarded operation reads the
+/// whole list (multi-sig checks iterate it and `is_admin` scans it). Letting the
+/// set grow without bound therefore inflates the per-call ledger footprint and
+/// lets a storage-flooding caller degrade every guarded operation, so the set is
+/// capped and `add_guardian` is rejected once the cap is reached.
+pub const MAX_GUARDIANS: u32 = 20;
 
 /// Standardized event actions emitted by every successful guard action.
 #[contracttype]
@@ -173,6 +194,13 @@ const EVENT_RESUME_ALL: &str = "emergency_guard_resumed_all";
 const EVENT_ADD_ADMIN: &str = "emergency_guard_admin_added";
 const EVENT_REMOVE_ADMIN: &str = "emergency_guard_admin_removed";
 
+/// Hard ceiling on the guardian (admin) list.
+///
+/// The list lives in `instance` storage and is walked on every multi-sig check,
+/// so an unbounded list is a storage-growth and per-call-footprint problem: each
+/// entry is paid for on every guarded call, forever.  Capping it keeps the cost
+/// of a guard check bounded no matter how the committee grows (#077).
+
 pub fn emit_guard_initialized(e: &Env, admins: &Vec<Address>, threshold: u32) {
     e.events().publish(
         (String::from_str(e, EVENT_INIT_GUARD),),
@@ -237,15 +265,59 @@ pub struct EmergencyGuard;
 
 #[cfg_attr(feature = "contract", contractimpl)]
 impl EmergencyGuard {
-    /// Initialize the emergency guard with a list of admins and required threshold.
-    pub fn initialize(env: Env, admins: Vec<Address>, threshold: u32) -> Result<(), GuardError> {
+    /// Initialize the emergency guard with a list of admins, required threshold,
+    /// and an initial guardian. The guardian is seeded into the guardian set so
+    /// that `emergency_pause` can be triggered from day one.
+    pub fn initialize(
+        env: Env,
+        admins: Vec<Address>,
+        threshold: u32,
+        guardian: Address,
+    ) -> Result<(), GuardError> {
         if env.storage().instance().has(&GuardDataKey::Admins) {
             return Err(GuardError::AlreadyInitialized);
         }
         if threshold == 0 || threshold > admins.len() {
             return Err(GuardError::InvalidThreshold);
         }
+        if admins.len() > MAX_GUARDIANS {
+            return Err(GuardError::TooManyGuardians);
+        }
+        let mut guardians = Vec::new(&env);
+        guardians.push_back(guardian.clone());
+        if guardians.len() > MAX_GUARDIANS {
+            return Err(GuardError::TooManyGuardians);
+        }
         env.storage().instance().set(&GuardDataKey::Admins, &admins);
+        env.storage().instance().set(&GuardDataKey::Guardians, &guardians);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::SignatureThreshold, &threshold);
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::PauseState, &PauseType::new(0));
+        emit_guard_initialized(&env, &admins, threshold);
+        Ok(())
+    }
+
+    /// Initialize the emergency guard with distinct admin and guardian sets.
+    pub fn initialize_with_roles(
+        env: Env,
+        admins: Vec<Address>,
+        guardians: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), GuardError> {
+        if env.storage().instance().has(&GuardDataKey::Admins) {
+            return Err(GuardError::AlreadyInitialized);
+        }
+        if threshold == 0 || threshold > admins.len() || threshold > guardians.len() {
+            return Err(GuardError::InvalidThreshold);
+        }
+        if admins.len() > MAX_GUARDIANS || guardians.len() > MAX_GUARDIANS {
+            return Err(GuardError::TooManyGuardians);
+        }
+        env.storage().instance().set(&GuardDataKey::Admins, &admins);
+        env.storage().instance().set(&GuardDataKey::Guardians, &guardians);
         env.storage()
             .instance()
             .set(&GuardDataKey::SignatureThreshold, &threshold);
@@ -334,9 +406,14 @@ impl EmergencyGuard {
         Ok(())
     }
 
-    /// Emergency pause all operations (requires multi-sig approval).
+    /// Emergency pause all operations.
+    ///
+    /// Requires guardian multi-sig: `approvers` must contain at least `threshold`
+    /// distinct guardians, each of whom must have provided `require_auth()`. This
+    /// enforces the guardian threshold on every `emergency_pause` invocation
+    /// (issue #429).
     pub fn emergency_pause(env: Env, approvers: Vec<Address>) -> Result<(), GuardError> {
-        Self::check_multi_sig(&env, &approvers)?;
+        Self::check_guardian_multi_sig(&env, &approvers)?;
         let mut state = PauseType::new(0);
         state.pause_all();
         env.storage()
@@ -384,6 +461,11 @@ impl EmergencyGuard {
     }
 
     /// Add new admin (multi-sig required).
+    ///
+    /// Rejected with `GuardError::TooManyGuardians` once the list holds
+    /// `MAX_GUARDIANS` entries, so the committee cannot grow without bound
+    /// (#077). Adding an address that is already a guardian is a no-op and is
+    /// still allowed at the cap.
     pub fn add_admin(
         env: Env,
         approvers: Vec<Address>,
@@ -392,6 +474,9 @@ impl EmergencyGuard {
         Self::check_multi_sig(&env, &approvers)?;
         let mut admins = Self::get_admins(env.clone());
         if !admins.iter().any(|a| a == new_admin) {
+            if admins.len() >= MAX_GUARDIANS {
+                return Err(GuardError::TooManyGuardians);
+            }
             admins.push_back(new_admin.clone());
             env.storage().instance().set(&GuardDataKey::Admins, &admins);
             emit_guard_event(
@@ -409,6 +494,126 @@ impl EmergencyGuard {
             emit_admin_added(&env, &approvers, &new_admin);
         }
         Ok(())
+    }
+
+    /// Add a guardian to the guardian set (multi-sig required by admins).
+    ///
+    /// Guardians are the addresses authorized to trigger `emergency_pause`.
+    /// Subject to the [`MAX_GUARDIANS`] cap (#077). Adding an address that is
+    /// already a guardian is a no-op and is still allowed at the cap.
+    pub fn add_guardian(
+        env: Env,
+        approvers: Vec<Address>,
+        new_guardian: Address,
+    ) -> Result<(), GuardError> {
+        Self::check_multi_sig(&env, &approvers)?;
+        let mut guardians = Self::get_guardians(env.clone());
+        if !guardians.iter().any(|g| g == new_guardian) {
+            if guardians.len() >= MAX_GUARDIANS {
+                return Err(GuardError::TooManyGuardians);
+            }
+            guardians.push_back(new_guardian.clone());
+            env.storage()
+                .instance()
+                .set(&GuardDataKey::Guardians, &guardians);
+            emit_guard_event(
+                &env,
+                EmergencyGuardEvent {
+                    action: EmergencyGuardAction::AdminAdded,
+                    admin: Some(new_guardian.clone()),
+                    operation: 0,
+                    paused: false,
+                    threshold: Self::get_threshold(env.clone()),
+                    admin_count: Self::get_admins(env.clone()).len(),
+                    approver_count: approvers.len(),
+                },
+            );
+            emit_admin_added(&env, &approvers, &new_guardian);
+        }
+        Ok(())
+    }
+
+    /// Remove a guardian from the guardian set (multi-sig required by admins).
+    pub fn remove_guardian(
+        env: Env,
+        approvers: Vec<Address>,
+        guardian: Address,
+    ) -> Result<(), GuardError> {
+        Self::check_multi_sig(&env, &approvers)?;
+        let guardians = Self::get_guardians(env.clone());
+        let mut new_guardians = Vec::new(&env);
+        let mut found = false;
+        for g in guardians.iter() {
+            if g == guardian {
+                found = true;
+            } else {
+                new_guardians.push_back(g.clone());
+            }
+        }
+        if !found {
+            return Err(GuardError::GuardianNotFound);
+        }
+        env.storage()
+            .instance()
+            .set(&GuardDataKey::Guardians, &new_guardians);
+        emit_guard_event(
+            &env,
+            EmergencyGuardEvent {
+                action: EmergencyGuardAction::AdminRemoved,
+                admin: Some(guardian.clone()),
+                operation: 0,
+                paused: false,
+                threshold: Self::get_threshold(env.clone()),
+                admin_count: new_guardians.len(),
+                approver_count: approvers.len(),
+            },
+        );
+        emit_admin_removed(&env, &approvers, &guardian);
+        Ok(())
+    }
+
+    /// Get list of current guardians.
+    pub fn get_guardians(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&GuardDataKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Check if an address is a guardian.
+    pub fn is_guardian(env: Env, addr: Address) -> bool {
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::Guardians)
+            .unwrap_or_else(|| Vec::new(&env));
+        guardians.iter().any(|g| g == addr)
+    }
+
+    /// Number of guardian slots still available before `MAX_GUARDIANS`.
+    /// Counts unique addresses across both the admin and guardian sets, since
+    /// an address can be both an admin and a guardian (e.g. the initial guardian
+    /// seeded during `initialize`).
+    pub fn guardian_capacity(env: Env) -> u32 {
+        let admins = Self::get_admins(env.clone());
+        let guardians = Self::get_guardians(env.clone());
+        let mut unique: Vec<Address> = Vec::new(&env);
+        for a in admins.iter() {
+            if !unique.iter().any(|u| u == a) {
+                unique.push_back(a.clone());
+            }
+        }
+        for g in guardians.iter() {
+            if !unique.iter().any(|u| u == g) {
+                unique.push_back(g.clone());
+            }
+        }
+        MAX_GUARDIANS.saturating_sub(unique.len() as u32)
+    }
+
+    /// Whether the guardian set is at its `MAX_GUARDIANS` cap.
+    pub fn is_guardian_set_full(env: Env) -> bool {
+        Self::guardian_capacity(env) == 0
     }
 
     /// Remove admin (multi-sig required).
@@ -481,8 +686,6 @@ impl EmergencyGuard {
             return Err(GuardError::AdminNotFound);
         }
 
-        new_admins.push_back(new_admin.clone());
-
         if (new_admins.len() as u32) < threshold {
             return Err(GuardError::InvalidThreshold);
         }
@@ -552,10 +755,6 @@ impl EmergencyGuard {
             .get(&GuardDataKey::SignatureThreshold)
             .ok_or(GuardError::NotInitialized)?;
 
-        if approvers.len() < threshold {
-            return Err(GuardError::InsufficientSignatures);
-        }
-
         let mut valid = 0u32;
         let mut seen = Vec::new(env);
         for addr in approvers.iter() {
@@ -571,11 +770,63 @@ impl EmergencyGuard {
             }
         }
 
+        if approvers.len() < threshold {
+            return Err(GuardError::InsufficientSignatures);
+        }
+
         if valid < threshold {
             Err(GuardError::InsufficientSignatures)
         } else {
             Ok(())
         }
+    }
+
+    /// Verify that `approvers` contains at least `threshold` distinct valid guardians,
+    /// each having provided their authorization. Used by `emergency_pause` to enforce
+    /// the guardian threshold (issue #429).
+    pub(crate) fn check_guardian_multi_sig(
+        env: &Env,
+        approvers: &Vec<Address>,
+    ) -> Result<(), GuardError> {
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::SignatureThreshold)
+            .ok_or(GuardError::NotInitialized)?;
+
+        let mut valid = 0u32;
+        let mut seen = Vec::new(env);
+        for addr in approvers.iter() {
+            if seen.iter().any(|a| a == addr) {
+                continue;
+            }
+            seen.push_back(addr.clone());
+            if Self::is_guardian_internal(env, &addr) {
+                addr.require_auth();
+                valid += 1;
+            } else {
+                return Err(GuardError::Unauthorized);
+            }
+        }
+
+        if approvers.len() < threshold {
+            return Err(GuardError::InsufficientSignatures);
+        }
+
+        if valid < threshold {
+            Err(GuardError::InsufficientSignatures)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn is_guardian_internal(env: &Env, addr: &Address) -> bool {
+        let guardians: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&GuardDataKey::Guardians)
+            .unwrap_or_else(|| Vec::new(env));
+        guardians.iter().any(|g| g == *addr)
     }
 }
 
@@ -631,12 +882,20 @@ impl EmergencyGuardTrait for DefaultEmergencyGuard {
     }
 
     /// Unpause a specific operation (any single admin can do this)
-    fn unpause(env: &Env, operation: u32) -> Result<(), GuardError> {
+    fn unpause(env: &Env, admin: Address, operation: u32) -> Result<(), GuardError> {
+        admin.require_auth();
+        if !EmergencyGuard::is_admin_internal(env, &admin) {
+            return Err(GuardError::Unauthorized);
+        }
         Self::set_pause_state(env, operation, false)
     }
 
     /// Unpause all operations (any single admin can do this)
-    fn unpause_all(env: &Env) -> Result<(), GuardError> {
+    fn unpause_all(env: &Env, admin: Address) -> Result<(), GuardError> {
+        admin.require_auth();
+        if !EmergencyGuard::is_admin_internal(env, &admin) {
+            return Err(GuardError::Unauthorized);
+        }
         let pause_state = PauseType::new(0);
         env.storage()
             .instance()
@@ -646,9 +905,9 @@ impl EmergencyGuardTrait for DefaultEmergencyGuard {
         Ok(())
     }
 
-    /// Emergency pause all operations (requires multi-sig approval)
+    /// Emergency pause all operations (requires guardian multi-sig approval)
     fn emergency_pause_all(env: &Env, approvers: Vec<Address>) -> Result<(), GuardError> {
-        EmergencyGuard::check_multi_sig(env, &approvers)?;
+        EmergencyGuard::check_guardian_multi_sig(env, &approvers)?;
 
         let mut pause_state = PauseType::new(0);
         pause_state.pause_all();
@@ -914,3 +1173,5 @@ pub trait EmergencyGuardTrait {
     fn get_threshold(env: &Env) -> u32;
     fn is_admin(env: &Env, addr: Address) -> bool;
 }
+
+

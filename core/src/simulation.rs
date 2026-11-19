@@ -249,8 +249,8 @@ impl WasmInstrumenter {
     pub fn instrument(&self, wasm_bytes: &[u8]) -> Result<Vec<u8>, SimulationError> {
         use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
         use wasm_encoder::{
-            CodeSection, ConstExpr, ExportKind, ExportSection, Function, FunctionSection,
-            GlobalSection, GlobalType, Instruction, Module, TypeSection, ValType,
+            CodeSection, ConstExpr, CustomSection, ExportKind, ExportSection, Function,
+            FunctionSection, GlobalSection, GlobalType, Instruction, Module, TypeSection, ValType,
         };
         use wasmparser::{Parser, Payload};
 
@@ -639,11 +639,25 @@ impl WasmInstrumenter {
                 }
 
                 Payload::CustomSection(reader) => {
-                    reencoder
-                        .parse_custom_section(&mut module, reader)
-                        .map_err(|e| {
-                            SimulationError::InvalidContract(format!("Custom section error: {e}"))
-                        })?;
+                    // Custom sections may be standard (e.g. `name`, Soroban metadata)
+                    // or non-standard/arbitrary. We try re-encoding via `RoundtripReencoder`.
+                    // If parsing or re-encoding fails or panics (e.g. malformed Name subsections
+                    // or unknown custom formatting), we fall back to preserving the custom
+                    // section as raw bytes so instrumentation never fails or panics on custom sections.
+                    let reencode_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        reencoder.parse_custom_section(&mut module, reader)
+                    }));
+                    match reencode_res {
+                        Ok(Ok(())) => {}
+                        _ => {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                module.section(&CustomSection {
+                                    name: reader.name().into(),
+                                    data: reader.data().into(),
+                                });
+                            }));
+                        }
+                    }
                 }
 
                 Payload::End(_) => {
@@ -847,6 +861,15 @@ impl CallGraph {
         let mut mermaid = String::from("graph TD\n");
         self.append_mermaid_nodes(&self.root, &mut mermaid, &mut 0);
         mermaid
+    }
+
+    /// Maximum contract-call nesting depth, with the root at depth 1.
+    pub fn max_depth(&self) -> usize {
+        fn node_depth(node: &CallNode) -> usize {
+            1 + node.children.iter().map(node_depth).max().unwrap_or(0)
+        }
+
+        node_depth(&self.root)
     }
 
     fn append_mermaid_nodes(&self, node: &CallNode, mermaid: &mut String, id_gen: &mut usize) {
@@ -1089,6 +1112,8 @@ pub struct SimulationEngine {
     mode: SimulationMode,
     local_runner: Option<Arc<crate::runner::LocalRunner>>,
     rpc_throttle: crate::rpc_throttle::RpcThrottle,
+    /// Maximum total duration (seconds) for retry attempts to prevent indefinite hangs.
+    max_total_retry_duration_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1132,6 +1157,7 @@ impl SimulationEngine {
             mode: SimulationMode::Failover,
             local_runner: None,
             rpc_throttle: Default::default(),
+            max_total_retry_duration_secs: 300,
         }
     }
 
@@ -1151,6 +1177,7 @@ impl SimulationEngine {
             mode,
             local_runner: None,
             rpc_throttle: Default::default(),
+            max_total_retry_duration_secs: 300,
         }
     }
 
@@ -1168,6 +1195,7 @@ impl SimulationEngine {
             mode: SimulationMode::Failover,
             local_runner: None,
             rpc_throttle: Default::default(),
+            max_total_retry_duration_secs: 300,
         }
     }
 
@@ -1194,6 +1222,7 @@ impl SimulationEngine {
             mode,
             local_runner: None,
             rpc_throttle: Default::default(),
+            max_total_retry_duration_secs: 300,
         }
     }
 
@@ -1233,6 +1262,18 @@ impl SimulationEngine {
     /// Get the current request timeout.
     pub fn timeout(&self) -> std::time::Duration {
         self.request_timeout
+    }
+
+    /// Set the maximum total retry duration (in seconds).
+    /// When all retry attempts exceed this duration, the operation fails immediately.
+    pub fn with_max_retry_duration(mut self, secs: u64) -> Self {
+        self.max_total_retry_duration_secs = secs;
+        self
+    }
+
+    /// Get the configured maximum total retry duration in seconds.
+    pub fn max_retry_duration_secs(&self) -> u64 {
+        self.max_total_retry_duration_secs
     }
 
     /// Get the WASM bytes for a contract, checking the cache first.
@@ -2008,6 +2049,9 @@ impl SimulationEngine {
     /// providers aren't starved during warmup. The fallback loop itself
     /// still visits every healthy provider — ordering only controls which
     /// one is attempted first.
+    ///
+    /// The loop enforces a maximum total duration (max_total_retry_duration_secs)
+    /// to prevent indefinite hangs on degraded RPC nodes.
     async fn simulate_transaction_with_failover(
         &self,
         registry: &Arc<ProviderRegistry>,
@@ -2022,8 +2066,21 @@ impl SimulationEngine {
         }
 
         let mut last_error: Option<SimulationError> = None;
+        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(self.max_total_retry_duration_secs);
 
         for provider in &providers {
+            // Check if we've exceeded the maximum total retry duration
+            if std::time::Instant::now() > retry_deadline {
+                tracing::warn!(
+                    max_duration_secs = self.max_total_retry_duration_secs,
+                    "Maximum total retry duration exceeded, failing fast"
+                );
+                return Err(SimulationError::RpcRequestFailed(format!(
+                    "Exceeded maximum retry duration of {} seconds",
+                    self.max_total_retry_duration_secs
+                )));
+            }
+
             tracing::debug!(
                 provider = %provider.name,
                 url = %provider.url,
@@ -3232,7 +3289,18 @@ pub fn profile_contract(
     }
 
     env.mock_all_auths();
-    let contract_id = env.register(&*wasm_bytes, ());
+    let register_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.register(&*wasm_bytes, ())
+    }));
+    let contract_id = match register_result {
+        Ok(id) => id,
+        Err(_) => {
+            return Err(SimulationError::InvalidContract(
+                "Contract registration panicked; WASM may be missing required Soroban metadata or have invalid custom sections"
+                    .to_string(),
+            ));
+        }
+    };
 
     // Build the argument list for the invocation.
     let mut sdk_args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
@@ -3323,26 +3391,27 @@ pub fn profile_contract_with_flamegraph(
     let _enter = span.enter();
 
     // ── Attempt binary instrumentation ───────────────────────────────────────
-    let (instrumented, func_names, use_budget_fallback) = match WasmInstrumenter::new(&wasm_bytes) {
-        Ok(instrumenter) => match instrumenter.instrument(&wasm_bytes) {
-            Ok(bytes) => {
+    let (instrumented, func_names, use_budget_fallback) = match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| {
+            WasmInstrumenter::new(&wasm_bytes).and_then(|instrumenter| {
                 let names = instrumenter.func_names().to_vec();
-                (bytes, names, false)
-            }
-            Err(e) => {
-                tracing::error!(
-                    wasm_size_bytes = wasm_size,
-                    error = %e,
-                    "WASM instrumentation failed; falling back to budget API"
-                );
-                (wasm_bytes.clone(), vec![], true)
-            }
-        },
-        Err(e) => {
+                instrumenter.instrument(&wasm_bytes).map(|bytes| (bytes, names))
+            })
+        }),
+    ) {
+        Ok(Ok((bytes, names))) => (bytes, names, false),
+        Ok(Err(e)) => {
             tracing::error!(
                 wasm_size_bytes = wasm_size,
                 error = %e,
                 "WASM instrumentation failed; falling back to budget API"
+            );
+            (wasm_bytes.clone(), vec![], true)
+        }
+        Err(_) => {
+            tracing::error!(
+                wasm_size_bytes = wasm_size,
+                "WASM instrumentation panicked; falling back to budget API"
             );
             (wasm_bytes.clone(), vec![], true)
         }
@@ -3478,6 +3547,27 @@ pub fn profile_contract_with_flamegraph(
 mod tests {
     use super::*;
     use crate::cache::SimulationCache;
+
+    #[test]
+    fn test_call_graph_max_depth() {
+        let graph = CallGraph {
+            root: CallNode {
+                contract_id: "root".to_string(),
+                function: "invoke".to_string(),
+                children: vec![CallNode {
+                    contract_id: "child".to_string(),
+                    function: "transfer".to_string(),
+                    children: vec![CallNode {
+                        contract_id: "grandchild".to_string(),
+                        function: "authorize".to_string(),
+                        children: Vec::new(),
+                    }],
+                }],
+            },
+        };
+
+        assert_eq!(graph.max_depth(), 3);
+    }
 
     #[test]
     fn test_soroban_resources_default() {
@@ -4637,6 +4727,130 @@ mod tests {
         let parsed_legacy = extract_soroban_budget_from_logs(legacy_logs);
         assert_eq!(parsed_legacy.cpu_instructions, 500000);
         assert_eq!(parsed_legacy.memory_bytes, 250000);
+    }
+
+    fn soroban_wasm_with_custom_sections() -> Vec<u8> {
+        use soroban_sdk::xdr::{Limits, ScEnvMetaEntry, ScEnvMetaEntryInterfaceVersion, WriteXdr};
+        use wasm_encoder::{
+            CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
+            Module, TypeSection, ValType,
+        };
+
+        let meta_entry =
+            ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(ScEnvMetaEntryInterfaceVersion {
+                protocol: 22,
+                pre_release: 0,
+            });
+        let meta_bytes = meta_entry
+            .to_xdr(Limits::none())
+            .expect("XDR encode failed");
+
+        let mut module = Module::new();
+
+        // 1. Custom section before Type section
+        module.section(&CustomSection {
+            name: "contractenvmetav0".into(),
+            data: meta_bytes.as_slice().into(),
+        });
+
+        let mut types = TypeSection::new();
+        types.ty().function([], [ValType::I64]);
+        module.section(&types);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        module.section(&functions);
+
+        let mut exports = ExportSection::new();
+        exports.export("add", ExportKind::Func, 0);
+        module.section(&exports);
+
+        // 2. Custom section between Export and Code sections
+        module.section(&CustomSection {
+            name: "custom_between_export_and_code".into(),
+            data: b"intermediate-data".as_slice().into(),
+        });
+
+        let mut codes = CodeSection::new();
+        let mut f = Function::new(vec![]);
+        f.instruction(&wasm_encoder::Instruction::I64Const(2));
+        f.instruction(&wasm_encoder::Instruction::End);
+        codes.function(&f);
+        module.section(&codes);
+
+        // 3. Custom sections after Code section
+        module.section(&CustomSection {
+            name: "contractmetav0".into(),
+            data: b"\x00\x00\x00\x00".as_slice().into(),
+        });
+        module.section(&CustomSection {
+            name: "custom_tail_payload".into(),
+            data: b"tail-data".as_slice().into(),
+        });
+
+        module.finish()
+    }
+
+    #[test]
+    fn test_wasm_instrumenter_custom_sections_preserved() {
+        let wasm = soroban_wasm_with_custom_sections();
+        let instr = WasmInstrumenter::new(&wasm).expect("instrumenter creation should succeed");
+        let instrumented = instr.instrument(&wasm).expect("instrumentation should succeed");
+        assert!(instrumented.len() > wasm.len());
+
+        // Verify custom sections are present in instrumented binary
+        use wasmparser::{Parser, Payload};
+        let mut custom_names = Vec::new();
+        for payload in Parser::new(0).parse_all(&instrumented) {
+            if let Ok(Payload::CustomSection(reader)) = payload {
+                custom_names.push(reader.name().to_string());
+            }
+        }
+        assert!(custom_names.contains(&"contractenvmetav0".to_string()));
+        assert!(custom_names.contains(&"custom_between_export_and_code".to_string()));
+        assert!(custom_names.contains(&"contractmetav0".to_string()));
+        assert!(custom_names.contains(&"custom_tail_payload".to_string()));
+    }
+
+    #[test]
+    fn test_wasm_instrumenter_malformed_custom_section_does_not_panic() {
+        use wasm_encoder::{CustomSection, Module};
+        let mut wasm = minimal_wasm();
+        // Append a custom section with arbitrary / non-standard name subsection bytes
+        let mut module = Module::new();
+        module.section(&CustomSection {
+            name: "name".into(),
+            data: b"\xff\xff\xff\xff".as_slice().into(),
+        });
+        let custom_bytes = module.finish();
+        wasm.extend_from_slice(&custom_bytes[8..]); // append section to valid wasm
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Ok(instr) = WasmInstrumenter::new(&wasm) {
+                let _ = instr.instrument(&wasm);
+            }
+        }));
+        assert!(result.is_ok(), "instrumentation should never panic on custom sections");
+    }
+
+    #[test]
+    fn test_profile_contract_with_flamegraph_custom_sections_succeeds() {
+        let wasm = soroban_wasm_with_custom_sections();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            profile_contract_with_flamegraph(wasm, "add".to_string(), vec![])
+        }));
+        assert!(result.is_ok(), "profiling must not panic when WASM contains custom sections");
+        let (resources, profile) = result.unwrap().expect("profiling should succeed");
+        assert!(resources.cpu_instructions > 0);
+        assert!(!profile.per_function.is_empty());
+    }
+
+    #[test]
+    fn test_profile_contract_registration_panic_is_handled() {
+        // Corrupt WASM that fails registration
+        let bad_wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let res = profile_contract(bad_wasm, "foo".to_string(), vec![], None, None);
+        assert!(res.is_err(), "should return error rather than panicking");
     }
 }
 

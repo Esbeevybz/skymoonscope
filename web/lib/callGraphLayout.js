@@ -50,6 +50,32 @@ function gasColor(gas) {
   return GAS_COLORS[gasBand(gas)];
 }
 
+/** DFS cycle detection on a call graph whose nodes have `children` arrays. */
+function hasCycle(root) {
+  if (!root || typeof root !== 'object') return false;
+  const visited = new Set();
+  const stack = new Set();
+
+  function dfs(node) {
+    if (!node || typeof node !== 'object') return false;
+    if (stack.has(node)) return true;
+    if (visited.has(node)) return false;
+
+    visited.add(node);
+    stack.add(node);
+
+    const children = Array.isArray(node.children) ? node.children : [];
+    for (const child of children) {
+      if (dfs(child)) return true;
+    }
+
+    stack.delete(node);
+    return false;
+  }
+
+  return dfs(root);
+}
+
 /** Shorten a contract address for display: `CABC1234...WXYZ`. */
 function truncateContractId(contractId) {
   const id = String(contractId || '');
@@ -133,6 +159,12 @@ function layoutNodes(flat) {
  * @returns {{nodes: Array, edges: Array}}
  */
 function buildFlowElements(graph) {
+  const cyclic = hasCycle(graph);
+
+  if (cyclic) {
+    return { nodes: [], edges: [], hasCycle: true };
+  }
+
   const positioned = layoutNodes(flattenGraph(graph));
 
   const nodes = positioned.map((entry) => ({
@@ -177,7 +209,7 @@ function buildFlowElements(graph) {
       };
     });
 
-  return { nodes, edges };
+  return { nodes, edges, hasCycle: cyclic };
 }
 
 /** Format a gas figure compactly, e.g. `250K`. */

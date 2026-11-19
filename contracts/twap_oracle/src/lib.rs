@@ -13,6 +13,12 @@ pub enum Error {
     NotInitialized = 2,
     InvalidPrice = 3,
     InsufficientTimeElapsed = 4,
+    /// A cumulative-price or elapsed-time accumulator would have overflowed.
+    ///
+    /// The TWAP accumulators are `u128`; a long-running feed with a large price
+    /// can exhaust that range, and silently wrapping would corrupt every
+    /// subsequent TWAP. The update is rejected instead (issue #085).
+    ArithmeticOverflow = 5,
 }
 
 /// Storage keys used by the TWAP oracle contract.
@@ -78,8 +84,11 @@ impl TwapOracle {
     /// Updates the TWAP accumulator with a new price.
     /// Only allows updates after the minimum interval has elapsed.
     ///
-    /// Uses u128 accumulators with wrapping arithmetic to prevent overflow panics
-    /// and ensure continuous operation beyond one year.
+    /// Every step of the accumulation — `price * elapsed` and both accumulator
+    /// additions — is checked, and an update that would exceed the `u128` range
+    /// is rejected with [`Error::ArithmeticOverflow`] rather than wrapping. A
+    /// wrapped accumulator would silently poison every later TWAP, so failing
+    /// loudly is the safe behaviour for a long-running feed (issue #085).
     ///
     /// # Parameters
     /// - `e`: Soroban environment.
@@ -90,6 +99,7 @@ impl TwapOracle {
     /// - `Err(Error::NotInitialized)` if not initialized.
     /// - `Err(Error::InvalidPrice)` if price <= 0.
     /// - `Err(Error::InsufficientTimeElapsed)` if not enough time has passed since last update.
+    /// - `Err(Error::ArithmeticOverflow)` if the accumulators would overflow.
     pub fn update_price(e: Env, current_price: i128) -> Result<(), Error> {
         if !e.storage().instance().has(&DataKey::TokenA) {
             return Err(Error::NotInitialized);
@@ -110,7 +120,15 @@ impl TwapOracle {
             .get(&DataKey::MinUpdateIntervalSeconds)
             .unwrap_or(0);
 
-        if last_update > 0 && now - last_update < min_interval {
+        // The very first observation has no preceding price history, so it
+        // contributes no elapsed time. `saturating_sub` keeps a rewound test
+        // ledger from underflowing.
+        let elapsed = if last_update == 0 {
+            0
+        } else {
+            now.saturating_sub(last_update)
+        };
+        if last_update > 0 && elapsed < min_interval {
             return Err(Error::InsufficientTimeElapsed);
         }
 
@@ -122,15 +140,17 @@ impl TwapOracle {
             .unwrap_or(0);
         let total_time: u128 = e.storage().instance().get(&DataKey::TotalTime).unwrap_or(0);
 
-        let elapsed = if last_update == 0 {
-            0
-        } else {
-            now - last_update
-        };
-        let elapsed_u128 = elapsed as u128;
-        // Use wrapping arithmetic for modulo overflow handling per u128 accumulator design.
-        let new_cumulative = cumulative.wrapping_add(last_price.wrapping_mul(elapsed_u128));
-        let new_total_time = total_time.wrapping_add(elapsed_u128);
+        // Checked accumulation: a product or sum that does not fit in u128 aborts
+        // the update instead of wrapping around into a nonsense TWAP.
+        let weighted = last_price
+            .checked_mul(elapsed as u128)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let new_cumulative = cumulative
+            .checked_add(weighted)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let new_total_time = total_time
+            .checked_add(elapsed as u128)
+            .ok_or(Error::ArithmeticOverflow)?;
 
         e.storage()
             .instance()
@@ -157,8 +177,9 @@ impl TwapOracle {
     /// - The TWAP as i128, or 0 if no updates.
     ///
     /// # Safety
-    /// - The `as i128` cast on the division result assumes the TWAP fits within i128.
-    ///   This is safe for all practical token prices given u128 range for the accumulator.
+    /// - The accumulator is `u128` while the reported price is `i128`, so the
+    ///   quotient is converted with `try_from` and saturates at `i128::MAX`
+    ///   rather than wrapping round to a negative price (issue #85).
     pub fn get_twap(e: Env) -> i128 {
         let cumulative: u128 = e
             .storage()
@@ -169,7 +190,7 @@ impl TwapOracle {
         if total_time == 0 {
             0
         } else {
-            (cumulative / total_time) as i128
+            i128::try_from(cumulative / total_time).unwrap_or(i128::MAX)
         }
     }
 

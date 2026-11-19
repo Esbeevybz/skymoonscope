@@ -8,8 +8,9 @@
 //!   - `x-Sky Moon Scope-timestamp` — Unix timestamp (seconds) as an ASCII integer.
 //!   - `x-Sky Moon Scope-delivery` — opaque delivery UUID (validated for presence only).
 //!
-//! **Replay protection:** timestamps older than [`MAX_TIMESTAMP_SKEW_SECS`] are
-//! rejected. This bounds the window in which a stolen signature can be reused.
+//! **Replay protection:** timestamps outside [`MAX_TIMESTAMP_SKEW_SECS`] are
+//! rejected, and delivery nonces plus authenticated signatures are cached for
+//! the same window.
 //!
 //! **Constant-time comparison:** signature bytes are compared with
 //! [`hmac::Mac::verify_slice`], which is constant-time by construction and avoids
@@ -17,8 +18,8 @@
 //!
 //! # Complexity
 //!
-//! - Time: `O(n)` in the byte length of the request body — one HMAC pass.
-//! - Space: `O(1)` extra allocation beyond the body that Axum already holds.
+//! - Time: `O(n)` in the byte length of the request body, plus cache cleanup.
+//! - Space: `O(r)` for `r` deliveries still inside the replay window.
 //!
 //! # Usage
 //!
@@ -41,7 +42,8 @@ use axum::{
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::{
-    sync::Arc,
+    collections::HashMap,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -63,6 +65,30 @@ pub const MAX_TIMESTAMP_SKEW_SECS: u64 = 300;
 /// Server-side pre-shared secret injected as an Axum [`Extension`].
 #[derive(Clone)]
 pub struct InboundWebhookSecret(pub Arc<String>);
+
+/// Shared cache of delivery nonces accepted during the timestamp window.
+#[derive(Clone, Default)]
+pub struct InboundWebhookNonceCache {
+    nonces: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl InboundWebhookNonceCache {
+    fn check_and_store(&self, nonce: String, signature: String, now_secs: u64) -> bool {
+        let mut nonces = self.nonces.lock().expect("webhook nonce cache poisoned");
+        nonces.retain(|_, expires_at| *expires_at > now_secs);
+
+        let nonce_key = format!("nonce:{nonce}");
+        let signature_key = format!("signature:{signature}");
+        if nonces.contains_key(&nonce_key) || nonces.contains_key(&signature_key) {
+            return false;
+        }
+
+        let expires_at = now_secs.saturating_add(MAX_TIMESTAMP_SKEW_SECS);
+        nonces.insert(nonce_key, expires_at);
+        nonces.insert(signature_key, expires_at);
+        true
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Extractor
@@ -109,9 +135,13 @@ where
             .ok_or(WebhookValidationError::MissingHeader(SIGNATURE_HEADER))?
             .to_owned();
 
-        req.headers()
+        let delivery_id = req
+            .headers()
             .get(DELIVERY_HEADER)
-            .ok_or(WebhookValidationError::MissingHeader(DELIVERY_HEADER))?;
+            .and_then(|v| v.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .ok_or(WebhookValidationError::MissingHeader(DELIVERY_HEADER))?
+            .to_owned();
 
         // 3. Validate timestamp freshness.
         let request_ts: u64 = timestamp_val
@@ -129,6 +159,12 @@ where
             return Err(WebhookValidationError::TimestampExpired);
         }
 
+        let nonce_cache = req
+            .extensions()
+            .get::<InboundWebhookNonceCache>()
+            .cloned()
+            .ok_or(WebhookValidationError::MissingNonceCache)?;
+
         // 4. Buffer the body.
         let body = Bytes::from_request(req, state)
             .await
@@ -137,6 +173,10 @@ where
         // 5. Verify HMAC-SHA256 signature in constant time.
         if !verify_signature(&secret, &timestamp_val, &body, &signature_val) {
             return Err(WebhookValidationError::InvalidSignature);
+        }
+
+        if !nonce_cache.check_and_store(delivery_id, signature_val, now_secs) {
+            return Err(WebhookValidationError::NonceAlreadyUsed);
         }
 
         Ok(Self(body))
@@ -187,6 +227,10 @@ pub enum WebhookValidationError {
     BodyReadError,
     /// The pre-shared secret is not configured.
     MissingSecret,
+    /// The shared replay-protection cache is not configured.
+    MissingNonceCache,
+    /// The delivery nonce was already accepted during the replay window.
+    NonceAlreadyUsed,
 }
 
 impl IntoResponse for WebhookValidationError {
@@ -215,6 +259,14 @@ impl IntoResponse for WebhookValidationError {
             Self::MissingSecret => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Inbound webhook secret not configured".to_string(),
+            ),
+            Self::MissingNonceCache => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Inbound webhook nonce cache not configured".to_string(),
+            ),
+            Self::NonceAlreadyUsed => (
+                StatusCode::UNAUTHORIZED,
+                "Webhook delivery nonce has already been used".to_string(),
             ),
         };
 
@@ -285,7 +337,8 @@ mod tests {
                     StatusCode::OK
                 }),
             )
-            .layer(Extension(InboundWebhookSecret(secret)));
+            .layer(Extension(InboundWebhookSecret(secret)))
+            .layer(Extension(InboundWebhookNonceCache::default()));
 
         let ts = now_str();
         let sig = format!("sha256={}", sign(SECRET, &ts, BODY));
@@ -304,6 +357,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extractor_rejects_reused_delivery_nonce() {
+        let secret = Arc::new(SECRET.to_string());
+        let app = Router::new()
+            .route(
+                "/test",
+                post(|ValidatedWebhook(_): ValidatedWebhook| async move { StatusCode::OK }),
+            )
+            .layer(Extension(InboundWebhookSecret(secret)))
+            .layer(Extension(InboundWebhookNonceCache::default()));
+
+        let ts = now_str();
+        let sig = format!("sha256={}", sign(SECRET, &ts, BODY));
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/test")
+                .header(TIMESTAMP_HEADER, &ts)
+                .header(SIGNATURE_HEADER, &sig)
+                .header(DELIVERY_HEADER, "reused-delivery-id")
+                .body(Body::from(BODY))
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app.oneshot(request()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn extractor_rejects_missing_headers() {
         let secret = Arc::new(SECRET.to_string());
         let app = Router::new()
@@ -311,7 +395,8 @@ mod tests {
                 "/test",
                 post(|ValidatedWebhook(_): ValidatedWebhook| async move { StatusCode::OK }),
             )
-            .layer(Extension(InboundWebhookSecret(secret)));
+            .layer(Extension(InboundWebhookSecret(secret)))
+            .layer(Extension(InboundWebhookNonceCache::default()));
 
         let ts = now_str();
         let sig = format!("sha256={}", sign(SECRET, &ts, BODY));
@@ -349,7 +434,8 @@ mod tests {
                 "/test",
                 post(|ValidatedWebhook(_): ValidatedWebhook| async move { StatusCode::OK }),
             )
-            .layer(Extension(InboundWebhookSecret(secret)));
+            .layer(Extension(InboundWebhookSecret(secret)))
+            .layer(Extension(InboundWebhookNonceCache::default()));
 
         let expired_ts = (SystemTime::now()
             .duration_since(UNIX_EPOCH)

@@ -6,6 +6,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Wallet, Check, AlertCircle } from "lucide-react";
 import React from "react";
 import UserIcon from "./userIcon";
+import { debugError } from "../lib/debugUtils";
 
 export function WalletModal() {
   const {
@@ -32,7 +33,7 @@ export function WalletModal() {
         await connect(activeSelection);
       } catch (err) {
         // Error is handled in context
-        console.error("Connection error:", err);
+        debugError("Connection error:", err);
       }
     }
   };

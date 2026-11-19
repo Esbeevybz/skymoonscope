@@ -124,26 +124,29 @@ export async function fetchFeeStats(rpcUrl: string): Promise<FeeStatsResponse> {
 }
 
 export enum FeeBumpLevel {
-  LOW = 'low',
-  MEDIUM = 'medium',
-  HIGH = 'high',
+  ECONOMY = 'economy',
+  STANDARD = 'standard',
+  FAST = 'fast',
 }
 
-const BUMP_CONFIG: Record<FeeBumpLevel, { label: string; multiplier: number; description: string }> = {
-  [FeeBumpLevel.LOW]: {
-    label: 'Low (Min)',
+const BUMP_CONFIG: Record<FeeBumpLevel, { label: string; multiplier: number; description: string; estimatedTime: string }> = {
+  [FeeBumpLevel.ECONOMY]: {
+    label: 'Economy',
     multiplier: 1.0,
-    description: 'Minimum fee, slower confirmation',
+    description: 'Lowest cost, may take longer to confirm',
+    estimatedTime: '~30-60s',
   },
-  [FeeBumpLevel.MEDIUM]: {
-    label: 'Medium',
+  [FeeBumpLevel.STANDARD]: {
+    label: 'Standard',
     multiplier: 1.5,
-    description: 'Balanced speed and cost',
+    description: 'Balanced speed and cost for most use cases',
+    estimatedTime: '~15-30s',
   },
-  [FeeBumpLevel.HIGH]: {
-    label: 'High',
+  [FeeBumpLevel.FAST]: {
+    label: 'Fast',
     multiplier: 2.0,
-    description: 'Priority processing',
+    description: 'Priority processing for quick confirmation',
+    estimatedTime: '~5-15s',
   },
 };
 
@@ -169,6 +172,7 @@ export function estimateFees(
       feeStroops,
       feeXlm: stroopsToXlm(feeStroops),
       description: cfg.description,
+      estimatedTime: cfg.estimatedTime,
     };
   });
 
@@ -179,10 +183,44 @@ export function estimateFees(
     totalFeeXlm: stroopsToXlm(baseTotal),
     feeBumps,
     networkFees: {
-      low: feeBumps[0].feeStroops,
-      medium: feeBumps[1].feeStroops,
-      high: feeBumps[2].feeStroops,
+      economy: feeBumps[0].feeStroops,
+      standard: feeBumps[1].feeStroops,
+      fast: feeBumps[2].feeStroops,
     },
     surgeMultiplier,
+  };
+}
+
+/**
+ * Fetch fee stats from both testnet and mainnet simultaneously
+ * and return a comparison of the estimated fees
+ */
+export async function fetchFeeComparison(
+  resourceCostStroops: number,
+  testnetRpcUrl: string,
+  mainnetRpcUrl: string,
+): Promise<import('./sorobantypes').NetworkFeeComparison> {
+  const [testnetStats, mainnetStats] = await Promise.allSettled([
+    fetchFeeStats(testnetRpcUrl),
+    fetchFeeStats(mainnetRpcUrl),
+  ]);
+
+  const testnetFeeStats = testnetStats.status === 'fulfilled' ? testnetStats.value : null;
+  const mainnetFeeStats = mainnetStats.status === 'fulfilled' ? mainnetStats.value : null;
+
+  const testnetEstimate = estimateFees(resourceCostStroops, testnetFeeStats);
+  const mainnetEstimate = estimateFees(resourceCostStroops, mainnetFeeStats);
+
+  // Calculate percentage difference (mainnet relative to testnet)
+  const percentageDifference =
+    testnetEstimate.totalFeeStroops > 0
+      ? ((mainnetEstimate.totalFeeStroops - testnetEstimate.totalFeeStroops) / testnetEstimate.totalFeeStroops) * 100
+      : 0;
+
+  return {
+    testnet: testnetEstimate,
+    mainnet: mainnetEstimate,
+    percentageDifference,
+    testnetHigher: testnetEstimate.totalFeeStroops > mainnetEstimate.totalFeeStroops,
   };
 }

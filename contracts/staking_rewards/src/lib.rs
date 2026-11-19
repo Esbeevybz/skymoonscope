@@ -2,8 +2,8 @@
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
 
 use emergency_guard::{DefaultEmergencyGuard, EmergencyGuard, EmergencyGuardTrait, PauseType};
-pub use Sky Moon Scope_error_codes::ContractError;
-use Sky Moon Scope_math::Fixed;
+pub use error_codes::ContractError;
+use math::Fixed;
 
 pub const SCALE: i128 = 1_000_000_000_000_000_000; // 18 decimals
 
@@ -374,7 +374,7 @@ impl StakingRewards {
         // (e.g. PauseType::CLAIM_REWARDS) can be toggled by the owner.
         // Threshold of 1 means the single owner can trigger any pause.
         let admins = soroban_sdk::vec![&e, config.owner.clone()];
-        EmergencyGuard::initialize(e, admins, 1).map_err(|_| ContractError::AlreadyInitialized)?;
+        EmergencyGuard::initialize(e, admins, 1, config.owner.clone()).map_err(|_| ContractError::AlreadyInitialized)?;
 
         Ok(())
     }

@@ -22,6 +22,12 @@ pub enum Error {
     InvalidCommitment = 8,
     DepositKeyAlreadyUsed = 9,
     DepositKeyExists = 10,
+    /// The submitted proof was empty, so there was nothing to verify (#078).
+    EmptyProof = 11,
+    /// This exact proof has already been accepted for a different statement.
+    ProofAlreadyUsed = 12,
+    /// The configured verifier is not a usable address.
+    VerifierNotConfigured = 13,
 }
 
 /// Stealth meta-address published by a receiver (spend + view public keys).
@@ -81,6 +87,9 @@ pub enum DataKey {
     DepositKeyUsed(BytesN<32>),
     DepositKeyOwner(BytesN<32>),
     StealthMeta(Address),
+    /// Digest of a proof already spent, keyed by H(proof).  A proof is a
+    /// one-time artifact, so a second use is rejected (#078).
+    UsedProof(BytesN<32>),
 }
 
 #[contractclient(name = "Groth16VerifierClient")]
@@ -95,6 +104,14 @@ pub trait Groth16Verifier {
 
 fn zero_bytes(env: &Env) -> BytesN<32> {
     BytesN::from_array(env, &[0; 32])
+}
+
+/// The all-zero account address, which is never a usable contract to call.
+fn zero_address(env: &Env) -> Address {
+    Address::from_string(&soroban_sdk::String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ))
 }
 
 fn read_current_root(env: &Env) -> Result<BytesN<32>, Error> {
@@ -179,6 +196,33 @@ fn require_admin(env: &Env) -> Result<Address, Error> {
 fn require_nonzero_commitment(env: &Env, commitment: &BytesN<32>) -> Result<(), Error> {
     if *commitment == zero_bytes(env) {
         return Err(Error::InvalidCommitment);
+    }
+    Ok(())
+}
+
+/// Digest identifying a proof, recorded so it can never be spent twice.
+///
+/// The circuit's public inputs are already committed by `statement_hash`, but
+/// the proof bytes are not, and a proof is a one-time artifact: the same bytes
+/// can only ever witness one transition.  Keying on the proof alone — rather
+/// than on `(public_input_hash, proof)` — is what makes that hold, because a
+/// digest over the pair would simply differ for each new statement and a
+/// replayed proof would sail through (#078).
+fn proof_digest(env: &Env, proof: &Bytes) -> BytesN<32> {
+    sha256_32(env, proof)
+}
+
+/// Structural checks the contract applies itself, before the verifier is asked.
+///
+/// A proof that is empty, or a verifier that was never set to a real address,
+/// must never be able to reach a `true` answer from anywhere — least of all
+/// from a stub that accepts unconditionally (#078).
+fn validate_proof_material(env: &Env, verifier: &Address, proof: &Bytes) -> Result<(), Error> {
+    if proof.is_empty() {
+        return Err(Error::EmptyProof);
+    }
+    if *verifier == zero_address(env) {
+        return Err(Error::VerifierNotConfigured);
     }
     Ok(())
 }
@@ -275,11 +319,34 @@ impl PrivateTransferContract {
         verification_key_hash: BytesN<32>,
     ) -> Result<(), Error> {
         require_admin(&env)?;
+        // Refuse to install an unusable verifier: a zero address would make
+        // every later transfer unverifiable rather than obviously invalid (#078).
+        if verifier == zero_address(&env) {
+            return Err(Error::VerifierNotConfigured);
+        }
         env.storage().instance().set(&DataKey::Verifier, &verifier);
         env.storage()
             .instance()
             .set(&DataKey::VerificationKeyHash, &verification_key_hash);
         Ok(())
+    }
+
+    /// The configured proof verifier and its verification-key hash.
+    ///
+    /// Exposed so integrators can confirm which circuit the pool is actually
+    /// checking against before relaying a transfer (#078).
+    pub fn verifier_config(env: Env) -> Result<(Address, BytesN<32>), Error> {
+        let verifier: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Verifier)
+            .ok_or(Error::NotInitialized)?;
+        let vk: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::VerificationKeyHash)
+            .ok_or(Error::NotInitialized)?;
+        Ok((verifier, vk))
     }
 
     pub fn current_root(env: Env) -> Result<BytesN<32>, Error> {
@@ -411,10 +478,6 @@ impl PrivateTransferContract {
             return Err(Error::InvalidRoot);
         }
 
-        let current_root = read_current_root(&env)?;
-        let next_root = next_root_for_transfer(&env, &transfer.old_root, &transfer);
-        let public_input_hash = statement_hash(&env, &transfer, &next_root);
-
         let verifier: Address = env
             .storage()
             .instance()
@@ -425,6 +488,23 @@ impl PrivateTransferContract {
             .instance()
             .get(&DataKey::VerificationKeyHash)
             .ok_or(Error::NotInitialized)?;
+
+        // The contract refuses obviously-unverifiable material on its own, so a
+        // missing or accept-anything verifier can never mint a valid state
+        // transition (#078).
+        validate_proof_material(&env, &verifier, &proof)?;
+
+        let current_root = read_current_root(&env)?;
+        let next_root = next_root_for_transfer(&env, &transfer.old_root, &transfer);
+        let public_input_hash = statement_hash(&env, &transfer, &next_root);
+
+        // A proof is single-use: recording its digest means resubmitting the same
+        // bytes against any later statement is rejected (#078).
+        let digest_key = DataKey::UsedProof(proof_digest(&env, &proof));
+        if env.storage().persistent().get(&digest_key).unwrap_or(false) {
+            return Err(Error::ProofAlreadyUsed);
+        }
+
         let valid = Groth16VerifierClient::new(&env, &verifier).verify(
             &verification_key_hash,
             &public_input_hash,
@@ -434,6 +514,7 @@ impl PrivateTransferContract {
             return Err(Error::ProofVerificationFailed);
         }
 
+        env.storage().persistent().set(&digest_key, &true);
         consume_deposit_key_if_registered(&env, &transfer.recipient_update.commitment)?;
 
         let leaf_index_start = Self::next_leaf_index(env.clone());

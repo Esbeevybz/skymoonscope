@@ -3,7 +3,7 @@ import { Head, Html, Main, NextScript } from "next/document";
 const themeInitializer = `
 (function() {
   try {
-    var storageKey = "theme";
+    var storageKey = "skyMoonScope-theme";
     var defaultTheme = "dark";
     var theme = localStorage.getItem(storageKey) || defaultTheme;
 
@@ -12,8 +12,7 @@ const themeInitializer = `
     }
 
     var root = document.documentElement;
-    root.classList.remove("light", "dark");
-    root.classList.add(theme);
+    root.setAttribute("data-theme", theme);
     root.style.colorScheme = theme;
   } catch (_) {}
 })();

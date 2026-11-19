@@ -16,10 +16,10 @@ use crate::jobs::{JobStatus as CoreJobStatus, JobType as CoreJobType};
 use crate::simulation::{SimulationEngine, SorobanResources};
 
 /// The Sky Moon Scope-core GraphQL schema: query-only (no mutations/subscriptions).
-pub type Sky Moon ScopeSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
+pub type SkyMoonScopeSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 
 /// Build the schema, wiring in the data sources resolvers read from.
-pub fn build_schema(job_queue: JobQueue, engine: SimulationEngine) -> Sky Moon ScopeSchema {
+pub fn build_schema(job_queue: JobQueue, engine: SimulationEngine) -> SkyMoonScopeSchema {
     Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
         .data(job_queue)
         .data(engine)
@@ -279,7 +279,8 @@ mod tests {
             progress_message: "Completed".to_string(),
             webhook_url: None,
             webhook_headers: None,
-            webhook_secret: None,
+            webhook_secret_hash: None,
+            webhook_secret_salt: None,
             error_message: None,
             error_type: None,
             timeout_secs: 300,

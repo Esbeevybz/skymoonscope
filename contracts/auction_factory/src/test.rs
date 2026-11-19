@@ -164,6 +164,87 @@ fn test_factory_deploys_auctions_collects_fees_and_indexes_them() {
     );
     assert_eq!(client.get_auction_type(&dutch), Some(AuctionType::Dutch));
     assert_eq!(client.get_auctions(&0, &10), vec![&env, english, dutch]);
+
+    // Issue #084: deployments are mirrored into the `instance` registry so the
+    // factory owner can enumerate them from a single read.
+    assert_eq!(client.get_instance_count(), 2);
+    assert_eq!(client.get_instances(), vec![&env, english, dutch]);
+    assert!(client.is_instance(&english));
+    assert!(client.is_instance(&dutch));
+    assert!(!client.is_instance(&seller));
+    assert_eq!(client.get_instance_capacity(), MAX_TRACKED_AUCTIONS - 2);
+}
+
+#[test]
+fn test_instance_registry_starts_empty() {
+    let (env, client, _admins) = setup(1, 1);
+
+    assert_eq!(client.get_instance_count(), 0);
+    assert_eq!(client.get_instances(), vec![&env]);
+    assert!(!client.is_instance(&Address::generate(&env)));
+    assert_eq!(client.get_instance_capacity(), MAX_TRACKED_AUCTIONS);
+}
+
+/// Deployments are recorded in the factory's instance-scoped `Vec<Address>`
+/// registry, so the owner can enumerate every auction it has deployed.
+#[test]
+fn test_factory_tracks_deployed_auctions_in_instance_storage() {
+    let (env, client, admins) = setup(1, 1);
+    let seller = Address::generate(&env);
+    let fee_recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let fee_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let nft_token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    token::StellarAssetClient::new(&env, &fee_token).mint(&seller, &100);
+    token::StellarAssetClient::new(&env, &nft_token).mint(&seller, &1);
+    client.configure_deployment_fee(&admins, &fee_token, &fee_recipient, &50);
+
+    // Nothing deployed yet.
+    assert_eq!(client.get_deployed_auction_count(), 0);
+    assert!(client.get_deployed_auctions().is_empty());
+
+    let english = client.create_english_auction(
+        &seller,
+        &nft_token,
+        &1,
+        &fee_token,
+        &100,
+        &200,
+        &10,
+        &english_wasm_hash(&env),
+    );
+    let dutch = client.create_dutch_auction(
+        &seller,
+        &nft_token,
+        &1,
+        &fee_token,
+        &200,
+        &100,
+        &10,
+        &dutch_wasm_hash(&env),
+    );
+
+    // The instance registry is updated on every deployment, in order.
+    let deployed = client.get_deployed_auctions();
+    assert_eq!(deployed.len(), 2);
+    assert_eq!(deployed.get(0).unwrap(), english);
+    assert_eq!(deployed.get(1).unwrap(), dutch);
+    assert_eq!(client.get_deployed_auction_count(), 2);
+
+    assert_eq!(client.is_deployed_auction(&english), true);
+    assert_eq!(client.is_deployed_auction(&dutch), true);
+    assert_eq!(client.is_deployed_auction(&Address::generate(&env)), false);
+
+    // The registry agrees with the persistent index.
+    assert_eq!(
+        client.get_deployed_auction_count(),
+        client.get_auction_count()
+    );
 }
 
 #[test]

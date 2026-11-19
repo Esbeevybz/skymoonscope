@@ -105,6 +105,26 @@ impl AuthState {
         self.emergency_verification_paused
             .store(paused, Ordering::SeqCst);
     }
+
+    pub fn validate_token(&self, token: &str) -> Result<(), AppError> {
+        if self.is_verification_paused() {
+            return Err(AppError::Internal(
+                "Authentication is temporarily paused for emergency maintenance".into(),
+            ));
+        }
+
+        let validation = Validation::new(Algorithm::RS256);
+        let token_data = decode::<Claims>(token, &self.decoding_key, &validation)
+            .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
+
+        if !token_data.claims.scopes.contains(&"simulate".to_string()) {
+            return Err(AppError::Unauthorized(
+                "Missing required scope 'simulate'".into(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -484,13 +504,6 @@ pub async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    // Check if verification is paused — deny all requests during emergency maintenance
-    if state.is_verification_paused() {
-        return Err(AppError::Internal(
-            "Authentication is temporarily paused for emergency maintenance".into(),
-        ));
-    }
-
     let auth_header = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -501,15 +514,7 @@ pub async fn auth_middleware(
         .strip_prefix("Bearer ")
         .ok_or_else(|| AppError::Unauthorized("Expected Bearer token".into()))?;
 
-    let validation = Validation::new(Algorithm::RS256);
-    let token_data = decode::<Claims>(token, &state.decoding_key, &validation)
-        .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
-
-    if !token_data.claims.scopes.contains(&"simulate".to_string()) {
-        return Err(AppError::Unauthorized(
-            "Missing required scope 'simulate'".into(),
-        ));
-    }
+    state.validate_token(token)?;
 
     Ok(next.run(req).await)
 }

@@ -89,3 +89,35 @@ pub fn approval_count(bitmap: u32) -> u32 {
 pub fn has_quorum(bitmap: u32) -> bool {
     approval_count(bitmap) >= REQUIRED_APPROVALS
 }
+
+// ── Guardian Rotation Timelock Delay ──────────────────────────
+
+pub const DEFAULT_ROTATION_DELAY_LEDGERS: u32 = 100;
+
+pub fn read_rotation_delay(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get(&DataKey::RotationDelayLedgers)
+        .unwrap_or(DEFAULT_ROTATION_DELAY_LEDGERS)
+}
+
+pub fn write_rotation_delay(e: &Env, delay: u32) {
+    e.storage()
+        .instance()
+        .set(&DataKey::RotationDelayLedgers, &delay);
+}
+
+pub fn read_pending_rotation(e: &Env) -> Option<crate::storage_types::PendingGuardianRotation> {
+    e.storage().instance().get(&DataKey::PendingRotation)
+}
+
+pub fn write_pending_rotation(
+    e: &Env,
+    proposal: &crate::storage_types::PendingGuardianRotation,
+) {
+    e.storage().instance().set(&DataKey::PendingRotation, proposal);
+}
+
+pub fn clear_pending_rotation(e: &Env) {
+    e.storage().instance().remove(&DataKey::PendingRotation);
+}

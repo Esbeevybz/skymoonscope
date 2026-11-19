@@ -25,6 +25,23 @@ export interface WasmImportEntry {
   kind: string;
 }
 
+export interface WasmDataSegment {
+  /** Zero-based index within the data section. */
+  index: number;
+  /** "active" | "passive" | "unknown(n)" */
+  kind: string;
+  /** Target linear memory index; null for passive segments. */
+  memoryIndex: number | null;
+  /**
+   * Decoded i32.const offset for active segments with a simple constant
+   * expression; null when the offset uses a more complex expression (e.g.,
+   * global.get) or when the segment is passive.
+   */
+  offsetValue: number | null;
+  /** Byte length of the initialisation data. */
+  byteLength: number;
+}
+
 export interface WasmValidationReport {
   valid: boolean;
   byteLength: number;
@@ -32,6 +49,8 @@ export interface WasmValidationReport {
   sections: WasmSectionSummary[];
   exports: WasmExportEntry[];
   imports: WasmImportEntry[];
+  dataSegments: WasmDataSegment[];
+  sorobanMeta?: import('./sorobanMeta').SorobanMetaDecodeResult;
   errors: string[];
   warnings: string[];
   durationMs: number;
@@ -52,6 +71,12 @@ export declare function readVarUint32(
 export declare function parseWasmSections(
   input: ArrayBuffer | Uint8Array,
 ): Array<WasmSectionSummary & { start: number; end: number }>;
+
+export declare function parseDataSection(
+  bytes: Uint8Array,
+  start: number,
+  end: number,
+): WasmDataSegment[];
 
 export declare function validateWasmModule(
   input: ArrayBuffer | Uint8Array | number[],

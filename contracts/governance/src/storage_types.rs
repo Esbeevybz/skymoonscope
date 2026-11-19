@@ -1,6 +1,6 @@
 use soroban_sdk::{contracttype, Address, String, Vec};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq))
 #[contracttype]
 pub enum ProposalState {
     Draft,
@@ -11,7 +11,7 @@ pub enum ProposalState {
     Vetoed,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 #[contracttype]
 pub struct ProposalAction {
     pub contract_id: Address,
@@ -19,7 +19,7 @@ pub struct ProposalAction {
     pub args: Vec<String>, // Simplified, in real implementation might need proper types
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 #[contracttype]
 pub struct Proposal {
     pub id: u32,
@@ -37,7 +37,7 @@ pub struct Proposal {
     pub quorum_required: i128,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 #[contracttype]
 pub struct GovernanceConfig {
     pub admin: Address,
@@ -47,7 +47,7 @@ pub struct GovernanceConfig {
     pub proposal_count: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 #[contracttype]
 pub enum DataKey {
     Proposal(u32),
@@ -60,4 +60,26 @@ pub enum DataKey {
     Voters,
     VotingPowerSnapshot(u32, Address),
     TotalVotingPowerSnapshot(u32),
+    // Stores the full proposal record for a given proposal id so two
+    /+ versions can be compared side-by-side.
+    ProposalVersion(u32, u32),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+#[contracttype]
+pub struct ProposalComparison {
+    pub proposal_id: u32,
+    pub version_a: u32,
+    pub version_b: u32,
+    pub title_changed: bool,
+    pub description_changed: bool,
+    pub actions_changed: bool,
+    pub state_changed: bool,
+    pub for_votes_changed: bool,
+    pub against_votes_changed: bool,
+    pub actions_added: u32,
+    pub actions_removed: u32,
+    pub actions_modified: u32,
+    pub same_actions: bool,
+    pub identical: bool,
 }
