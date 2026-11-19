@@ -2558,29 +2558,39 @@ async fn main() {
 
         let leader_redis_client = redis::Client::open(config.redis_url.as_str())
             .expect("Failed to create Redis client for leader lock");
-        let leader_lock = Arc::new(leader_lock::RedisLeaderLock::new(
+        let leader_lock = leader_lock::RedisLeaderLock::new(
             leader_redis_client,
             "sky-moon-scope:leader:fee_collector",
             std::time::Duration::from_secs(config.fee_collection_interval_secs.max(1) * 3),
-        ));
-
-        let collector = Arc::new(FeeCollector::new(
-            Arc::clone(&registry),
-            Arc::clone(&fee_store),
-            collector_config,
-            Arc::clone(&metrics),
-            leader_lock,
-        ));
-
-        let fee_shutdown = shutdown_tx.subscribe();
-        worker_handles.push(tokio::spawn(async move {
-            collector.run_collection_loop(fee_shutdown).await;
-        }));
-
-        tracing::info!(
-            interval_secs = config.fee_collection_interval_secs,
-            "Fee market collector started"
         );
+        match leader_lock.load_scripts().await {
+            Ok(()) => {
+                let collector = Arc::new(FeeCollector::new(
+                    Arc::clone(&registry),
+                    Arc::clone(&fee_store),
+                    collector_config,
+                    Arc::clone(&metrics),
+                    Arc::new(leader_lock),
+                ));
+
+                let fee_shutdown = shutdown_tx.subscribe();
+                worker_handles.push(tokio::spawn(async move {
+                    collector.run_collection_loop(fee_shutdown).await;
+                }));
+
+                tracing::info!(
+                    interval_secs = config.fee_collection_interval_secs,
+                    "Fee market collector started"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    severity = "critical",
+                    error = %error,
+                    "Redis scripting unavailable; fee market leader election is disabled"
+                );
+            }
+        }
 
         // Schedule periodic cleanup of old fee data
         let cleanup_store = Arc::clone(&fee_store);

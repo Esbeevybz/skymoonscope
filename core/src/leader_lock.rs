@@ -31,6 +31,21 @@ else
 end
 "#;
 
+const RENEW_SCRIPT_SHA: &str = "9d70d8566d8043418770b1952c5d93613a3d574f";
+const RELEASE_SCRIPT_SHA: &str = "aefc6bbfaac1ed02c135d12b12c8c42cdfb36af4";
+
+#[derive(Debug, thiserror::Error)]
+pub enum LeaderLockInitError {
+    #[error("Redis scripting command failed: {0}")]
+    Redis(#[from] redis::RedisError),
+    #[error("{script} script SHA mismatch: expected {expected}, got {actual}")]
+    ShaMismatch {
+        script: &'static str,
+        expected: &'static str,
+        actual: String,
+    },
+}
+
 /// A renewable Redis lease used to elect a single leader across instances.
 pub struct RedisLeaderLock {
     redis: RedisClient,
@@ -51,6 +66,38 @@ impl RedisLeaderLock {
             ttl_ms,
             lease_deadline: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Load and validate the Lua scripts before starting leader election.
+    pub async fn load_scripts(&self) -> Result<(), LeaderLockInitError> {
+        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let renew_sha: String = redis::cmd("SCRIPT")
+            .arg("LOAD")
+            .arg(RENEW_SCRIPT)
+            .query_async(&mut conn)
+            .await?;
+        if renew_sha != RENEW_SCRIPT_SHA {
+            return Err(LeaderLockInitError::ShaMismatch {
+                script: "renew",
+                expected: RENEW_SCRIPT_SHA,
+                actual: renew_sha,
+            });
+        }
+
+        let release_sha: String = redis::cmd("SCRIPT")
+            .arg("LOAD")
+            .arg(RELEASE_SCRIPT)
+            .query_async(&mut conn)
+            .await?;
+        if release_sha != RELEASE_SCRIPT_SHA {
+            return Err(LeaderLockInitError::ShaMismatch {
+                script: "release",
+                expected: RELEASE_SCRIPT_SHA,
+                actual: release_sha,
+            });
+        }
+
+        Ok(())
     }
 
     /// Attempt to become (or remain) leader. Returns `true` if this
@@ -82,13 +129,23 @@ impl RedisLeaderLock {
         let renewed: i64 = if expired {
             0
         } else {
-            redis::Script::new(RENEW_SCRIPT)
+            match redis::Script::new(RENEW_SCRIPT)
                 .key(&self.key)
                 .arg(&self.token)
                 .arg(self.ttl_ms)
                 .invoke_async(&mut conn)
                 .await
-                .unwrap_or(0)
+            {
+                Ok(renewed) => renewed,
+                Err(error) => {
+                    tracing::error!(
+                        severity = "critical",
+                        error = %error,
+                        "Leader lease renewal script failed"
+                    );
+                    return false;
+                }
+            }
         };
 
         if renewed == 1 {
@@ -124,15 +181,21 @@ impl RedisLeaderLock {
     /// expires after `ttl` and another instance takes over.
     #[allow(dead_code)]
     pub async fn release(&self) {
-        *self.last_acquired_at.lock().unwrap() = None;
         let Ok(mut conn) = self.redis.get_multiplexed_async_connection().await else {
             return;
         };
-        let _: Result<i64, _> = redis::Script::new(RELEASE_SCRIPT)
+        let released: Result<i64, _> = redis::Script::new(RELEASE_SCRIPT)
             .key(&self.key)
             .arg(&self.token)
             .invoke_async(&mut conn)
             .await;
+        if let Err(error) = released {
+            tracing::error!(
+                severity = "critical",
+                error = %error,
+                "Leader lease release script failed"
+            );
+        }
         *self
             .lease_deadline
             .lock()
@@ -162,42 +225,5 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(lock.ttl_ms, 1);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lease_local_validity_and_expiry() {
-        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
-        let lock = RedisLeaderLock::new(client, "test_key", Duration::from_millis(100));
-
-        assert!(!lock.is_lease_locally_valid());
-        assert!(lock.last_acquired_instant().is_none());
-
-        // Simulate acquisition
-        *lock.last_acquired_at.lock().unwrap() = Some(Instant::now());
-        assert!(lock.is_lease_locally_valid());
-        assert!(lock.last_acquired_instant().is_some());
-    }
-
-    #[tokio::test]
-    async fn test_clock_jump_stability() {
-        tokio::time::pause();
-        let client = redis::Client::open("redis://127.0.0.1/").unwrap();
-        let lock = RedisLeaderLock::new(client, "test_key", Duration::from_secs(5));
-
-        *lock.last_acquired_at.lock().unwrap() = Some(Instant::now());
-        assert!(lock.is_lease_locally_valid());
-
-        // Advance simulated monotonic time by 2 seconds — should still be valid
-        tokio::time::advance(Duration::from_secs(2)).await;
-        assert!(lock.is_lease_locally_valid());
-
-        // Advance simulated time past TTL — should expire
-        tokio::time::advance(Duration::from_secs(4)).await;
-        assert!(!lock.is_lease_locally_valid());
     }
 }
