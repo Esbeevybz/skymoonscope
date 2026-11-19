@@ -24,7 +24,6 @@
 
 use sky_moon_scope_core::simulation_service::{SimulationMetric, SimulationService};
 
-use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use soroban_sdk::{symbol_short, Env, IntoVal, Symbol, Val, Vec};
 use std::path::{Path, PathBuf};
@@ -149,15 +148,16 @@ fn simulate_hello(wasm: &[u8]) -> SimulationMetric {
 
 /// Sums the persisted profile columns so the assertions below read from the
 /// database rather than from the values the test already held in memory.
-fn stored_totals(db_path: &Path) -> (i64, i64, i64) {
-    let conn = Connection::open(db_path).expect("open the metrics database");
-    conn.query_row(
+async fn stored_totals(pool: &sqlx::SqlitePool) -> (i64, i64, i64) {
+    use sqlx::Row as _;
+    let row = sqlx::query(
         "SELECT COALESCE(SUM(cpu_instructions), 0), COALESCE(SUM(ram_bytes), 0), COUNT(*)
          FROM simulation_metrics",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
-    .expect("sum the persisted simulation metrics")
+    .fetch_one(pool)
+    .await
+    .expect("sum the persisted simulation metrics");
+    (row.get(0), row.get(1), row.get(2))
 }
 
 #[tokio::test]
@@ -189,6 +189,7 @@ async fn wasm_upload_simulation_and_resource_profile_end_to_end() {
     // ── Step 4: turn the simulation into a stored resource profile.
     let db = TempDb::new("simulate_profile_report");
     let service = SimulationService::new(db.path(), None)
+        .await
         .expect("initialise the simulation service on a fresh database");
 
     let first_report = service
@@ -253,7 +254,7 @@ async fn wasm_upload_simulation_and_resource_profile_end_to_end() {
 
     // ...and the metrics really landed in the profile table, with non-zero
     // CPU/RAM for both simulations.
-    let (cpu_total, ram_total, rows) = stored_totals(db.path());
+    let (cpu_total, ram_total, rows) = stored_totals(&service.pool).await;
     assert_eq!(rows, 2, "both simulations should be persisted");
     assert!(cpu_total > 0, "persisted CPU instructions must be non-zero");
     assert!(ram_total > 0, "persisted RAM bytes must be non-zero");

@@ -9,6 +9,7 @@ use soroban_sdk::xdr::{
     TransactionResultMeta,
 };
 use std::io::Cursor;
+use stellar_strkey::Strkey;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,7 +23,10 @@ pub struct DecodedTransactionResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DecodedInvocation {
-    /// Transaction source account in lossless XDR debug representation.
+    /// Transaction source account as a canonical Stellar StrKey address
+    /// (e.g. `G...` for a plain Ed25519 key, `M...` for a muxed account).
+    /// This is a stable, human-readable identifier suitable for routing,
+    /// logging, and external clients.
     pub invoker: String,
     pub contract: String,
     pub function: String,
@@ -266,7 +270,7 @@ fn decode_operations(
         .filter_map(|operation| match &operation.body {
             OperationBody::InvokeHostFunction(op) => match &op.host_function {
                 HostFunction::InvokeContract(args) => Some(DecodedInvocation {
-                    invoker: format!("{source:?}"),
+                    invoker: muxed_account_to_strkey(source),
                     contract: format!("{:?}", args.contract_address),
                     function: format_symbol(&args.function_name),
                     arguments: args.args.iter().map(format_sc_val).collect(),
@@ -276,6 +280,29 @@ fn decode_operations(
             _ => None,
         })
         .collect()
+}
+
+/// Convert a [`MuxedAccount`] to its canonical Stellar StrKey representation.
+///
+/// Plain Ed25519 keys become `G...` addresses; muxed accounts become `M...`
+/// addresses.  This produces a stable, human-readable string that external
+/// clients can parse reliably, unlike the Rust debug format which embeds
+/// internal implementation details.
+fn muxed_account_to_strkey(source: &soroban_sdk::xdr::MuxedAccount) -> String {
+    use soroban_sdk::xdr::MuxedAccount;
+    match source {
+        MuxedAccount::Ed25519(key) => {
+            Strkey::PublicKeyEd25519(stellar_strkey::ed25519::PublicKey(key.0))
+                .to_string()
+        }
+        MuxedAccount::MuxedEd25519(muxed) => {
+            Strkey::MuxedAccountEd25519(stellar_strkey::ed25519::MuxedAccount {
+                id: muxed.id,
+                ed25519: muxed.ed25519.0,
+            })
+            .to_string()
+        }
+    }
 }
 
 fn decode_event(event: &ContractEvent) -> DecodedContractEvent {

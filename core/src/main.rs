@@ -2297,6 +2297,7 @@ async fn main() {
                 .unwrap_or_else(|_| "sky_moon_scope_metrics.db".to_string());
             let webhook_url = env::var("SKY_MOON_SCOPE_ALERT_WEBHOOK_URL").ok();
             let simulation_service = SimulationService::new(db_path, webhook_url)
+                .await
                 .expect("initialize simulation service");
             if let Err(e) = benchmarks::run_token_benchmark(path, &simulation_service).await {
                 tracing::error!("Benchmark failed: {}", e);

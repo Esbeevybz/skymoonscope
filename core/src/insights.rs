@@ -295,13 +295,21 @@ impl InsightsEngine {
         }
     }
 
-    /// Weighted efficiency score (0–100).
+    /// Weighted efficiency score (1–100).
     ///
     /// Starts at 100 and deducts points for:
-    /// - Each Critical insight: −20
-    /// - Each Warning insight: −10
-    /// - Each Info insight: −3
-    /// - High absolute resource usage (graduated penalties)
+    /// - Each Critical insight: −20  (penalty threshold: 5 criticals → floor)
+    /// - Each Warning insight:  −10  (penalty threshold: 10 warnings → floor)
+    /// - Each Info insight:     −3
+    /// - High absolute resource usage (graduated penalties, max −30 total):
+    ///   - CPU > 50 M instructions: −10; CPU > 10 M: −5
+    ///   - RAM > 20 MiB:            −10; RAM >  5 MiB: −5
+    ///   - Ledger I/O > 100 KiB:   −10; Ledger I/O > 50 KiB: −5
+    ///
+    /// The minimum returned score is **1** for any contract that executed
+    /// successfully.  A score of 0 is never produced; that value is reserved
+    /// to signal a failed or un-scored invocation so callers can distinguish
+    /// "extremely inefficient but ran" from "did not run".
     fn compute_efficiency_score(resources: &SorobanResources, insights: &[Insight]) -> u32 {
         let mut score: i32 = 100;
 
@@ -340,7 +348,9 @@ impl InsightsEngine {
             score -= 5;
         }
 
-        score.clamp(0, 100) as u32
+        // Floor at 1: a contract that executed successfully always receives a
+        // non-zero score.  Callers can use 0 to signal a failed invocation.
+        score.clamp(1, 100) as u32
     }
 }
 
