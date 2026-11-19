@@ -1,6 +1,7 @@
 #![allow(clippy::unnecessary_cast)]
 
 use crate::fee_store::LedgerFeeSample;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -61,6 +62,8 @@ pub struct ModelBreakdown {
 /// Market conditions snapshot
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MarketConditions {
+    /// Time this snapshot was generated
+    pub timestamp: DateTime<Utc>,
     /// Current ledger sequence
     pub current_ledger: u64,
     /// Volatility classification
@@ -230,6 +233,7 @@ impl FeeAnalyticsEngine {
     ) -> MarketConditions {
         if samples.is_empty() {
             return MarketConditions {
+                timestamp: Utc::now(),
                 current_ledger,
                 volatility: "unknown".to_string(),
                 trend: "unknown".to_string(),
@@ -275,6 +279,7 @@ impl FeeAnalyticsEngine {
         let transaction_pressure = (avg_tx_count / 100.0).min(1.0);
 
         MarketConditions {
+            timestamp: Utc::now(),
             current_ledger,
             volatility: volatility_str,
             trend: trend_str,
@@ -537,11 +542,27 @@ mod tests {
         let samples: Vec<LedgerFeeSample> =
             (0..30).map(|i| create_sample(i as i64 + 1, 100)).collect();
 
+        let before = Utc::now();
         let conditions = engine.get_market_conditions(&samples, 100);
+        let after = Utc::now();
 
+        assert!(conditions.timestamp >= before);
+        assert!(conditions.timestamp <= after);
         assert_eq!(conditions.current_ledger, 100);
         assert_eq!(conditions.avg_fee_10_ledgers, 100);
         assert!(conditions.transaction_pressure >= 0.0);
         assert!(conditions.transaction_pressure <= 1.0);
+    }
+
+    #[test]
+    fn test_market_conditions_empty_data_timestamp() {
+        let engine = FeeAnalyticsEngine::new();
+
+        let before = Utc::now();
+        let conditions = engine.get_market_conditions(&[], 100);
+        let after = Utc::now();
+
+        assert!(conditions.timestamp >= before);
+        assert!(conditions.timestamp <= after);
     }
 }
