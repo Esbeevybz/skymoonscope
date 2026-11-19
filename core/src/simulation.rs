@@ -1242,6 +1242,18 @@ impl SimulationEngine {
         self.local_runner.is_some()
     }
 
+    /// Return the hash of locally loaded WASM for the contract, if available.
+    pub async fn local_wasm_hash_for_contract_id(
+        &self,
+        contract_id: &str,
+    ) -> Result<Option<[u8; 32]>, SimulationError> {
+        let Some(runner) = &self.local_runner else {
+            return Ok(None);
+        };
+        let contract_hash = self.parse_contract_id(contract_id)?;
+        Ok(runner.wasm_hash(&contract_hash).await)
+    }
+
     /// Update the request timeout for subsequent simulation calls.
     pub fn set_timeout(&mut self, timeout: std::time::Duration) {
         self.request_timeout = timeout;
