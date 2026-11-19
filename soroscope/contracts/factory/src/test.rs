@@ -5,7 +5,7 @@ use super::*;
 use emergency_guard::PauseType;
 use soroban_sdk::{
     testutils::Address as _,
-    vec, Address, Env,
+    vec, Address, Bytes, BytesN, Env,
 };
 
 fn setup_factory(env: &Env) -> (Address, LiquidityPoolFactoryClient<'_>) {
@@ -174,4 +174,47 @@ fn test_get_pause_state() {
 
     client.set_operation_paused(&admin, &PauseType::CREATE_PAIR, &true);
     assert!(client.get_pause_state() & PauseType::CREATE_PAIR != 0);
+}
+
+#[test]
+fn test_create_pair_rejects_empty_wasm_hash() {
+    let env = Env::default();
+    let (_, client) = setup_factory(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    let empty_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let result = client.try_create_pair(&token_a, &token_b, &empty_hash);
+    assert_eq!(result, Err(Ok(Error::InvalidWasm)));
+
+    let empty_bytes_hash = env.crypto().sha256(&Bytes::new(&env));
+    let result_sha = client.try_create_pair(&token_a, &token_b, &empty_bytes_hash);
+    assert_eq!(result_sha, Err(Ok(Error::InvalidWasm)));
+}
+
+#[test]
+fn test_create_pair_from_wasm_rejects_zero_length_bytes() {
+    let env = Env::default();
+    let (_, client) = setup_factory(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    let empty_wasm = Bytes::new(&env);
+    let result = client.try_create_pair_from_wasm(&token_a, &token_b, &empty_wasm);
+    assert_eq!(result, Err(Ok(Error::InvalidWasm)));
+
+    let upload_result = client.try_upload_contract_wasm(&empty_wasm);
+    assert_eq!(upload_result, Err(Ok(Error::InvalidWasm)));
 }

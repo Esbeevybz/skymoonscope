@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, IntoVal, Vec,
+    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, IntoVal, Vec,
 };
 use emergency_guard::{EmergencyGuard, GuardError, PauseType};
 
@@ -14,6 +14,7 @@ pub enum Error {
     Paused = 4,
     PairAlreadyExists = 5,
     InvalidThreshold = 6,
+    InvalidWasm = 7,
 }
 
 #[contracttype]
@@ -43,6 +44,13 @@ impl LiquidityPoolFactory {
         Ok(())
     }
 
+    pub fn upload_contract_wasm(env: Env, wasm_bytes: Bytes) -> Result<BytesN<32>, Error> {
+        if wasm_bytes.is_empty() || wasm_bytes.len() == 0 {
+            return Err(Error::InvalidWasm);
+        }
+        Ok(env.deployer().upload_contract_wasm(wasm_bytes))
+    }
+
     pub fn create_pair(
         env: Env,
         token_a: Address,
@@ -51,6 +59,12 @@ impl LiquidityPoolFactory {
     ) -> Result<Address, Error> {
         if EmergencyGuard::is_paused(env.clone(), PauseType::CREATE_PAIR) {
             return Err(Error::Paused);
+        }
+
+        let empty_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let empty_bytes_hash = env.crypto().sha256(&Bytes::new(&env));
+        if wasm_hash == empty_hash || wasm_hash == empty_bytes_hash {
+            return Err(Error::InvalidWasm);
         }
 
         let (token_0, token_1) = if token_a < token_b {
@@ -79,6 +93,28 @@ impl LiquidityPoolFactory {
 
         env.storage().instance().set(&DataKey::Pair(token_0, token_1), &deployed_address);
         Ok(deployed_address)
+    }
+
+    pub fn create_pair_from_wasm(
+        env: Env,
+        token_a: Address,
+        token_b: Address,
+        wasm_bytes: Bytes,
+    ) -> Result<Address, Error> {
+        if wasm_bytes.is_empty() || wasm_bytes.len() == 0 {
+            return Err(Error::InvalidWasm);
+        }
+        let wasm_hash = env.deployer().upload_contract_wasm(wasm_bytes);
+        Self::create_pair(env, token_a, token_b, wasm_hash)
+    }
+
+    pub fn create_pair_with_wasm(
+        env: Env,
+        token_a: Address,
+        token_b: Address,
+        wasm_bytes: Bytes,
+    ) -> Result<Address, Error> {
+        Self::create_pair_from_wasm(env, token_a, token_b, wasm_bytes)
     }
 
     pub fn get_pair(env: Env, token_a: Address, token_b: Address) -> Option<Address> {
