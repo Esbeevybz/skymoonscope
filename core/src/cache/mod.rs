@@ -97,10 +97,20 @@ impl SimulationCache {
         })
     }
 
-    pub fn generate_key(contract_id: &str, function_name: &str, args: &[String]) -> String {
-        let args_json = serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string());
-        let input = format!("{}{}{}", contract_id, function_name, args_json);
-        let digest = Sha256::digest(input.as_bytes());
+    pub fn generate_key(
+        contract_id: &str,
+        function_name: &str,
+        args: &[String],
+        wasm_hash: Option<&[u8]>,
+    ) -> String {
+        let input = serde_json::to_vec(&(
+            contract_id,
+            function_name,
+            args,
+            wasm_hash.map(hex::encode),
+        ))
+        .expect("simulation cache key inputs are serializable");
+        let digest = Sha256::digest(input);
         hex::encode(digest)
     }
 

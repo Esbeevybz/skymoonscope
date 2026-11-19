@@ -380,7 +380,7 @@ mod tests {
             args in proptest::collection::vec(arb_short_string(), 0..5),
         ) {
             let arg_refs: Vec<String> = args;
-            let key = SimulationCache::generate_key(&cid, &func, &arg_refs);
+            let key = SimulationCache::generate_key(&cid, &func, &arg_refs, None);
             prop_assert_eq!(key.len(), 64);
             prop_assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
         }
@@ -391,8 +391,8 @@ mod tests {
             cid in arb_short_string(),
             func in arb_short_string(),
         ) {
-            let k1 = SimulationCache::generate_key(&cid, &func, &[]);
-            let k2 = SimulationCache::generate_key(&cid, &func, &[]);
+            let k1 = SimulationCache::generate_key(&cid, &func, &[], None);
+            let k2 = SimulationCache::generate_key(&cid, &func, &[], None);
             prop_assert_eq!(k1, k2);
         }
 
@@ -404,8 +404,8 @@ mod tests {
             func in "[a-z]{4,8}",
         ) {
             prop_assume!(cid1 != cid2);
-            let k1 = SimulationCache::generate_key(&cid1, &func, &[]);
-            let k2 = SimulationCache::generate_key(&cid2, &func, &[]);
+            let k1 = SimulationCache::generate_key(&cid1, &func, &[], None);
+            let k2 = SimulationCache::generate_key(&cid2, &func, &[], None);
             prop_assert_ne!(k1, k2);
         }
 

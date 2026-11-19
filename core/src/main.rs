@@ -1122,11 +1122,12 @@ async fn analyze(
     tracing::info!("Received analyze request");
 
     let args = payload.args.clone().unwrap_or_default();
-    let cache_key = SimulationCache::generate_key_with_network(
+    let wasm_hash = state.engine.local_wasm_hash(&payload.contract_id).await?;
+    let cache_key = SimulationCache::generate_key(
         &payload.contract_id,
         &payload.function_name,
         &args,
-        &state.network_passphrase,
+        wasm_hash.as_ref().map(|hash| hash.as_slice()),
     );
 
     // Track simulation latency

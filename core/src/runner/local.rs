@@ -11,6 +11,7 @@
 //! it would starve other simulations.
 
 use crate::simulation::{SimulationError, SimulationResult, SorobanResources};
+use sha2::{Digest, Sha256};
 use soroban_env_host::LedgerInfo;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,6 +87,14 @@ impl LocalRunner {
     /// Report whether WASM for the given contract has been loaded.
     pub async fn has_wasm(&self, contract_hash: &[u8; 32]) -> bool {
         self.wasm_store.read().await.contains_key(contract_hash)
+    }
+
+    /// Return the SHA-256 hash of the currently loaded WASM for a contract.
+    pub async fn wasm_hash(&self, contract_hash: &[u8; 32]) -> Option<[u8; 32]> {
+        let store = self.wasm_store.read().await;
+        store
+            .get(contract_hash)
+            .map(|wasm_bytes| Sha256::digest(wasm_bytes).into())
     }
 
     /// Run a contract invocation entirely in process.
@@ -206,6 +215,23 @@ mod tests {
         assert!(!runner.has_wasm(&hash).await);
         runner.load_wasm(hash, vec![0x00, 0x61, 0x73, 0x6d]).await;
         assert!(runner.has_wasm(&hash).await);
+    }
+
+    #[tokio::test]
+    async fn wasm_hash_changes_when_binary_is_replaced() {
+        let runner = LocalRunner::new(default_ledger_info());
+        let contract_hash = [7u8; 32];
+        let first_wasm = vec![0x00, 0x61, 0x73, 0x6d];
+        let second_wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01];
+
+        runner.load_wasm(contract_hash, first_wasm.clone()).await;
+        let first_hash = runner.wasm_hash(&contract_hash).await.unwrap();
+        assert_eq!(first_hash, Sha256::digest(&first_wasm).into());
+
+        runner.load_wasm(contract_hash, second_wasm.clone()).await;
+        let second_hash = runner.wasm_hash(&contract_hash).await.unwrap();
+        assert_eq!(second_hash, Sha256::digest(&second_wasm).into());
+        assert_ne!(first_hash, second_hash);
     }
 
     #[tokio::test]

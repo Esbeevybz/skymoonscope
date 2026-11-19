@@ -1242,6 +1242,18 @@ impl SimulationEngine {
         self.local_runner.is_some()
     }
 
+    /// Get the hash of the locally loaded WASM for a contract, if available.
+    pub async fn local_wasm_hash(
+        &self,
+        contract_id: &str,
+    ) -> Result<Option<[u8; 32]>, SimulationError> {
+        let Some(runner) = &self.local_runner else {
+            return Ok(None);
+        };
+        let contract_hash = self.parse_contract_id(contract_id)?;
+        Ok(runner.wasm_hash(&contract_hash).await)
+    }
+
     /// Update the request timeout for subsequent simulation calls.
     pub fn set_timeout(&mut self, timeout: std::time::Duration) {
         self.request_timeout = timeout;
@@ -4119,35 +4131,44 @@ mod tests {
 
         #[test]
         fn test_cache_key_is_deterministic() {
-            let k1 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &["arg1".to_string()]);
-            let k2 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &["arg1".to_string()]);
+            let k1 =
+                SimulationCache::generate_key("CONTRACT_A", "fn_x", &["arg1".to_string()], None);
+            let k2 =
+                SimulationCache::generate_key("CONTRACT_A", "fn_x", &["arg1".to_string()], None);
             assert_eq!(k1, k2);
         }
 
         #[test]
         fn test_cache_key_differs_on_contract_id() {
-            let k1 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[]);
-            let k2 = SimulationCache::generate_key("CONTRACT_B", "fn_x", &[]);
+            let k1 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[], None);
+            let k2 = SimulationCache::generate_key("CONTRACT_B", "fn_x", &[], None);
             assert_ne!(k1, k2);
         }
 
         #[test]
         fn test_cache_key_differs_on_function_name() {
-            let k1 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[]);
-            let k2 = SimulationCache::generate_key("CONTRACT_A", "fn_y", &[]);
+            let k1 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[], None);
+            let k2 = SimulationCache::generate_key("CONTRACT_A", "fn_y", &[], None);
             assert_ne!(k1, k2);
         }
 
         #[test]
         fn test_cache_key_differs_on_args() {
-            let k1 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &["1".to_string()]);
-            let k2 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &["2".to_string()]);
+            let k1 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &["1".to_string()], None);
+            let k2 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &["2".to_string()], None);
+            assert_ne!(k1, k2);
+        }
+
+        #[test]
+        fn test_cache_key_differs_on_wasm_hash() {
+            let k1 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[], Some(&[1; 32]));
+            let k2 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[], Some(&[2; 32]));
             assert_ne!(k1, k2);
         }
 
         #[test]
         fn test_cache_key_is_hex_sha256() {
-            let key = SimulationCache::generate_key("C", "f", &[]);
+            let key = SimulationCache::generate_key("C", "f", &[], None);
             assert_eq!(key.len(), 64);
             assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
         }
@@ -4179,7 +4200,7 @@ mod tests {
         async fn test_cache_aside_pattern() {
             let db = sled::Config::new().temporary(true).open().unwrap();
             let cache = SimulationCache::new(&db);
-            let key = SimulationCache::generate_key("CONTRACT_X", "do_thing", &[]);
+            let key = SimulationCache::generate_key("CONTRACT_X", "do_thing", &[], None);
 
             let first = cache.get(&key).await;
             assert!(first.is_none());
@@ -4196,8 +4217,8 @@ mod tests {
         async fn test_different_keys_stored_independently() {
             let db = sled::Config::new().temporary(true).open().unwrap();
             let cache = SimulationCache::new(&db);
-            let k1 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[]);
-            let k2 = SimulationCache::generate_key("CONTRACT_B", "fn_x", &[]);
+            let k1 = SimulationCache::generate_key("CONTRACT_A", "fn_x", &[], None);
+            let k2 = SimulationCache::generate_key("CONTRACT_B", "fn_x", &[], None);
             let mut r1 = make_result();
             let mut r2 = make_result();
             r1.latest_ledger = 1;
