@@ -180,6 +180,9 @@ struct AppConfig {
     /// L2 treats it as stale. Default 100 ≈ 8 minutes at 5 s/ledger.
     #[serde(default = "default_max_ledger_age")]
     max_ledger_age: u32,
+    /// TTL in seconds for the in-memory contract ledger cache (default 300).
+    #[serde(default = "default_ledger_cache_ttl_secs")]
+    ledger_cache_ttl_secs: u64,
     /// Maximum on-disk simulation cache size in megabytes (default 100).
     #[serde(default = "default_max_cache_size_mb")]
     max_cache_size_mb: u64,
@@ -278,6 +281,10 @@ fn default_max_ledger_age() -> u32 {
     100
 }
 
+fn default_ledger_cache_ttl_secs() -> u64 {
+    300
+}
+
 fn default_max_cache_size_mb() -> u64 {
     100
 }
@@ -352,6 +359,7 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("emergency_verification_paused", false)?
         .set_default("disk_cache_path", "")?
         .set_default("max_ledger_age", 100)?
+        .set_default("ledger_cache_ttl_secs", default_ledger_cache_ttl_secs())?
         .set_default("max_cache_size_mb", 100)?
         .set_default("cors_allowed_origins", "")?
         .set_default("event_bus_capacity", 256)?
@@ -2850,7 +2858,10 @@ async fn main() {
     let sled_db = sled::open("sky_moon_scope_cache").expect("Failed to open sled database");
     let simulation_cache =
         SimulationCache::new_with_max_cache_size_mb(&sled_db, config.max_cache_size_mb);
-    let contract_cache = Arc::new(ContractCache::new(&sled_db));
+    let contract_cache = Arc::new(ContractCache::new(
+        &sled_db,
+        std::time::Duration::from_secs(config.ledger_cache_ttl_secs),
+    ));
 
     let app_metrics = Arc::new(
         AppMetrics::new().expect("Failed to initialize Prometheus metrics"),

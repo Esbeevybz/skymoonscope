@@ -30,19 +30,7 @@ const CACHE_TTL_SECS: u64 = 3_600;
 const CACHE_MAX_CAPACITY: u64 = 1_000;
 const DEFAULT_MAX_CACHE_SIZE_MB: u64 = 100;
 
-/// Default TTL for the in-memory ledger entry cache. Overridable via the
-/// `LEDGER_CACHE_TTL_SECS` env var so deployments can tune freshness vs.
-/// hit rate without a rebuild.
-const LEDGER_CACHE_TTL_SECS_DEFAULT: u64 = 300;
 const LEDGER_CACHE_MAX_CAPACITY: u64 = 5_000;
-
-fn ledger_cache_ttl() -> Duration {
-    std::env::var("LEDGER_CACHE_TTL_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(LEDGER_CACHE_TTL_SECS_DEFAULT))
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry<T> {
@@ -240,7 +228,7 @@ pub struct ContractCache {
 }
 
 impl ContractCache {
-    pub fn new(db: &Db) -> Self {
+    pub fn new(db: &Db, ledger_cache_ttl: Duration) -> Self {
         let wasm_tree = db
             .open_tree("wasm_bytes")
             .expect("Failed to open wasm_bytes tree");
@@ -249,7 +237,7 @@ impl ContractCache {
             .expect("Failed to open ledger_entries tree");
         let ledger_memory = SyncCache::builder()
             .max_capacity(LEDGER_CACHE_MAX_CAPACITY)
-            .time_to_live(ledger_cache_ttl())
+            .time_to_live(ledger_cache_ttl)
             .build();
         Self {
             wasm_tree,

@@ -364,6 +364,11 @@ pub struct AppConfig {
     #[serde(default = "default_max_ledger_age")]
     pub max_ledger_age: u32,
 
+    /// TTL in seconds for the in-memory contract ledger cache.
+    /// Env: `LEDGER_CACHE_TTL_SECS` · Default: `300`
+    #[serde(default = "default_ledger_cache_ttl_secs")]
+    pub ledger_cache_ttl_secs: u64,
+
     // --- WebSocket event bus ---
 
     /// Per-subscriber in-flight event buffer capacity. Clamped to [16, 65536].
@@ -394,6 +399,10 @@ pub struct AppConfig {
 
 fn default_app_env() -> String {
     "development".to_string()
+}
+
+fn default_ledger_cache_ttl_secs() -> u64 {
+    300
 }
 
 impl AppConfig {
@@ -562,6 +571,7 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         )?
         .set_default("disk_cache_path", default_disk_cache_path())?
         .set_default("max_ledger_age", default_max_ledger_age())?
+        .set_default("ledger_cache_ttl_secs", default_ledger_cache_ttl_secs())?
         .set_default("event_bus_capacity", default_event_bus_capacity())?
         .set_default("cors_allowed_origins", "")?
         .set_default("allowed_origins", "")?
@@ -614,6 +624,7 @@ mod tests {
             "SOROBAN_RPC_URL",
             "NETWORK_PASSPHRASE",
             "DATABASE_URL",
+            "LEDGER_CACHE_TTL_SECS",
             "APP_ENV",
         ];
         for k in &keys {
@@ -631,7 +642,18 @@ mod tests {
             "Test SDF Network ; September 2015"
         );
         assert_eq!(cfg.database_url, "sqlite://Sky Moon Scope.db");
+        assert_eq!(cfg.ledger_cache_ttl_secs, 300);
         assert!(!cfg.is_production());
+    }
+
+    #[test]
+    fn ledger_cache_ttl_can_be_overridden_from_env() {
+        let _guard = EnvGuard(vec!["LEDGER_CACHE_TTL_SECS".into()]);
+
+        env::set_var("LEDGER_CACHE_TTL_SECS", "45");
+        let cfg = load_config().expect("load_config should succeed");
+
+        assert_eq!(cfg.ledger_cache_ttl_secs, 45);
     }
 
     #[test]
@@ -754,6 +776,7 @@ mod tests {
             emergency_verification_paused: false,
             disk_cache_path: String::new(),
             max_ledger_age: 100,
+            ledger_cache_ttl_secs: 300,
             event_bus_capacity: 256,
         };
 
@@ -794,6 +817,7 @@ mod tests {
             emergency_verification_paused: false,
             disk_cache_path: String::new(),
             max_ledger_age: 100,
+            ledger_cache_ttl_secs: 300,
             event_bus_capacity: 256,
         };
 
@@ -847,6 +871,7 @@ mod tests {
             emergency_verification_paused: false,
             disk_cache_path: String::new(),
             max_ledger_age: 100,
+            ledger_cache_ttl_secs: 300,
             event_bus_capacity: 256,
         };
 
