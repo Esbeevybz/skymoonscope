@@ -966,8 +966,13 @@ async fn analyze(
     tracing::info!("Received analyze request");
 
     let args = payload.args.clone().unwrap_or_default();
-    let cache_key =
-        SimulationCache::generate_key(&payload.contract_id, &payload.function_name, &args);
+    let wasm_hash = state.engine.local_wasm_hash(&payload.contract_id).await?;
+    let cache_key = SimulationCache::generate_key(
+        &payload.contract_id,
+        &payload.function_name,
+        &args,
+        wasm_hash.as_ref().map(|hash| hash.as_slice()),
+    );
 
     // Track simulation latency
     let start_time = std::time::Instant::now();
