@@ -2,7 +2,14 @@ use crate::storage_types::{DataKey, Error};
 use soroban_sdk::{Address, Env, Vec};
 
 pub const REQUIRED_GUARDIANS: u32 = 5;
-pub const REQUIRED_APPROVALS: u32 = 3;
+
+/// Strict-majority quorum for a guardian set of `guardian_count` members:
+/// `floor(n / 2) + 1` — e.g. 3 of 5. This is the default applied by
+/// `initialize` when no explicit `required_approvals` is supplied (issue #76).
+/// A single compromised guardian can never meet this threshold.
+pub fn default_required_approvals(guardian_count: u32) -> u32 {
+    guardian_count / 2 + 1
+}
 
 // ── Guardian List ─────────────────────────────────────────────
 
@@ -15,6 +22,24 @@ pub fn read_guardians(e: &Env) -> Vec<Address> {
 
 pub fn write_guardians(e: &Env, guardians: &Vec<Address>) {
     e.storage().instance().set(&DataKey::Guardians, guardians);
+}
+
+/// Number of guardian approvals required to reach quorum.
+///
+/// Stored at initialization (issue #76) so the threshold is no longer a
+/// compile-time constant. Returns `0` only when unset, which callers treat
+/// as "not initialized".
+pub fn read_required_approvals(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get(&DataKey::RequiredApprovals)
+        .unwrap_or(0u32)
+}
+
+pub fn write_required_approvals(e: &Env, required: u32) {
+    e.storage()
+        .instance()
+        .set(&DataKey::RequiredApprovals, &required);
 }
 
 /// Returns the index (0..4) of `addr` in the guardian list.
@@ -86,8 +111,8 @@ pub fn approval_count(bitmap: u32) -> u32 {
     count
 }
 
-pub fn has_quorum(bitmap: u32) -> bool {
-    approval_count(bitmap) >= REQUIRED_APPROVALS
+pub fn has_quorum(bitmap: u32, required: u32) -> bool {
+    approval_count(bitmap) >= required
 }
 
 // ── Guardian Rotation Timelock Delay ──────────────────────────

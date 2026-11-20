@@ -320,6 +320,14 @@ pub struct AppConfig {
     #[serde(default = "default_max_concurrent_jobs")]
     pub max_concurrent_jobs: usize,
 
+    // --- Simulation service (per-API-key limits) ---
+
+    /// Maximum number of simulations a single API key may run concurrently
+    /// before the service rejects further requests with `429 Too Many Requests`.
+    /// Env: `MAX_CONCURRENT_SIMULATIONS_PER_KEY` · Default: `8`
+    #[serde(default = "default_max_concurrent_simulations_per_key")]
+    pub max_concurrent_simulations_per_key: usize,
+
     // --- Event worker pool ---
 
     /// Thread count for the dedicated event worker pool.
@@ -403,6 +411,10 @@ fn default_app_env() -> String {
 
 fn default_ledger_cache_ttl_secs() -> u64 {
     300
+}
+
+fn default_max_concurrent_simulations_per_key() -> usize {
+    8
 }
 
 impl AppConfig {
@@ -567,6 +579,10 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         .set_default("max_total_retry_duration_secs", default_max_total_retry_duration_secs())?
         .set_default("job_timeout_secs", default_job_timeout_secs())?
         .set_default("max_concurrent_jobs", default_max_concurrent_jobs())?
+        .set_default(
+            "max_concurrent_simulations_per_key",
+            default_max_concurrent_simulations_per_key(),
+        )?
         .set_default("event_worker_threads", default_event_worker_threads())?
         .set_default(
             "fee_collection_interval_secs",
@@ -786,6 +802,7 @@ mod tests {
             disk_cache_path: String::new(),
             max_ledger_age: 100,
             ledger_cache_ttl_secs: 300,
+            max_concurrent_simulations_per_key: 8,
             event_bus_capacity: 256,
         };
 
@@ -827,6 +844,7 @@ mod tests {
             disk_cache_path: String::new(),
             max_ledger_age: 100,
             ledger_cache_ttl_secs: 300,
+            max_concurrent_simulations_per_key: 8,
             event_bus_capacity: 256,
         };
 
@@ -882,6 +900,7 @@ mod tests {
             disk_cache_path: String::new(),
             max_ledger_age: 100,
             ledger_cache_ttl_secs: 300,
+            max_concurrent_simulations_per_key: 8,
             event_bus_capacity: 256,
         };
 

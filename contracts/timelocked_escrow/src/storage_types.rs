@@ -11,6 +11,7 @@ pub enum DataKey {
     ApprovalEpoch,
     PendingRotation,
     RotationDelayLedgers,
+    RequiredApprovals,
 }
 
 // ── Escrow Configuration ──────────────────────────────────────
@@ -59,6 +60,7 @@ pub enum Error {
     CancellationFeeTooHigh = 13,
     NoPendingRotation = 14,
     RotationTimelockNotElapsed = 15,
+    InvalidApprovalThreshold = 16,
 }
 
 // ── Event Structs ─────────────────────────────────────────────
