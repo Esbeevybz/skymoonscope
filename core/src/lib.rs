@@ -22,6 +22,7 @@ pub mod jobs;
 pub mod leader_lock;
 pub mod merkle_tree;
 pub mod parser;
+pub mod profiling_export;
 pub mod routing;
 pub mod soroban_meta_decoder;
 pub mod rpc_provider;

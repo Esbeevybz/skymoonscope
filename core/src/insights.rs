@@ -252,11 +252,15 @@ impl InsightRule for MemoryPressureRule {
 /// metrics to produce an `InsightsReport`.
 pub struct InsightsEngine {
     rules: Vec<Box<dyn InsightRule>>,
+    /// When true, halts rule evaluation immediately after finding the first Critical insight.
+    pub stop_after_critical: bool,
 }
 
 impl Clone for InsightsEngine {
     fn clone(&self) -> Self {
-        Self::new()
+        let mut engine = Self::new();
+        engine.stop_after_critical = self.stop_after_critical;
+        engine
     }
 }
 
@@ -270,7 +274,24 @@ impl InsightsEngine {
                 Box::new(FootprintBloatRule),
                 Box::new(MemoryPressureRule),
             ],
+            stop_after_critical: false,
         }
+    }
+
+    /// Builder method to configure early exit after finding the first critical insight.
+    pub fn with_stop_after_critical(mut self, stop: bool) -> Self {
+        self.stop_after_critical = stop;
+        self
+    }
+
+    /// Returns whether the engine short-circuits evaluation after encountering a critical insight.
+    pub fn stop_after_critical(&self) -> bool {
+        self.stop_after_critical
+    }
+
+    /// Set whether the engine short-circuits evaluation after encountering a critical insight.
+    pub fn set_stop_after_critical(&mut self, stop: bool) {
+        self.stop_after_critical = stop;
     }
 
     /// Add a custom rule at runtime.
@@ -280,12 +301,25 @@ impl InsightsEngine {
     }
 
     /// Run all rules and compute the efficiency score.
+    ///
+    /// When `stop_after_critical` is enabled, rule evaluation short-circuits
+    /// immediately after the first `Severity::Critical` insight is encountered.
     pub fn analyze(&self, resources: &SorobanResources) -> InsightsReport {
-        let insights: Vec<Insight> = self
-            .rules
-            .iter()
-            .flat_map(|rule| rule.evaluate(resources))
-            .collect();
+        let mut insights = Vec::new();
+
+        for rule in &self.rules {
+            for insight in rule.evaluate(resources) {
+                let is_critical = insight.severity == Severity::Critical;
+                insights.push(insight);
+                if self.stop_after_critical && is_critical {
+                    break;
+                }
+            }
+            if self.stop_after_critical && insights.iter().any(|i| i.severity == Severity::Critical)
+            {
+                break;
+            }
+        }
 
         let efficiency_score = Self::compute_efficiency_score(resources, &insights);
 
@@ -395,6 +429,193 @@ mod tests {
         let engine = InsightsEngine::new();
         let report = engine.analyze(&SorobanResources::default());
         assert!(report.efficiency_score <= 100);
+    }
+
+    // ── Stop after critical (short-circuit) ────────────────────────────────
+
+    #[test]
+    fn test_stop_after_critical_disabled_by_default() {
+        let engine = InsightsEngine::new();
+        assert!(!engine.stop_after_critical);
+        assert!(!engine.stop_after_critical());
+    }
+
+    #[test]
+    fn test_stop_after_critical_builder_and_setter() {
+        let mut engine = InsightsEngine::new().with_stop_after_critical(true);
+        assert!(engine.stop_after_critical());
+
+        engine.set_stop_after_critical(false);
+        assert!(!engine.stop_after_critical());
+
+        let cloned = engine.with_stop_after_critical(true).clone();
+        assert!(cloned.stop_after_critical());
+    }
+
+    struct MockRule {
+        name: &'static str,
+        insights: Vec<Insight>,
+        evaluated: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl InsightRule for MockRule {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn evaluate(&self, _r: &SorobanResources) -> Vec<Insight> {
+            self.evaluated
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.insights.clone()
+        }
+    }
+
+    #[test]
+    fn test_stop_after_critical_short_circuits_rule_evaluation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let eval_counter_1 = Arc::new(AtomicUsize::new(0));
+        let eval_counter_2 = Arc::new(AtomicUsize::new(0));
+
+        let critical_insight = Insight {
+            severity: Severity::Critical,
+            rule: "mock_critical".to_string(),
+            message: "Critical issue found".to_string(),
+            suggested_fix: "Fix immediately".to_string(),
+        };
+
+        let warning_insight = Insight {
+            severity: Severity::Warning,
+            rule: "mock_warning".to_string(),
+            message: "Warning issue found".to_string(),
+            suggested_fix: "Consider fixing".to_string(),
+        };
+
+        // Case 1: stop_after_critical = false (evaluates all rules)
+        let engine_without_stop = InsightsEngine {
+            rules: vec![
+                Box::new(MockRule {
+                    name: "rule_1",
+                    insights: vec![critical_insight.clone()],
+                    evaluated: Arc::clone(&eval_counter_1),
+                }),
+                Box::new(MockRule {
+                    name: "rule_2",
+                    insights: vec![warning_insight.clone()],
+                    evaluated: Arc::clone(&eval_counter_2),
+                }),
+            ],
+            stop_after_critical: false,
+        };
+
+        let report_without_stop = engine_without_stop.analyze(&minimal_resources());
+        assert_eq!(eval_counter_1.load(Ordering::SeqCst), 1);
+        assert_eq!(eval_counter_2.load(Ordering::SeqCst), 1);
+        assert_eq!(report_without_stop.insights.len(), 2);
+
+        // Reset counters
+        eval_counter_1.store(0, Ordering::SeqCst);
+        eval_counter_2.store(0, Ordering::SeqCst);
+
+        // Case 2: stop_after_critical = true (short-circuits after rule 1)
+        let engine_with_stop = InsightsEngine {
+            rules: vec![
+                Box::new(MockRule {
+                    name: "rule_1",
+                    insights: vec![critical_insight],
+                    evaluated: Arc::clone(&eval_counter_1),
+                }),
+                Box::new(MockRule {
+                    name: "rule_2",
+                    insights: vec![warning_insight],
+                    evaluated: Arc::clone(&eval_counter_2),
+                }),
+            ],
+            stop_after_critical: true,
+        };
+
+        let report_with_stop = engine_with_stop.analyze(&minimal_resources());
+        assert_eq!(eval_counter_1.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            eval_counter_2.load(Ordering::SeqCst),
+            0,
+            "rule 2 should not be evaluated after critical insight"
+        );
+        assert_eq!(report_with_stop.insights.len(), 1);
+        assert_eq!(report_with_stop.insights[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn test_stop_after_critical_does_not_stop_on_warnings_or_info() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let counter_1 = Arc::new(AtomicUsize::new(0));
+        let counter_2 = Arc::new(AtomicUsize::new(0));
+
+        let warning = Insight {
+            severity: Severity::Warning,
+            rule: "w".to_string(),
+            message: "w".to_string(),
+            suggested_fix: "w".to_string(),
+        };
+
+        let info = Insight {
+            severity: Severity::Info,
+            rule: "i".to_string(),
+            message: "i".to_string(),
+            suggested_fix: "i".to_string(),
+        };
+
+        let engine = InsightsEngine {
+            rules: vec![
+                Box::new(MockRule {
+                    name: "r1",
+                    insights: vec![warning],
+                    evaluated: Arc::clone(&counter_1),
+                }),
+                Box::new(MockRule {
+                    name: "r2",
+                    insights: vec![info],
+                    evaluated: Arc::clone(&counter_2),
+                }),
+            ],
+            stop_after_critical: true,
+        };
+
+        let report = engine.analyze(&minimal_resources());
+        assert_eq!(counter_1.load(Ordering::SeqCst), 1);
+        assert_eq!(counter_2.load(Ordering::SeqCst), 1);
+        assert_eq!(report.insights.len(), 2);
+    }
+
+    #[test]
+    fn test_stop_after_critical_with_builtin_rules() {
+        // High CPU (triggers InstructionDensityRule critical) and high write ratio (triggers StorageEfficiencyRule critical)
+        let r = SorobanResources {
+            cpu_instructions: 60_000_000,
+            ram_bytes: 1_024,
+            ledger_read_bytes: 100,
+            ledger_write_bytes: 5_000,
+            transaction_size_bytes: 1_024,
+        };
+
+        let full_report = InsightsEngine::new().analyze(&r);
+        assert!(
+            full_report.insights.len() >= 2,
+            "both rules should trigger critical insights"
+        );
+
+        let early_report = InsightsEngine::new()
+            .with_stop_after_critical(true)
+            .analyze(&r);
+        assert_eq!(
+            early_report.insights.len(),
+            1,
+            "only the first critical insight should be returned"
+        );
+        assert_eq!(early_report.insights[0].severity, Severity::Critical);
     }
 
     // ── Storage efficiency rule ───────────────────────────────────────────

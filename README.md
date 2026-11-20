@@ -24,7 +24,7 @@ cd skymoonscope
 The core crate is a Rust binary that will power Skymoonscope resource profiling.
 
 Features
-Resource Profiling: Analyze CPU, RAM, and ledger footprint consumption
+Resource Profiling: Analyze CPU, RAM, and ledger footprint consumption, with CLI export to JSON and CSV
 Gas Golfing Analysis: Automated detection of gas-heavy patterns with optimization suggestions
 Contract Simulation: Test contract functions with various inputs
 Fee Market Analysis: Real-time fee predictions and market conditions
@@ -35,6 +35,11 @@ cargo build -p skymoonscope-core
 # Run the server (RUST_LOG=info is required to see API logs)
 RUST_LOG=info cargo run -p skymoonscope-core
 The server listens on http://localhost:8080 by default.
+
+# Profile a contract and export to JSON or CSV via CLI
+cargo run --manifest-path core/Cargo.toml --bin wasm-profile -- \
+  path/to/contract.wasm --function hello --format csv -o profile_results.csv
+See core/PROFILE_CLI.md for full CLI export options.
 
 Merkle Tree Utility
 The core crate includes an off-chain Merkle Tree utility (core/src/merkle_tree.rs) for building binary Merkle trees and generating inclusion proofs compatible with the cross_chain_verifier contract.
