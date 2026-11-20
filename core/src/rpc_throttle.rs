@@ -2,30 +2,69 @@
 
 use reqwest::header::HeaderMap;
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RpcThrottle {
-    blocked_until: Arc<Mutex<Option<tokio::time::Instant>>>,
+    blocked_until: Arc<AtomicU64>,
+}
+
+impl Default for RpcThrottle {
+    fn default() -> Self {
+        Self {
+            blocked_until: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 impl RpcThrottle {
     /// Wait until the provider's advertised retry window has elapsed.
     pub async fn wait(&self) {
-        let deadline = *self.blocked_until.lock().await;
-        if let Some(deadline) = deadline {
-            tokio::time::sleep_until(deadline).await;
+        let deadline_ms = self.blocked_until.load(Ordering::Acquire);
+        if deadline_ms == 0 {
+            return;
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if deadline_ms > now_ms {
+            tokio::time::sleep(Duration::from_millis(deadline_ms - now_ms)).await;
         }
     }
 
     /// Update the next permitted request time from standard RPC headers.
     pub async fn observe(&self, headers: &HeaderMap) -> Option<Duration> {
         let delay = retry_delay(headers, SystemTime::now())?;
-        *self.blocked_until.lock().await = Some(tokio::time::Instant::now() + delay);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let new_deadline = now_ms.saturating_add(delay.as_millis() as u64);
+
+        let mut current = self.blocked_until.load(Ordering::Acquire);
+        while new_deadline > current {
+            match self.blocked_until.compare_exchange_weak(
+                current,
+                new_deadline,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
         Some(delay)
+    }
+
+    /// Returns the current blocked-until deadline as Unix milliseconds, or 0 if none.
+    pub fn deadline_ms(&self) -> u64 {
+        self.blocked_until.load(Ordering::Acquire)
     }
 }
 
@@ -86,9 +125,43 @@ mod tests {
         headers.insert(RETRY_AFTER, HeaderValue::from_static("tomorrow"));
         assert_eq!(retry_delay(&headers, UNIX_EPOCH), None);
     }
-}
 
-use std::sync::atomic::{AtomicU64, Ordering};
+    #[tokio::test]
+    async fn observe_updates_deadline_lock_free() {
+        let throttle = RpcThrottle::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+
+        let delay = throttle.observe(&headers).await;
+        assert_eq!(delay, Some(Duration::from_secs(2)));
+
+        let deadline = throttle.deadline_ms();
+        assert!(deadline > 0);
+    }
+
+    #[tokio::test]
+    async fn observe_keeps_later_deadline() {
+        let throttle = RpcThrottle::default();
+        let mut headers_long = HeaderMap::new();
+        headers_long.insert(RETRY_AFTER, HeaderValue::from_static("10"));
+        throttle.observe(&headers_long).await;
+
+        let deadline_long = throttle.deadline_ms();
+
+        let mut headers_short = HeaderMap::new();
+        headers_short.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        throttle.observe(&headers_short).await;
+
+        let deadline_after = throttle.deadline_ms();
+        assert_eq!(deadline_after, deadline_long);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_immediately_when_no_deadline() {
+        let throttle = RpcThrottle::default();
+        throttle.wait().await;
+    }
+}
 
 pub struct TokenBucket {
     tokens: AtomicU64,
