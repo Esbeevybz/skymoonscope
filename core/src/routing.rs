@@ -72,13 +72,14 @@ pub fn select_provider_index(
 }
 
 /// Compute weighted round-robin weights for the healthy subset of
-/// `providers`. Returns one weight per healthy provider, in input order.
+/// `providers`. Returns one weight per healthy provider, in input order,
+/// or `None` if no providers are healthy.
 /// Faster providers receive higher weights: `weight = max_rtt / rtt`.
 ///
-/// Skips unhealthy providers entirely — the output length equals the
+/// Skips unhealthy providers entirely — when `Some`, the output length equals the
 /// count of healthy providers, so callers pairing the weights with
 /// indices must track the filter themselves.
-pub fn compute_inverse_rtt_weights(providers: &[ProviderView<'_>]) -> Vec<u64> {
+pub fn compute_inverse_rtt_weights(providers: &[ProviderView<'_>]) -> Option<Vec<u64>> {
     let rtts: Vec<u64> = providers
         .iter()
         .filter(|p| p.is_healthy)
@@ -86,11 +87,11 @@ pub fn compute_inverse_rtt_weights(providers: &[ProviderView<'_>]) -> Vec<u64> {
         .collect();
 
     if rtts.is_empty() {
-        return Vec::new();
+        return None;
     }
 
     let max_rtt = *rtts.iter().max().unwrap();
-    rtts.into_iter().map(|r| max_rtt / r).collect()
+    Some(rtts.into_iter().map(|r| max_rtt / r).collect())
 }
 
 #[cfg(test)]
@@ -181,19 +182,32 @@ mod tests {
     fn inverse_rtt_weights_favour_faster_providers() {
         // fast=50us, slow=500us → max/fast=10, max/slow=1
         let pool = [warm("slow", 500), warm("fast", 50)];
-        assert_eq!(compute_inverse_rtt_weights(&pool), vec![1, 10]);
+        assert_eq!(compute_inverse_rtt_weights(&pool), Some(vec![1, 10]));
     }
 
     #[test]
     fn inverse_rtt_weights_skip_unhealthy() {
         let pool = [warm("a", 100), down("b", 10), warm("c", 50)];
-        assert_eq!(compute_inverse_rtt_weights(&pool), vec![1, 2]);
+        assert_eq!(compute_inverse_rtt_weights(&pool), Some(vec![1, 2]));
     }
 
     #[test]
-    fn inverse_rtt_weights_on_empty_healthy_pool_return_empty() {
+    fn inverse_rtt_weights_on_empty_healthy_pool_return_none() {
         let pool = [down("a", 100), down("b", 50)];
-        assert!(compute_inverse_rtt_weights(&pool).is_empty());
+        assert_eq!(compute_inverse_rtt_weights(&pool), None);
+        assert_eq!(compute_inverse_rtt_weights(&[]), None);
+    }
+
+    #[test]
+    fn inverse_rtt_weights_single_healthy_provider_returns_some_one() {
+        let pool = [warm("only", 100)];
+        assert_eq!(compute_inverse_rtt_weights(&pool), Some(vec![1]));
+
+        let pool_with_unhealthy = [down("a", 50), warm("only", 100), down("b", 200)];
+        assert_eq!(
+            compute_inverse_rtt_weights(&pool_with_unhealthy),
+            Some(vec![1])
+        );
     }
 
     #[test]
@@ -210,7 +224,7 @@ mod tests {
             },
             warm("real", 200),
         ];
-        let weights = compute_inverse_rtt_weights(&pool);
+        let weights = compute_inverse_rtt_weights(&pool).expect("healthy pool");
         assert_eq!(weights.len(), 2);
         assert!(weights[0] >= weights[1]);
     }
