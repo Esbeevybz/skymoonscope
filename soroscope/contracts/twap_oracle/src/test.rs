@@ -148,7 +148,7 @@ fn test_large_price_accumulation_no_overflow() {
 }
 
 #[test]
-fn test_u128_wrapping_does_not_panic() {
+fn test_u128_overflow_aborts_with_accumulator_overflow() {
     let e = Env::default();
     e.ledger().with_mut(|li| li.timestamp = 0);
 
@@ -160,7 +160,7 @@ fn test_u128_wrapping_does_not_panic() {
 
     client.initialize(&token_a, &token_b, &1);
 
-    // Use extremely large values that would overflow i128 but are handled safely by u128 wrapping.
+    // Use extremely large values that would overflow i128.
     let max_price: i128 = i128::MAX;
 
     assert_eq!(client.update_price(&max_price), Ok(()));
@@ -168,12 +168,11 @@ fn test_u128_wrapping_does_not_panic() {
     // Advance by a large amount
     e.ledger().with_mut(|li| li.timestamp = 1_000_000);
 
-    // This multiplication would overflow i128, but u128 wrapping handles it gracefully.
+    // Accumulator updates overflow checked math and return AccumulatorOverflow
     let result = client.update_price(&max_price);
-    // The update should succeed without panicking.
-    assert_eq!(result, Ok(()));
+    assert_eq!(result, Err(Error::AccumulatorOverflow));
 
-    // get_twap should not panic either.
-    let _twap = client.get_twap();
+    // get_twap should return 0 since no successful updates with elapsed time occurred.
+    assert_eq!(client.get_twap(), 0);
 }
 
