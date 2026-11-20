@@ -607,7 +607,15 @@ impl AppMetrics {
             prometheus::HistogramOpts::new(
                 "simulation_latency_seconds",
                 "Latency of simulation requests in seconds",
-            ),
+            )
+            // Explicit buckets so long-running simulations keep granularity for
+            // p99 alerting (ISSUE-067). The 15.0, 30.0 and 45.0 boundaries map
+            // to 15 000 ms, 30 000 ms and 45 000 ms, with 60.0 s as the top
+            // finite bucket.
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 45.0,
+                60.0,
+            ]),
             &["endpoint"],
         )?;
         let rpc_error_count_total = IntCounterVec::new(

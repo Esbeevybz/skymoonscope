@@ -41,7 +41,8 @@ POST /analyze/gas-golfing
         "severity": "medium",
         "gas_saved_estimate": 200,
         "suggested_fix": "Replace divisions with multiplications by reciprocals or use bitwise shifts",
-        "code_example": "Replace: x / 2\nWith: x >> 1"
+        "code_example": "Replace: x / 2\nWith: x >> 1",
+        "language_hint": "rust"
       }
     ],
     "summary": {
