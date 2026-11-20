@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
+use wasmparser::{Parser, Payload};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GasGolfingSuggestion {
@@ -11,6 +12,13 @@ pub struct GasGolfingSuggestion {
     pub gas_saved_estimate: Option<u64>,
     pub suggested_fix: String,
     pub code_example: Option<String>,
+    /// Best-guess source toolchain this suggestion's example applies to,
+    /// inferred from the WASM `contractmetav0` custom section (e.g. `"rust"`
+    /// or `"unknown"`).  Rust-only code examples are omitted when the contract
+    /// was not compiled from Rust, so the field stays accurate for contracts
+    /// written in AssemblyScript or other Soroban-compatible languages.
+    #[serde(default)]
+    pub language_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -30,6 +38,66 @@ impl Default for GasGolfingAnalyzer {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Toolchain detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Name of the Soroban custom section that carries build/toolchain metadata.
+const CONTRACT_META_SECTION: &str = "contractmetav0";
+
+/// Metadata keys the Rust Soroban SDK records in `contractmetav0`.  Their
+/// presence identifies the contract as Rust-compiled; the keys are stored as
+/// UTF-8 inside the section so a raw byte search is sufficient.
+const RUST_META_KEYS: [&[u8]; 2] = [b"rsver", b"rssdkver"];
+
+/// Source toolchain inferred from the contract's WASM metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Toolchain {
+    /// Contract compiled from Rust (embeds `rsver`/`rssdkver` metadata).
+    Rust,
+    /// Toolchain could not be determined; Rust-only examples must be withheld.
+    Unknown,
+}
+
+impl Toolchain {
+    /// Stable identifier exposed on each suggestion via `language_hint`.
+    fn hint(self) -> &'static str {
+        match self {
+            Toolchain::Rust => "rust",
+            Toolchain::Unknown => "unknown",
+        }
+    }
+
+    fn is_rust(self) -> bool {
+        matches!(self, Toolchain::Rust)
+    }
+}
+
+/// Detect the contract's source toolchain from the toolchain metadata the
+/// compiler embeds in the WASM `contractmetav0` custom section.  Contracts
+/// built with the Rust SDK record `rsver`/`rssdkver`; anything else is treated
+/// as an unknown (non-Rust) toolchain.  Never panics — malformed input simply
+/// yields [`Toolchain::Unknown`].
+fn detect_toolchain(wasm_bytes: &[u8]) -> Toolchain {
+    for payload in Parser::new(0).parse_all(wasm_bytes) {
+        if let Ok(Payload::CustomSection(reader)) = payload {
+            if reader.name() == CONTRACT_META_SECTION
+                && RUST_META_KEYS
+                    .iter()
+                    .any(|key| contains_subslice(reader.data(), key))
+            {
+                return Toolchain::Rust;
+            }
+        }
+    }
+    Toolchain::Unknown
+}
+
+/// Returns `true` when `needle` occurs contiguously within `haystack`.
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 impl GasGolfingAnalyzer {
     pub fn new() -> Self {
         Self
@@ -39,12 +107,27 @@ impl GasGolfingAnalyzer {
         let mut suggestions = Vec::new();
         let mut summary = HashMap::new();
 
+        // Detect the source toolchain once so every suggestion can be tagged
+        // with a `language_hint` and its example filtered accordingly.
+        let toolchain = detect_toolchain(wasm_bytes);
+
         // Analyze WASM bytecode for common gas-heavy patterns
         suggestions.extend(self.analyze_loop_patterns(wasm_bytes));
         suggestions.extend(self.analyze_memory_patterns(wasm_bytes));
         suggestions.extend(self.analyze_arithmetic_patterns(wasm_bytes));
         suggestions.extend(self.analyze_storage_patterns(wasm_bytes));
         suggestions.extend(self.analyze_branching_patterns(wasm_bytes));
+
+        // The embedded `code_example`s are Rust source snippets, so they are
+        // irrelevant and misleading for contracts built with another Soroban
+        // toolchain (e.g. AssemblyScript).  Tag each suggestion with the
+        // detected toolchain and drop the example unless it is Rust (ISSUE-060).
+        for suggestion in suggestions.iter_mut() {
+            suggestion.language_hint = Some(toolchain.hint().to_string());
+            if !toolchain.is_rust() {
+                suggestion.code_example = None;
+            }
+        }
 
         // Build summary
         for suggestion in &suggestions {
@@ -128,6 +211,7 @@ impl GasGolfingAnalyzer {
                      With:\n  count = mask.count_ones();"
                         .to_string(),
                 ),
+                language_hint: None,
             });
         }
 
@@ -185,6 +269,7 @@ impl GasGolfingAnalyzer {
                      into a default Vec inside a loop"
                         .to_string(),
                 ),
+                language_hint: None,
             });
         }
 
@@ -248,6 +333,7 @@ impl GasGolfingAnalyzer {
                      use reciprocal multiplication for known constant divisors"
                         .to_string(),
                 code_example: Some("Replace: x / 2\nWith: x >> 1\n\nReplace: x % 8\nWith: x & 7".to_string()),
+                language_hint: None,
             });
         }
 
@@ -263,6 +349,7 @@ impl GasGolfingAnalyzer {
                 suggested_fix:
                     "Use bitwise shifts for multiplication/division by powers of 2".to_string(),
                 code_example: Some("Replace: x * 8\nWith: x << 3".to_string()),
+                language_hint: None,
             });
         }
 
@@ -319,6 +406,7 @@ impl GasGolfingAnalyzer {
                 code_example: Some(
                     "Use a single storage update instead of multiple separate calls".to_string(),
                 ),
+                language_hint: None,
             });
         }
 
@@ -366,6 +454,7 @@ impl GasGolfingAnalyzer {
                 code_example: Some(
                     "Replace nested if-else with a lookup table or early returns".to_string(),
                 ),
+                language_hint: None,
             });
         }
 

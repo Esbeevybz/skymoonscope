@@ -15,6 +15,10 @@
 //! This parser maintains a call stack: each `fn_call` pushes a new node and
 //! each `fn_return` pops it, attaching it as a child of its caller.  The
 //! final tree root represents the outermost contract invocation.
+//!
+//! Calls that trap or return an error before completing still emit a
+//! `fn_call`, so their subtree is kept in the graph and flagged with
+//! [`CallNode::failed`] instead of being discarded.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -35,6 +39,13 @@ pub struct CallNode {
     pub function: String,
     /// Ordered list of nested sub-calls made during this invocation.
     pub children: Vec<CallNode>,
+    /// Whether this call returned an error / trapped before completing.
+    ///
+    /// Events observed from an unsuccessful call are retained (up to the error
+    /// point) rather than discarded, so the node still appears in the graph
+    /// with `failed = true`.
+    #[serde(default)]
+    pub failed: bool,
 }
 
 /// A complete call graph rooted at the outermost contract invocation.
@@ -95,10 +106,12 @@ pub fn parse_call_trace(events: &[String]) -> Option<CallGraph> {
             }
         };
 
-        // Only process events from successful contract calls.
-        if !diag_event.in_successful_contract_call {
-            continue;
-        }
+        // Retain events from failed calls as well. A child contract that traps
+        // or returns an error still emits `fn_call`/`fn_return` for the events
+        // up to its error point; dropping them would silently discard its
+        // subtree and leave an incomplete call graph (ISSUE-062). The affected
+        // node is instead flagged `failed` below so callers can see it.
+        let call_succeeded = diag_event.in_successful_contract_call;
 
         let contract_id = match &diag_event.event.contract_id {
             Some(Hash(h)) => Strkey::Contract(StrkeyContract(*h)).to_string(),
@@ -135,10 +148,16 @@ pub fn parse_call_trace(events: &[String]) -> Option<CallGraph> {
                     contract_id,
                     function,
                     children: Vec::new(),
+                    failed: !call_succeeded,
                 });
             }
             "fn_return" => {
-                if let Some(finished_node) = stack.pop() {
+                if let Some(mut finished_node) = stack.pop() {
+                    // A failed `fn_return` marks the popped node as failed even
+                    // if its matching `fn_call` was reported as successful.
+                    if !call_succeeded {
+                        finished_node.failed = true;
+                    }
                     let span = debug_span!(
                         "fn_return",
                         contract_id = %finished_node.contract_id,

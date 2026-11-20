@@ -541,6 +541,7 @@ GET logs-Sky Moon Scope-*/_search
 | RPC Endpoint Down | All providers unavailable | Failover + escalate to platform team |
 | Memory Leak | Usage growing > 10MB/min | Restart service, investigate in post-mortem |
 | Simulation Latency | p95 > 5s | Investigate bottleneck, consider horizontal scaling |
+| Simulation Latency (long-running) | p99 > 45s (15s/30s/45s/60s histogram buckets) | Inspect slow simulations, scale out or optimize the contract |
 | Merkle Tree Verification Failures | > 10/min | Check relayer key permissions |
 | Admin Key Rotation Failed | Any failure | Manual intervention required, escalate immediately |
 
