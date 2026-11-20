@@ -2,10 +2,11 @@
 
 use crate::errors::AppError;
 use reqwest::Client;
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 const DEFAULT_ZSCORE_THRESHOLD: f64 = 2.0;
@@ -155,7 +156,13 @@ impl Drop for ConcurrencyPermit {
 
 #[derive(Debug, Clone)]
 pub struct SimulationService {
-    db_path: PathBuf,
+    /// Shared connection pool configured with WAL journal mode.
+    ///
+    /// Using `sqlx::SqlitePool` (instead of a bare `rusqlite::Connection`)
+    /// eliminates `SQLITE_BUSY` errors when concurrent requests read and write
+    /// the metrics database at the same time (issue #561).  WAL mode allows
+    /// one writer and many readers to proceed without blocking each other.
+    pool: SqlitePool,
     shift_threshold: f64,
     zscore_threshold: f64,
     webhook_url: Option<String>,
@@ -163,29 +170,49 @@ pub struct SimulationService {
 }
 
 impl SimulationService {
-    pub fn new(db_path: impl AsRef<Path>, webhook_url: Option<String>) -> Result<Self, AppError> {
-        Self::new_with_limit(
-            db_path,
-            webhook_url,
-            DEFAULT_MAX_CONCURRENT_SIMULATIONS_PER_KEY,
-        )
+    pub async fn new(
+        db_path: impl AsRef<Path>,
+        webhook_url: Option<String>,
+    ) -> Result<Self, AppError> {
+        Self::new_with_limit(db_path, webhook_url, DEFAULT_MAX_CONCURRENT_SIMULATIONS_PER_KEY)
+            .await
     }
 
     /// Like [`SimulationService::new`], but with an explicit per-API-key
     /// concurrency ceiling.
-    pub fn new_with_limit(
+    pub async fn new_with_limit(
         db_path: impl AsRef<Path>,
         webhook_url: Option<String>,
         max_concurrent_per_key: usize,
     ) -> Result<Self, AppError> {
+        let url = format!(
+            "sqlite://{}",
+            db_path.as_ref().to_string_lossy()
+        );
+        // Open (or create) the database with WAL journal mode so that
+        // concurrent readers are never blocked by an in-progress write and
+        // vice-versa.  This eliminates the SQLITE_BUSY errors that occurred
+        // when rusqlite and sqlx opened separate connection paths to the same
+        // file (issue #561).
+        let options = SqliteConnectOptions::from_str(&url)
+            .map_err(|e| AppError::Internal(format!("Invalid SQLite URL: {e}")))?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect_with(options)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to open metrics database: {e}")))?;
+
         let service = Self {
-            db_path: db_path.as_ref().to_path_buf(),
+            pool,
             shift_threshold: DEFAULT_SHIFT_THRESHOLD,
             zscore_threshold: DEFAULT_ZSCORE_THRESHOLD,
             webhook_url,
             limiter: ConcurrencyLimiter::new(max_concurrent_per_key),
         };
-        service.ensure_schema()?;
+        service.ensure_schema().await?;
         Ok(service)
     }
 
@@ -233,16 +260,9 @@ impl SimulationService {
         self.record_and_analyze(metric).await
     }
 
-    fn connect(&self) -> Result<Connection, AppError> {
-        Connection::open(&self.db_path)
-            .map_err(|e| AppError::Internal(format!("Failed to open metrics database: {e}")))
-    }
-
-    fn ensure_schema(&self) -> Result<(), AppError> {
-        let conn = self.connect()?;
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS simulation_metrics (
+    async fn ensure_schema(&self) -> Result<(), AppError> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS simulation_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 contract TEXT NOT NULL,
                 method TEXT NOT NULL,
@@ -251,12 +271,22 @@ impl SimulationService {
                 ram_bytes INTEGER NOT NULL,
                 ledger_footprint INTEGER NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
+            )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create simulation_metrics table: {e}")))?;
 
-            CREATE INDEX IF NOT EXISTS idx_simulation_lookup
-                ON simulation_metrics(contract, method, code_hash, created_at);
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_simulation_lookup
+                ON simulation_metrics(contract, method, code_hash, created_at)",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create simulation index: {e}")))?;
 
-            CREATE TABLE IF NOT EXISTS simulation_alerts (
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS simulation_alerts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 simulation_metric_id INTEGER NOT NULL,
                 contract TEXT NOT NULL,
@@ -265,10 +295,12 @@ impl SimulationService {
                 details_json TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(simulation_metric_id) REFERENCES simulation_metrics(id)
-            );
-            ",
+            )",
         )
-        .map_err(|e| AppError::Internal(format!("Failed to create metrics schema: {e}")))?;
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create simulation_alerts table: {e}")))?;
+
         Ok(())
     }
 
@@ -276,19 +308,20 @@ impl SimulationService {
         &self,
         metric: SimulationMetric,
     ) -> Result<AnalysisResult, AppError> {
-        let baseline =
-            self.load_historical_stats(&metric.contract, &metric.method, &metric.code_hash)?;
+        let baseline = self
+            .load_historical_stats(&metric.contract, &metric.method, &metric.code_hash)
+            .await?;
         let outliers = if let Some((ref historical, ref rows)) = baseline {
             self.detect_outliers(&metric, historical, rows)
         } else {
             Vec::new()
         };
 
-        let metric_id = self.insert_metric(&metric)?;
+        let metric_id = self.insert_metric(&metric).await?;
         let alert_triggered = !outliers.is_empty();
 
         if alert_triggered {
-            self.store_alert(metric_id, &metric, &outliers)?;
+            self.store_alert(metric_id, &metric, &outliers).await?;
             self.emit_alert(&metric, &outliers).await;
         }
 
@@ -300,27 +333,27 @@ impl SimulationService {
         })
     }
 
-    fn insert_metric(&self, metric: &SimulationMetric) -> Result<i64, AppError> {
-        let conn = self.connect()?;
-        conn.execute(
-            "
-            INSERT INTO simulation_metrics (contract, method, code_hash, cpu_instructions, ram_bytes, ledger_footprint)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ",
-            params![
-                metric.contract,
-                metric.method,
-                metric.code_hash,
-                metric.cpu_instructions as i64,
-                metric.ram_bytes as i64,
-                metric.ledger_footprint as i64
-            ],
+    async fn insert_metric(&self, metric: &SimulationMetric) -> Result<i64, AppError> {
+        let cpu = metric.cpu_instructions as i64;
+        let ram = metric.ram_bytes as i64;
+        let ledger = metric.ledger_footprint as i64;
+        let result = sqlx::query(
+            "INSERT INTO simulation_metrics (contract, method, code_hash, cpu_instructions, ram_bytes, ledger_footprint)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
+        .bind(&metric.contract)
+        .bind(&metric.method)
+        .bind(&metric.code_hash)
+        .bind(cpu)
+        .bind(ram)
+        .bind(ledger)
+        .execute(&self.pool)
+        .await
         .map_err(|e| AppError::Internal(format!("Failed to insert simulation metric: {e}")))?;
-        Ok(conn.last_insert_rowid())
+        Ok(result.last_insert_rowid())
     }
 
-    fn store_alert(
+    async fn store_alert(
         &self,
         simulation_metric_id: i64,
         metric: &SimulationMetric,
@@ -328,58 +361,54 @@ impl SimulationService {
     ) -> Result<(), AppError> {
         let details_json = serde_json::to_string(outliers)
             .map_err(|e| AppError::Internal(format!("Failed to serialize alert details: {e}")))?;
-        let conn = self.connect()?;
-        conn.execute(
-            "
-            INSERT INTO simulation_alerts (simulation_metric_id, contract, method, code_hash, details_json)
-            VALUES (?, ?, ?, ?, ?)
-            ",
-            params![
-                simulation_metric_id,
-                metric.contract,
-                metric.method,
-                metric.code_hash,
-                details_json
-            ],
+        sqlx::query(
+            "INSERT INTO simulation_alerts (simulation_metric_id, contract, method, code_hash, details_json)
+             VALUES (?, ?, ?, ?, ?)",
         )
+        .bind(simulation_metric_id)
+        .bind(&metric.contract)
+        .bind(&metric.method)
+        .bind(&metric.code_hash)
+        .bind(&details_json)
+        .execute(&self.pool)
+        .await
         .map_err(|e| AppError::Internal(format!("Failed to store simulation alert: {e}")))?;
         Ok(())
     }
 
-    fn load_historical_stats(
+    async fn load_historical_stats(
         &self,
         contract: &str,
         method: &str,
         code_hash: &str,
     ) -> Result<Option<(HistoricalAverages, Vec<(u64, u64, u64)>)>, AppError> {
-        let conn = self.connect()?;
-        let mut stmt = conn
-            .prepare(
-                "
-                SELECT cpu_instructions, ram_bytes, ledger_footprint
-                FROM simulation_metrics
-                WHERE contract = ?1 AND method = ?2 AND code_hash = ?3
-                ",
-            )
-            .map_err(|e| AppError::Internal(format!("Failed to prepare history query: {e}")))?;
+        let rows = sqlx::query(
+            "SELECT cpu_instructions, ram_bytes, ledger_footprint
+             FROM simulation_metrics
+             WHERE contract = ? AND method = ? AND code_hash = ?",
+        )
+        .bind(contract)
+        .bind(method)
+        .bind(code_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to query historical metrics: {e}")))?;
 
-        let rows = stmt
-            .query_map(params![contract, method, code_hash], |row| {
-                Ok((
-                    row.get::<_, i64>(0)? as u64,
-                    row.get::<_, i64>(1)? as u64,
-                    row.get::<_, i64>(2)? as u64,
-                ))
-            })
-            .map_err(|e| AppError::Internal(format!("Failed to query historical metrics: {e}")))?;
-
-        let data: Result<Vec<_>, _> = rows.collect();
-        let data = data
-            .map_err(|e| AppError::Internal(format!("Failed to read historical metrics: {e}")))?;
-
-        if data.is_empty() {
+        if rows.is_empty() {
             return Ok(None);
         }
+
+        use sqlx::Row as _;
+        let data: Vec<(u64, u64, u64)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<i64, _>(0) as u64,
+                    r.get::<i64, _>(1) as u64,
+                    r.get::<i64, _>(2) as u64,
+                )
+            })
+            .collect();
 
         let n = data.len() as f64;
         let cpu_sum: f64 = data.iter().map(|r| r.0 as f64).sum();
@@ -535,8 +564,8 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    use rusqlite::Connection;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDbPath(PathBuf);
@@ -576,19 +605,21 @@ mod tests {
         }
     }
 
-    fn alert_count(db_path: &Path) -> usize {
-        let conn = Connection::open(db_path).expect("open sqlite database");
-        conn.query_row("SELECT COUNT(*) FROM simulation_alerts", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .expect("count alerts") as usize
+    async fn alert_count(pool: &SqlitePool) -> usize {
+        use sqlx::Row as _;
+        let row = sqlx::query("SELECT COUNT(*) FROM simulation_alerts")
+            .fetch_one(pool)
+            .await
+            .expect("count alerts");
+        row.get::<i64, _>(0) as usize
     }
 
     #[tokio::test]
     async fn first_sample_has_no_historical_baseline() {
         let db_path = TempDbPath::new("first_sample_has_no_historical_baseline");
-        let service =
-            SimulationService::new(&db_path.0, None).expect("initialize simulation service");
+        let service = SimulationService::new(&db_path.0, None)
+            .await
+            .expect("initialize simulation service");
 
         let result = service
             .record_and_analyze(metric("token", "mint", "hash-a", 100, 100, 100))
@@ -598,14 +629,15 @@ mod tests {
         assert!(!result.has_historical_baseline);
         assert!(!result.alert_triggered);
         assert!(result.outliers.is_empty());
-        assert_eq!(alert_count(&db_path.0), 0);
+        assert_eq!(alert_count(&service.pool).await, 0);
     }
 
     #[tokio::test]
     async fn same_code_hash_shift_over_ten_percent_triggers_alert() {
         let db_path = TempDbPath::new("same_code_hash_shift_triggers_alert");
-        let service =
-            SimulationService::new(&db_path.0, None).expect("initialize simulation service");
+        let service = SimulationService::new(&db_path.0, None)
+            .await
+            .expect("initialize simulation service");
 
         service
             .record_and_analyze(metric("token", "mint", "hash-a", 100, 200, 300))
@@ -620,14 +652,15 @@ mod tests {
         assert!(result.has_historical_baseline);
         assert!(result.alert_triggered);
         assert!(!result.outliers.is_empty());
-        assert_eq!(alert_count(&db_path.0), 1);
+        assert_eq!(alert_count(&service.pool).await, 1);
     }
 
     #[tokio::test]
     async fn different_code_hash_does_not_trigger_no_code_change_alert() {
         let db_path = TempDbPath::new("different_code_hash_does_not_alert");
-        let service =
-            SimulationService::new(&db_path.0, None).expect("initialize simulation service");
+        let service = SimulationService::new(&db_path.0, None)
+            .await
+            .expect("initialize simulation service");
 
         service
             .record_and_analyze(metric("token", "transfer", "hash-a", 100, 200, 300))
@@ -642,14 +675,15 @@ mod tests {
         assert!(!result.has_historical_baseline);
         assert!(!result.alert_triggered);
         assert!(result.outliers.is_empty());
-        assert_eq!(alert_count(&db_path.0), 0);
+        assert_eq!(alert_count(&service.pool).await, 0);
     }
 
     #[tokio::test]
     async fn z_score_outlier_triggers_even_under_ten_percent_shift() {
         let db_path = TempDbPath::new("z_score_outlier_triggers_alert");
-        let service =
-            SimulationService::new(&db_path.0, None).expect("initialize simulation service");
+        let service = SimulationService::new(&db_path.0, None)
+            .await
+            .expect("initialize simulation service");
 
         for cpu in [95_u64, 100, 100, 102, 103] {
             service
@@ -676,7 +710,7 @@ mod tests {
             .z_score
             .map(|z| z.abs() > DEFAULT_ZSCORE_THRESHOLD)
             .unwrap_or(false));
-        assert_eq!(alert_count(&db_path.0), 1);
+        assert_eq!(alert_count(&service.pool).await, 1);
     }
 
     // ── Per-API-key concurrency limit (issue #25) ────────────────────────
@@ -759,6 +793,7 @@ mod tests {
     async fn record_and_analyze_for_key_rejects_over_limit() {
         let db_path = TempDbPath::new("per_key_concurrency_limit");
         let service = SimulationService::new_with_limit(&db_path.0, None, 1)
+            .await
             .expect("initialize simulation service");
         assert_eq!(service.max_concurrent_simulations_per_key(), 1);
 
@@ -775,19 +810,18 @@ mod tests {
         assert_eq!(err.into_response().status(), StatusCode::TOO_MANY_REQUESTS);
 
         // The rejected request must not have touched the database.
-        let conn = Connection::open(&db_path.0).expect("open sqlite database");
-        let persisted: i64 = conn
-            .query_row("SELECT COUNT(*) FROM simulation_metrics", [], |row| {
-                row.get(0)
-            })
+        use sqlx::Row as _;
+        let row = sqlx::query("SELECT COUNT(*) FROM simulation_metrics")
+            .fetch_one(&service.pool)
+            .await
             .expect("count metrics");
+        let persisted: i64 = row.get(0);
         assert_eq!(persisted, 0);
 
         drop(held);
         assert_eq!(service.in_flight_simulations("key-a"), 0);
 
-        // Once the slot is released the same key can run again, and the slot is
-        // returned after the call completes.
+        // Once the slot is released the same key can run again.
         service
             .record_and_analyze_for_key("key-a", metric("token", "mint", "hash-a", 1, 1, 1))
             .await
@@ -799,6 +833,7 @@ mod tests {
     async fn record_and_analyze_for_key_keeps_keys_independent() {
         let db_path = TempDbPath::new("per_key_independent_limits");
         let service = SimulationService::new_with_limit(&db_path.0, None, 1)
+            .await
             .expect("initialize simulation service");
 
         let held = service

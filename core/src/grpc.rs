@@ -40,6 +40,7 @@ use std::fs;
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -64,16 +65,43 @@ use proto::{ContractEvent, StreamContractEventsRequest};
 
 // ── Service implementation ────────────────────────────────────────────────────
 
+/// Default maximum number of concurrently connected gRPC streaming clients.
+///
+/// Each connection holds a broadcast receiver and a background Tokio task.
+/// Without a limit a burst of connections exhausts file descriptors and task
+/// memory (issue #579).  Operators can override this via
+/// [`EventStreamServiceImpl::with_max_clients`].
+pub const DEFAULT_MAX_GRPC_CLIENTS: usize = 1_000;
+
 /// gRPC service implementation.  Holds a reference to the shared
 /// [`SimulationBus`] so it can fan out events to every connected gRPC client.
 pub struct EventStreamServiceImpl {
     bus: Arc<SimulationBus>,
+    /// Live count of connected streaming clients.
+    connected_clients: Arc<AtomicUsize>,
+    /// Maximum number of clients allowed to stream concurrently.
+    max_clients: usize,
 }
 
 impl EventStreamServiceImpl {
     /// Create a new service instance backed by the given bus.
     pub fn new(bus: Arc<SimulationBus>) -> Self {
-        Self { bus }
+        Self {
+            bus,
+            connected_clients: Arc::new(AtomicUsize::new(0)),
+            max_clients: DEFAULT_MAX_GRPC_CLIENTS,
+        }
+    }
+
+    /// Override the maximum number of concurrently connected streaming clients.
+    pub fn with_max_clients(mut self, max_clients: usize) -> Self {
+        self.max_clients = max_clients.max(1);
+        self
+    }
+
+    /// Current number of connected streaming clients.
+    pub fn connected_clients(&self) -> usize {
+        self.connected_clients.load(Ordering::Relaxed)
     }
 }
 
@@ -89,10 +117,29 @@ impl EventStreamService for EventStreamServiceImpl {
     /// The server subscribes to the internal broadcast bus and translates each
     /// [`SimulationEvent::Completed`] into a [`ContractEvent`].  The stream
     /// remains open until the client disconnects or the server shuts down.
+    ///
+    /// Returns `RESOURCE_EXHAUSTED` when the number of connected clients
+    /// already equals `max_clients` (default 1 000).  This prevents file
+    /// descriptor and task exhaustion under a burst of connections (issue #579).
     async fn stream_contract_events(
         &self,
         request: Request<StreamContractEventsRequest>,
     ) -> Result<Response<Self::StreamContractEventsStream>, Status> {
+        // Enforce the client limit before subscribing to the bus.
+        // fetch_add is used rather than compare-and-swap so the counter
+        // accurately reflects the peak even under races; the check below
+        // corrects any over-admission and decrements back.
+        let previous = self
+            .connected_clients
+            .fetch_add(1, Ordering::Relaxed);
+        if previous >= self.max_clients {
+            self.connected_clients.fetch_sub(1, Ordering::Relaxed);
+            return Err(Status::resource_exhausted(format!(
+                "maximum connected clients ({}) reached; try again later",
+                self.max_clients,
+            )));
+        }
+
         let params = request.into_inner();
         let contract_id_filter = params.contract_id.clone();
         let event_types_filter: Vec<String> = params
@@ -106,12 +153,16 @@ impl EventStreamService for EventStreamServiceImpl {
             contract_id = %contract_id_filter,
             start_ledger = params.start_ledger,
             event_types = ?event_types_filter,
+            connected_clients = previous + 1,
+            max_clients = self.max_clients,
             "gRPC client connected to EventStreamService"
         );
 
         let receiver = self.bus.subscribe();
         let bus_stream = BroadcastStream::new(receiver);
 
+        // Clone the counter so the stream task can decrement it on drop.
+        let client_counter = Arc::clone(&self.connected_clients);
         let contract_filter = contract_id_filter.clone();
         let output = bus_stream
             // Drop lagged-error items — slow gRPC consumers skip missed events
@@ -129,7 +180,45 @@ impl EventStreamService for EventStreamServiceImpl {
             })
             .map(Ok);
 
-        Ok(Response::new(Box::pin(output)))
+        // Wrap the stream so the client counter is decremented when the stream
+        // is dropped (i.e. the client disconnects or the server shuts down).
+        let guarded = ClientCountGuard {
+            inner: Box::pin(output),
+            counter: client_counter,
+        };
+
+        Ok(Response::new(Box::pin(guarded)))
+    }
+}
+
+// ── Client-count guard stream ─────────────────────────────────────────────────
+
+/// Wraps an event stream and decrements the connected-client counter when the
+/// stream is dropped.
+struct ClientCountGuard {
+    inner: Pin<Box<dyn Stream<Item = Result<ContractEvent, Status>> + Send + 'static>>,
+    counter: Arc<AtomicUsize>,
+}
+
+impl Stream for ClientCountGuard {
+    type Item = Result<ContractEvent, Status>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl Drop for ClientCountGuard {
+    fn drop(&mut self) {
+        // Saturating so a logic error cannot wrap the counter below zero.
+        let prev = self.counter.fetch_sub(1, Ordering::Relaxed);
+        if prev == 0 {
+            // Guard against wrapping; restore to 0.
+            self.counter.store(0, Ordering::Relaxed);
+        }
     }
 }
 
