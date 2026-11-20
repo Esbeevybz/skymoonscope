@@ -146,6 +146,11 @@ struct AppConfig {
     /// Pre-shared secret for inbound webhook HMAC validation.
     #[serde(default = "default_inbound_webhook_secret")]
     inbound_webhook_secret: String,
+
+    /// Allowed inbound webhook clock skew in seconds; zero requires the current second.
+    /// Env: `WEBHOOK_TIMESTAMP_TOLERANCE_SECS`; default: 300.
+    #[serde(default = "crate::webhook_validation::default_timestamp_tolerance_secs")]
+    webhook_timestamp_tolerance_secs: u64,
     /// Job timeout in seconds (default 300).
     #[serde(default = "default_job_timeout_secs")]
     job_timeout_secs: u64,
@@ -358,6 +363,10 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("simulation_mode", "failover")?
         .set_default("database_url", "sqlite://sky-moon-scope.db")?
         .set_default("inbound_webhook_secret", "")?
+        .set_default(
+            "webhook_timestamp_tolerance_secs",
+            crate::webhook_validation::default_timestamp_tolerance_secs(),
+        )?
         .set_default("job_timeout_secs", 300)?
         .set_default("max_concurrent_jobs", 10)?
         .set_default("event_worker_threads", 4)?
@@ -3132,6 +3141,9 @@ async fn main() {
         .layer(Extension(webhook_validation::InboundWebhookSecret(Arc::new(
             config.inbound_webhook_secret.clone(),
         ))))
+        .layer(Extension(webhook_validation::InboundWebhookTimestampTolerance(
+            config.webhook_timestamp_tolerance_secs,
+        )))
         .layer(Extension(webhook_validation::InboundWebhookNonceCache::default()))
         .layer(Extension(SharedResultsState {
             store: shared_results_store,
