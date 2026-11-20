@@ -158,6 +158,14 @@ The `/ws/jobs/:job_id` WebSocket upgrade and the `/graphql` endpoint are not
 part of the REST description; WebSocket and GraphQL are outside the scope of
 an OpenAPI document and are documented separately.
 
+## Contract Comparison (`/analyze/compare`)
+
+The `/analyze/compare` endpoint evaluates resource usage changes between two contract snapshots (or WASM binaries) and returns a `RegressionReport`.
+
+### ResourceDelta Precision and Rounding
+
+To prevent floating-point drift across successive comparisons, all percent-change values in `ResourceDelta` (and `RegressionReport.deltas`) are rounded to two decimal places before serialisation (e.g. `15.42` represents a 15.42% increase). Clients storing or comparing metrics over time can rely on consistent two-decimal-place precision without spurious threshold regressions caused by IEEE 754 precision artifacts.
+
 ## Adding a new endpoint
 
 1. Annotate the handler with `#[utoipa::path(...)]`, giving it a `tag`, a

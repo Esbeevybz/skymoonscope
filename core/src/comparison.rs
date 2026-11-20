@@ -1,5 +1,5 @@
 use crate::simulation::{SimulationEngine, SimulationError, SorobanResources};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::path::PathBuf;
 use thiserror::Error;
 use utoipa::ToSchema;
@@ -72,22 +72,51 @@ impl Snapshot {
     }
 }
 
+/// Round a percentage change value to two decimal places.
+pub fn round_two_decimals(val: f64) -> f64 {
+    if !val.is_finite() {
+        return val;
+    }
+    let rounded = (val * 100.0).round() / 100.0;
+    if rounded == 0.0 {
+        0.0
+    } else {
+        rounded
+    }
+}
+
+fn serialize_rounded_f64<S>(val: &f64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_f64(round_two_decimals(*val))
+}
+
 /// Percentage change for each tracked resource metric.
+///
+/// All percent-change values are rounded to two decimal places before
+/// serialisation (e.g. `15.42` means a 15.42% increase) to prevent floating-point
+/// drift across successive comparisons.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ResourceDelta {
-    /// CPU instruction change (e.g. +15.4 means 15.4% increase)
+    /// CPU instruction change percentage, rounded to two decimal places (e.g. +15.40 means 15.4% increase)
+    #[serde(serialize_with = "serialize_rounded_f64")]
     #[schema(example = json!(15.4))]
     pub cpu_instructions: f64,
-    /// RAM byte change
+    /// RAM byte change percentage, rounded to two decimal places
+    #[serde(serialize_with = "serialize_rounded_f64")]
     #[schema(example = json!(-2.1))]
     pub ram_bytes: f64,
-    /// Ledger read bytes change
+    /// Ledger read bytes change percentage, rounded to two decimal places
+    #[serde(serialize_with = "serialize_rounded_f64")]
     #[schema(example = json!(0.0))]
     pub ledger_read_bytes: f64,
-    /// Ledger write bytes change
+    /// Ledger write bytes change percentage, rounded to two decimal places
+    #[serde(serialize_with = "serialize_rounded_f64")]
     #[schema(example = json!(5.3))]
     pub ledger_write_bytes: f64,
-    /// Transaction size bytes change
+    /// Transaction size bytes change percentage, rounded to two decimal places
+    #[serde(serialize_with = "serialize_rounded_f64")]
     #[schema(example = json!(1.0))]
     pub transaction_size_bytes: f64,
 }
@@ -97,7 +126,8 @@ pub struct ResourceDelta {
 pub struct RegressionFlag {
     /// The resource that regressed (e.g. "cpu_instructions")
     pub resource: String,
-    /// Percentage change
+    /// Percentage change rounded to two decimal places
+    #[serde(serialize_with = "serialize_rounded_f64")]
     pub change_percent: f64,
     /// "high" if >10%, "critical" if >25%
     pub severity: String,
@@ -293,7 +323,8 @@ fn pct_change(current: u64, base: u64) -> f64 {
     if base == 0 {
         return 0.0;
     }
-    ((current as f64 - base as f64) / base as f64) * 100.0
+    let val = ((current as f64 - base as f64) / base as f64) * 100.0;
+    round_two_decimals(val)
 }
 
 /// Pretty-print a `RegressionReport` to stdout (used by the CLI).
@@ -405,6 +436,25 @@ mod tests {
         assert!((deltas.ledger_read_bytes - 25.0).abs() < 0.001);
         assert!((deltas.ledger_write_bytes - 0.0).abs() < 0.001);
         assert!((deltas.transaction_size_bytes - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_calculate_deltas_precision_rounding() {
+        let current = make_resources(1, 10003, 1001, 100, 200);
+        let base = make_resources(3, 10000, 1000, 100, 200);
+
+        let deltas = calculate_deltas(&current, &base);
+
+        // (1 - 3) / 3 * 100 = -66.666666... rounded to 2 decimal places = -66.67
+        assert_eq!(deltas.cpu_instructions, -66.67);
+        // (10003 - 10000) / 10000 * 100 = 0.03%
+        assert_eq!(deltas.ram_bytes, 0.03);
+        // (1001 - 1000) / 1000 * 100 = 0.1%
+        assert_eq!(deltas.ledger_read_bytes, 0.1);
+
+        let json = serde_json::to_string(&deltas).expect("should serialize");
+        assert!(json.contains("\"cpu_instructions\":-66.67"));
+        assert!(json.contains("\"ram_bytes\":0.03"));
     }
 
     #[test]
