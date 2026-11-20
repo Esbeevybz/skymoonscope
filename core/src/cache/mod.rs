@@ -137,6 +137,13 @@ impl SimulationCache {
         None
     }
 
+    /// Persist `result` into L1 and the on-disk `simulation_results` tree.
+    ///
+    /// The disk write is best-effort and is intentionally *not* fsynced: Sled
+    /// flushes asynchronously, so a crash shortly after this call may lose the
+    /// entry. That is tolerated here because a missing simulation result is
+    /// simply recomputed on the next request — unlike ledger entries, it must
+    /// not pay an fsync on the hot path.
     pub async fn set(&self, key: String, result: SimulationResult) {
         let entry = CacheEntry {
             ledger_sequence: result.latest_ledger,
@@ -286,7 +293,21 @@ impl ContractCache {
         None
     }
 
-    pub fn set_ledger_entry(&self, key_64: String, entry_bytes: Vec<u8>, ledger_sequence: u64) {
+    /// Insert a ledger entry and force it to disk before returning.
+    ///
+    /// Sled acknowledges writes from an in-memory buffer and only flushes to
+    /// stable storage asynchronously, so a crash immediately after a write
+    /// could lose the entry and leave the ledger cache inconsistent with
+    /// entries callers have already observed. We therefore fsync the store
+    /// after every ledger-entry write. The [`SimulationCache`] result tree
+    /// deliberately does *not* do this (see [`SimulationCache::set`]) because a
+    /// lost simulation result is simply recomputed.
+    pub async fn set_ledger_entry(
+        &self,
+        key_64: String,
+        entry_bytes: Vec<u8>,
+        ledger_sequence: u64,
+    ) {
         let entry = CacheEntry {
             data: entry_bytes,
             ledger_sequence,
@@ -297,6 +318,9 @@ impl ContractCache {
         };
         if let Ok(bytes) = serde_json::to_vec(&entry) {
             let _ = self.ledger_tree.insert(key_64.clone(), bytes);
+            if let Err(e) = self.ledger_tree.flush_async().await {
+                tracing::warn!(error = %e, "failed to flush ledger entry cache to disk");
+            }
         }
         self.ledger_memory.insert(key_64, entry);
     }

@@ -183,6 +183,11 @@ struct AppConfig {
     /// TTL in seconds for the in-memory contract ledger cache (default 300).
     #[serde(default = "default_ledger_cache_ttl_secs")]
     ledger_cache_ttl_secs: u64,
+    /// Maximum number of simulations a single API key may run concurrently
+    /// before the service rejects further requests with `429 Too Many Requests`.
+    /// Env: `MAX_CONCURRENT_SIMULATIONS_PER_KEY` · Default: `8`
+    #[serde(default = "default_max_concurrent_simulations_per_key")]
+    max_concurrent_simulations_per_key: usize,
     /// Maximum on-disk simulation cache size in megabytes (default 100).
     #[serde(default = "default_max_cache_size_mb")]
     max_cache_size_mb: u64,
@@ -285,6 +290,10 @@ fn default_ledger_cache_ttl_secs() -> u64 {
     300
 }
 
+fn default_max_concurrent_simulations_per_key() -> usize {
+    8
+}
+
 fn default_max_cache_size_mb() -> u64 {
     100
 }
@@ -360,6 +369,10 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("disk_cache_path", "")?
         .set_default("max_ledger_age", 100)?
         .set_default("ledger_cache_ttl_secs", default_ledger_cache_ttl_secs())?
+        .set_default(
+            "max_concurrent_simulations_per_key",
+            default_max_concurrent_simulations_per_key(),
+        )?
         .set_default("max_cache_size_mb", 100)?
         .set_default("cors_allowed_origins", "")?
         .set_default("event_bus_capacity", 256)?
@@ -2304,9 +2317,10 @@ async fn main() {
             let db_path = env::var("SKY_MOON_SCOPE_DB_PATH")
                 .unwrap_or_else(|_| "sky_moon_scope_metrics.db".to_string());
             let webhook_url = env::var("SKY_MOON_SCOPE_ALERT_WEBHOOK_URL").ok();
-            let simulation_service = SimulationService::new(db_path, webhook_url)
-                .await
-                .expect("initialize simulation service");
+            let simulation_service =
+                SimulationService::new_with_limit(db_path, webhook_url, config.max_concurrent_simulations_per_key)
+                    .await
+                    .expect("initialize simulation service");
             if let Err(e) = benchmarks::run_token_benchmark(path, &simulation_service).await {
                 tracing::error!("Benchmark failed: {}", e);
             }

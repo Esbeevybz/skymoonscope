@@ -2669,7 +2669,9 @@ impl SimulationEngine {
         for entry in fetched_entries {
             if let Some(cache) = &self.contract_cache {
                 if let Ok(bytes) = serde_json::to_vec(&entry) {
-                    cache.set_ledger_entry(entry.key.clone(), bytes, latest_ledger);
+                    cache
+                        .set_ledger_entry(entry.key.clone(), bytes, latest_ledger)
+                        .await;
                 }
             }
 

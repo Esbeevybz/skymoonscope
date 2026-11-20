@@ -11,6 +11,14 @@ use tracing::error;
 use crate::comparison::ComparisonError;
 use crate::simulation::SimulationError;
 
+/// Value advertised in the `Retry-After` header on every `429 Too Many
+/// Requests` response.
+///
+/// The per-API-key limit is a concurrency ceiling rather than a fixed time
+/// window, so there is no exact moment at which a slot frees. A short backoff
+/// hint lets batch clients pace their retries instead of hot-looping.
+const RETRY_AFTER_SECONDS: &str = "1";
+
 #[derive(Error, Debug)]
 #[allow(dead_code)]
 pub enum AppError {
@@ -142,6 +150,14 @@ impl IntoResponse for AppError {
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/problem+json"),
             );
+            // 429 responses advertise a short retry hint so batch clients can
+            // back off instead of immediately re-hitting the per-key limit.
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                response.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    header::HeaderValue::from_static(RETRY_AFTER_SECONDS),
+                );
+            }
             response
         }
     }

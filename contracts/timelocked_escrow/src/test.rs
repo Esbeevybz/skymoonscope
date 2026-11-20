@@ -55,6 +55,7 @@ fn setup() -> (
         &LOCK_LEDGERS,
         &FEE_BPS,
         &protocol_vault,
+        &None::<u32>,
     );
 
     (
@@ -422,6 +423,7 @@ fn test_duplicate_guardians_rejected() {
         &LOCK_LEDGERS,
         &FEE_BPS,
         &protocol_vault,
+        &None::<u32>,
     );
 }
 
@@ -440,6 +442,7 @@ fn test_double_initialize_fails() {
         &LOCK_LEDGERS,
         &FEE_BPS,
         &_vault,
+        &None::<u32>,
     );
 }
 
@@ -470,10 +473,14 @@ fn test_bitmap_operations() {
     assert_eq!(approval_count(0b10101), 3);
     assert_eq!(approval_count(0b11111), 5);
 
-    assert!(!has_quorum(0b00000));
-    assert!(!has_quorum(0b00011));
-    assert!(has_quorum(0b00111));
-    assert!(has_quorum(0b11111));
+    assert!(!has_quorum(0b00000, 3));
+    assert!(!has_quorum(0b00011, 3));
+    assert!(has_quorum(0b00111, 3));
+    assert!(has_quorum(0b11111, 3));
+
+    // Threshold is a parameter — a single approval is never quorum-safe for 5.
+    assert!(!has_quorum(0b00001, 3));
+    assert!(has_quorum(0b00001, 1));
 
     // set_approval
     let bm = set_approval(0, 0).unwrap();
@@ -616,6 +623,7 @@ fn test_initialize_with_max_fee() {
         &LOCK_LEDGERS,
         &10_000u32,
         &protocol_vault,
+        &None::<u32>,
     );
 
     let config = client.get_config();
@@ -655,6 +663,7 @@ fn test_initialize_excessive_fee_fails() {
         &LOCK_LEDGERS,
         &10_001u32,
         &protocol_vault,
+        &None::<u32>,
     );
 }
 
@@ -692,6 +701,7 @@ fn test_cancel_with_zero_fee() {
         &LOCK_LEDGERS,
         &0u32,
         &protocol_vault,
+        &None::<u32>,
     );
 
     let token_client = token::Client::new(&e, &token_addr);
@@ -739,6 +749,7 @@ fn test_mutual_cancel_with_zero_fee() {
         &LOCK_LEDGERS,
         &0u32,
         &protocol_vault,
+        &None::<u32>,
     );
 
     let token_client = token::Client::new(&e, &token_addr);
@@ -851,4 +862,86 @@ fn test_approvals_early_do_not_enable_early_release() {
     e.ledger()
         .with_mut(|l| l.sequence_number = unlock_ledger - 1);
     assert_eq!(client.try_release(), Err(Ok(Error::TimelockNotExpired)));
+}
+
+// ── Configurable quorum threshold (issue #76) ─────────────────
+
+/// Builds an initialized escrow with an explicit guardian quorum threshold.
+fn setup_with_threshold(
+    required: Option<u32>,
+) -> (Env, TimelockEscrowClient<'static>, Vec<Address>) {
+    let e = Env::default();
+    e.mock_all_auths();
+    e.cost_estimate().budget().reset_unlimited();
+
+    let depositor = Address::generate(&e);
+    let beneficiary = Address::generate(&e);
+    let protocol_vault = Address::generate(&e);
+    let token_admin = Address::generate(&e);
+    let token_addr = e
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sac = token::StellarAssetClient::new(&e, &token_addr);
+    sac.mint(&depositor, &(DEPOSIT_AMOUNT * 2));
+
+    let mut guardians = Vec::new(&e);
+    for _ in 0..5 {
+        guardians.push_back(Address::generate(&e));
+    }
+
+    let contract_id = e.register(TimelockEscrow, ());
+    let client = TimelockEscrowClient::new(&e, &contract_id);
+
+    client.initialize(
+        &depositor,
+        &beneficiary,
+        &token_addr,
+        &guardians,
+        &LOCK_LEDGERS,
+        &FEE_BPS,
+        &protocol_vault,
+        &required,
+    );
+
+    (e, client, guardians)
+}
+
+#[test]
+fn test_default_required_approvals_is_majority() {
+    let (_e, client, _guardians) = setup_with_threshold(None);
+    // Strict majority of 5 guardians: floor(5 / 2) + 1 = 3 — never 1.
+    assert_eq!(client.get_required_approvals(), 3);
+}
+
+#[test]
+fn test_explicit_required_approvals_is_enforced() {
+    let (e, client, guardians) = setup_with_threshold(Some(4));
+    assert_eq!(client.get_required_approvals(), 4);
+
+    client.deposit(&DEPOSIT_AMOUNT);
+    for i in 0..3 {
+        client.approve(&guardians.get(i).unwrap());
+    }
+    advance_ledger(&e, LOCK_LEDGERS + 1);
+
+    // 3 of 5 is below the configured 4-of-5 quorum.
+    assert!(!client.is_releasable());
+    assert_eq!(client.try_release(), Err(Ok(Error::InsufficientApprovals)));
+
+    // The fourth approval reaches the configured threshold.
+    client.approve(&guardians.get(3).unwrap());
+    assert!(client.is_releasable());
+    assert_eq!(client.try_release(), Ok(()));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_zero_required_approvals_rejected() {
+    let _ = setup_with_threshold(Some(0));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_required_approvals_above_guardian_count_rejected() {
+    let _ = setup_with_threshold(Some(6));
 }

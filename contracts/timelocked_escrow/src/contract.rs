@@ -1,9 +1,10 @@
 use crate::escrow::{has_config, read_config, require_active, require_funded, write_config};
 use crate::guardian::{
-    approval_count, clear_pending_rotation, guardian_index, has_quorum, read_approvals,
-    read_epoch, read_guardians, read_pending_rotation, read_rotation_delay, set_approval,
-    validate_guardians, write_approvals, write_epoch, write_guardians, write_pending_rotation,
-    REQUIRED_APPROVALS,
+    approval_count, clear_pending_rotation, default_required_approvals, guardian_index,
+    has_quorum, read_approvals, read_epoch, read_guardians, read_pending_rotation,
+    read_required_approvals, read_rotation_delay, set_approval, validate_guardians,
+    write_approvals, write_epoch, write_guardians, write_pending_rotation,
+    write_required_approvals,
 };
 use crate::storage_types::{
     ApprovalEvent, CancelEvent, DepositEvent, Error, EscrowConfig, GuardianRotationCancelledEvent,
@@ -21,6 +22,9 @@ impl TimelockEscrow {
     /// The timelock is computed as current ledger sequence + `lock_ledgers`.
     /// `cancellation_fee_bps` is the fee (in basis points) deducted on cancel, capped at 10000.
     /// `protocol_vault` receives the cancellation fee.
+    /// `required_approvals` is the guardian quorum threshold (issue #76). When `None`
+    /// it defaults to a strict majority of the guardian set (`default_required_approvals`),
+    /// so a single compromised guardian can never unilaterally reach quorum.
     pub fn initialize(
         e: Env,
         depositor: Address,
@@ -30,6 +34,7 @@ impl TimelockEscrow {
         lock_ledgers: u32,
         cancellation_fee_bps: u32,
         protocol_vault: Address,
+        required_approvals: Option<u32>,
     ) -> Result<(), Error> {
         if has_config(&e) {
             return Err(Error::AlreadyInitialized);
@@ -37,6 +42,12 @@ impl TimelockEscrow {
         validate_guardians(&guardians)?;
         if cancellation_fee_bps > 10_000 {
             return Err(Error::CancellationFeeTooHigh);
+        }
+
+        let required = required_approvals
+            .unwrap_or_else(|| default_required_approvals(guardians.len()));
+        if required == 0 || required > guardians.len() {
+            return Err(Error::InvalidApprovalThreshold);
         }
 
         let config = EscrowConfig {
@@ -55,6 +66,7 @@ impl TimelockEscrow {
         write_guardians(&e, &guardians);
         write_approvals(&e, 0u32);
         write_epoch(&e, 0u32);
+        write_required_approvals(&e, required);
 
         e.storage().instance().extend_ttl(100, 100);
         Ok(())
@@ -135,7 +147,7 @@ impl TimelockEscrow {
         }
 
         let bitmap = read_approvals(&e);
-        if !has_quorum(bitmap) {
+        if !has_quorum(bitmap, read_required_approvals(&e)) {
             return Err(Error::InsufficientApprovals);
         }
 
@@ -269,8 +281,8 @@ impl TimelockEscrow {
         Ok(())
     }
 
-    /// Proposes a new guardian set. Requires exactly 3 current guardians to authorize.
-    /// Initiates a time-lock delay before the rotation can be executed.
+    /// Proposes a new guardian set. Requires exactly the stored quorum of current
+    /// guardians to authorize. Initiates a time-lock delay before the rotation can be executed.
     pub fn propose_guardian_rotation(
         e: Env,
         new_guardians: Vec<Address>,
@@ -281,7 +293,7 @@ impl TimelockEscrow {
 
         validate_guardians(&new_guardians)?;
 
-        if approving_guardians.len() != REQUIRED_APPROVALS {
+        if approving_guardians.len() != read_required_approvals(&e) {
             return Err(Error::InsufficientApprovals);
         }
 
@@ -414,6 +426,11 @@ impl TimelockEscrow {
         approval_count(read_approvals(&e))
     }
 
+    /// Quorum threshold currently required to release or rotate (issue #76).
+    pub fn get_required_approvals(e: Env) -> u32 {
+        read_required_approvals(&e)
+    }
+
     pub fn is_releasable(e: Env) -> bool {
         match read_config(&e) {
             Ok(config) => {
@@ -421,7 +438,7 @@ impl TimelockEscrow {
                     && !config.is_cancelled
                     && config.amount > 0
                     && e.ledger().sequence() >= config.unlock_ledger
-                    && has_quorum(read_approvals(&e))
+                    && has_quorum(read_approvals(&e), read_required_approvals(&e))
             }
             Err(_) => false,
         }

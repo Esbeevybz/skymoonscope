@@ -13,8 +13,9 @@ const DEFAULT_ZSCORE_THRESHOLD: f64 = 2.0;
 const DEFAULT_SHIFT_THRESHOLD: f64 = 0.10;
 
 /// Default ceiling on how many simulations a single API key may run at the
-/// same time. Operators can override it when building the service.
-pub const DEFAULT_MAX_CONCURRENT_SIMULATIONS_PER_KEY: usize = 4;
+/// same time. Operators can override it via `MAX_CONCURRENT_SIMULATIONS_PER_KEY`
+/// (see `AppConfig::max_concurrent_simulations_per_key`).
+pub const DEFAULT_MAX_CONCURRENT_SIMULATIONS_PER_KEY: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationMetric {
