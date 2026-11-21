@@ -193,7 +193,6 @@ impl TokenTrait for Token {
                 amount,
             },
         );
-        spend_balance(&e, from.clone(), amount);
         write_total_supply(&e, read_total_supply(&e) - amount);
     }
 
@@ -213,8 +212,6 @@ impl TokenTrait for Token {
                 amount,
             },
         );
-        spend_allowance(&e, from.clone(), spender.clone(), amount);
-        spend_balance(&e, from.clone(), amount);
         write_total_supply(&e, read_total_supply(&e) - amount);
     }
 
