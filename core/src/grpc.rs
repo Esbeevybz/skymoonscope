@@ -40,15 +40,14 @@ use std::fs;
 use std::io::{self, BufReader};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use rustls_pemfile::certs as read_cert_chain;
-use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::{Stream, StreamExt};
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::Stream;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
@@ -72,6 +71,16 @@ use proto::{ContractEvent, StreamContractEventsRequest};
 /// memory (issue #579).  Operators can override this via
 /// [`EventStreamServiceImpl::with_max_clients`].
 pub const DEFAULT_MAX_GRPC_CLIENTS: usize = 1_000;
+
+/// Maximum number of translated events buffered per gRPC connection before the
+/// connection is treated as an overloaded (slow) consumer and disconnected.
+///
+/// Each connection decouples its shared broadcast subscription from the
+/// outbound gRPC stream with a queue of this size.  Once a consumer lets the
+/// queue fill, the producer stops pulling from the bus and the stream is closed
+/// with an explicit overload status — a slow consumer can therefore never stall
+/// the broadcast channel for other subscribers (Issue #066).
+pub const GRPC_STREAM_QUEUE_CAPACITY: usize = 512;
 
 /// gRPC service implementation.  Holds a reference to the shared
 /// [`SimulationBus`] so it can fan out events to every connected gRPC client.
@@ -121,6 +130,11 @@ impl EventStreamService for EventStreamServiceImpl {
     /// Returns `RESOURCE_EXHAUSTED` when the number of connected clients
     /// already equals `max_clients` (default 1 000).  This prevents file
     /// descriptor and task exhaustion under a burst of connections (issue #579).
+    ///
+    /// Each connection buffers translated events in a bounded queue
+    /// ([`GRPC_STREAM_QUEUE_CAPACITY`]).  If a slow consumer lets that queue
+    /// overflow, the stream terminates with a `RESOURCE_EXHAUSTED` overload
+    /// status instead of stalling the shared broadcast channel (Issue #066).
     async fn stream_contract_events(
         &self,
         request: Request<StreamContractEventsRequest>,
@@ -158,32 +172,63 @@ impl EventStreamService for EventStreamServiceImpl {
             "gRPC client connected to EventStreamService"
         );
 
-        let receiver = self.bus.subscribe();
-        let bus_stream = BroadcastStream::new(receiver);
+        let mut receiver = self.bus.subscribe();
+
+        // Decouple the shared broadcast subscription from the outbound gRPC
+        // stream with a per-connection bounded queue (Issue #066).  A background
+        // task drains the broadcast receiver into the queue; the response stream
+        // reads from the queue.  When a slow consumer lets the queue fill, the
+        // task flags the connection as overloaded and stops pulling from the bus
+        // rather than stalling the broadcast channel; the stream then surfaces an
+        // explicit overload status and closes.
+        let (tx, rx) = mpsc::channel::<ContractEvent>(GRPC_STREAM_QUEUE_CAPACITY);
+        let overloaded = Arc::new(AtomicBool::new(false));
+
+        let contract_filter = contract_id_filter.clone();
+        let overload_flag = Arc::clone(&overloaded);
+        tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(traced_msg) => {
+                        if let Some(event) =
+                            translate_event(traced_msg.payload, &contract_filter, &event_types_filter)
+                        {
+                            match tx.try_send(event) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // Slow consumer: signal overload and stop
+                                    // feeding this connection so the broadcast
+                                    // channel is never blocked.
+                                    overload_flag.store(true, Ordering::SeqCst);
+                                    break;
+                                }
+                                // Consumer already disconnected; nothing to do.
+                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            skipped = skipped,
+                            "gRPC stream lagged; some events were dropped"
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
 
         // Clone the counter so the stream task can decrement it on drop.
         let client_counter = Arc::clone(&self.connected_clients);
-        let contract_filter = contract_id_filter.clone();
-        let output = bus_stream
-            // Drop lagged-error items — slow gRPC consumers skip missed events
-            // rather than crashing the stream.
-            .filter_map(move |item| {
-                let cf = contract_filter.clone();
-                let etf = event_types_filter.clone();
-                match item {
-                    Err(_lagged) => {
-                        tracing::warn!("gRPC stream lagged; some events were dropped");
-                        None
-                    }
-                    Ok(traced_msg) => translate_event(traced_msg.payload, &cf, &etf),
-                }
-            })
-            .map(Ok);
 
         // Wrap the stream so the client counter is decremented when the stream
         // is dropped (i.e. the client disconnects or the server shuts down).
         let guarded = ClientCountGuard {
-            inner: Box::pin(output),
+            inner: Box::pin(BoundedEventStream {
+                rx,
+                overloaded,
+                finished: false,
+            }),
             counter: client_counter,
         };
 
@@ -220,6 +265,62 @@ impl Drop for ClientCountGuard {
             self.counter.store(0, Ordering::Relaxed);
         }
     }
+}
+
+// ── Bounded per-connection queue stream ───────────────────────────────────────
+
+/// Stream that drains the per-connection bounded event queue.
+///
+/// The matching producer task pulls from the shared [`SimulationBus`] broadcast
+/// channel into this queue.  When the queue overflows because the consumer is
+/// too slow, the producer flags the connection and stops consuming, and this
+/// stream ends with an explicit overload [`Status`] instead of closing
+/// silently.  This keeps a slow consumer from stalling the broadcast channel for
+/// other subscribers (Issue #066).
+struct BoundedEventStream {
+    /// Receives translated events from the per-connection producer task.
+    rx: mpsc::Receiver<ContractEvent>,
+    /// Set by the producer task when the queue overflowed.
+    overloaded: Arc<AtomicBool>,
+    /// Whether the terminal item (error or clean end) has been emitted.
+    finished: bool,
+}
+
+impl Stream for BoundedEventStream {
+    type Item = Result<ContractEvent, Status>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // `BoundedEventStream` is `Unpin` (all fields are `Unpin`).
+        let this = self.get_mut();
+        if this.finished {
+            return std::task::Poll::Ready(None);
+        }
+        match this.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(event)) => std::task::Poll::Ready(Some(Ok(event))),
+            std::task::Poll::Ready(None) => {
+                this.finished = true;
+                if this.overloaded.load(Ordering::SeqCst) {
+                    // Explicit overload signal for the slow consumer before the
+                    // stream closes.
+                    std::task::Poll::Ready(Some(Err(consumer_overloaded_status())))
+                } else {
+                    std::task::Poll::Ready(None)
+                }
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Status returned to a slow consumer whose per-connection queue overflowed.
+fn consumer_overloaded_status() -> Status {
+    Status::resource_exhausted(format!(
+        "consumer too slow: outbound event queue ({} events) overflowed; stream closed",
+        GRPC_STREAM_QUEUE_CAPACITY
+    ))
 }
 
 // ── Translation helpers ───────────────────────────────────────────────────────

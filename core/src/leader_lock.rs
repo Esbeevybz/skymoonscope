@@ -34,6 +34,14 @@ end
 const RENEW_SCRIPT_SHA: &str = "9d70d8566d8043418770b1952c5d93613a3d574f";
 const RELEASE_SCRIPT_SHA: &str = "aefc6bbfaac1ed02c135d12b12c8c42cdfb36af4";
 
+/// Default proactive renewal interval, expressed as a percentage of the lease
+/// TTL.
+///
+/// Renewing at 40% of the TTL (rather than a hard-coded half-TTL) leaves a
+/// larger safety margin, so a renewal delayed by Redis latency still lands well
+/// before the lease expires and leadership is not lost for a cycle (Issue #070).
+const DEFAULT_RENEWAL_INTERVAL_PERCENT: usize = 40;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LeaderLockInitError {
     #[error("Redis scripting command failed: {0}")]
@@ -52,20 +60,40 @@ pub struct RedisLeaderLock {
     key: String,
     token: String,
     ttl_ms: usize,
+    /// How often the lease is proactively renewed before it expires.
+    renewal_interval_ms: usize,
     lease_deadline: std::sync::Mutex<Option<Instant>>,
+    /// Earliest instant at which the next renewal should be attempted.
+    next_renewal: std::sync::Mutex<Option<Instant>>,
 }
 
 impl RedisLeaderLock {
     pub fn new(redis: RedisClient, key: impl Into<String>, ttl: Duration) -> Self {
         let ttl_ms = ttl.as_millis().try_into().unwrap_or(usize::MAX).max(1);
+        // Default renewal interval: 40% of the TTL, clamped to `[1, ttl]`.
+        let renewal_interval_ms =
+            (ttl_ms.saturating_mul(DEFAULT_RENEWAL_INTERVAL_PERCENT) / 100).clamp(1, ttl_ms);
 
         Self {
             redis,
             key: key.into(),
             token: Uuid::new_v4().to_string(),
             ttl_ms,
+            renewal_interval_ms,
             lease_deadline: std::sync::Mutex::new(None),
+            next_renewal: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Override the proactive renewal interval (default: 40% of the TTL).
+    ///
+    /// The interval is clamped to `[1 ms, ttl]`.  A shorter interval renews more
+    /// often (more Redis traffic); a longer interval reduces the safety margin
+    /// before the lease expires.
+    pub fn with_renewal_interval(mut self, interval: Duration) -> Self {
+        let interval_ms: usize = interval.as_millis().try_into().unwrap_or(usize::MAX);
+        self.renewal_interval_ms = interval_ms.clamp(1, self.ttl_ms);
+        self
     }
 
     /// Load and validate the Lua scripts before starting leader election.
@@ -105,16 +133,43 @@ impl RedisLeaderLock {
     /// instance currently holds it (or Redis is unreachable, in which case
     /// callers should treat the cycle as non-leader and skip).
     pub async fn try_acquire_or_renew(&self) -> bool {
+        let now = Instant::now();
+
+        // Renewal-interval gate (Issue #070): while we still hold a lease that
+        // has not yet reached its renewal interval, report leadership without a
+        // Redis round-trip.  Renewing no more often than `renewal_interval`
+        // (default 40% of the TTL) keeps a safety margin so a renewal delayed by
+        // Redis latency still arrives before the lease expires.
+        {
+            let deadline = *self
+                .lease_deadline
+                .lock()
+                .expect("leader lock deadline mutex poisoned");
+            let renew_at = *self
+                .next_renewal
+                .lock()
+                .expect("leader lock renewal mutex poisoned");
+            if let (Some(deadline), Some(renew_at)) = (deadline, renew_at) {
+                if now < deadline && now < renew_at {
+                    return true;
+                }
+            }
+        }
+
         let expired = self
             .lease_deadline
             .lock()
             .expect("leader lock deadline mutex poisoned")
-            .is_some_and(|deadline| Instant::now() >= deadline);
+            .is_some_and(|deadline| now >= deadline);
         if expired {
             *self
                 .lease_deadline
                 .lock()
                 .expect("leader lock deadline mutex poisoned") = None;
+            *self
+                .next_renewal
+                .lock()
+                .expect("leader lock renewal mutex poisoned") = None;
         }
 
         let mut conn = match self.redis.get_multiplexed_async_connection().await {
@@ -169,11 +224,17 @@ impl RedisLeaderLock {
     }
 
     fn update_lease_deadline(&self) {
+        let now = Instant::now();
         *self
             .lease_deadline
             .lock()
             .expect("leader lock deadline mutex poisoned") =
-            Some(Instant::now() + Duration::from_millis(self.ttl_ms as u64));
+            Some(now + Duration::from_millis(self.ttl_ms as u64));
+        *self
+            .next_renewal
+            .lock()
+            .expect("leader lock renewal mutex poisoned") =
+            Some(now + Duration::from_millis(self.renewal_interval_ms as u64));
     }
 
     /// Release the lease if still held by this instance. Best-effort — if
@@ -200,6 +261,10 @@ impl RedisLeaderLock {
             .lease_deadline
             .lock()
             .expect("leader lock deadline mutex poisoned") = None;
+        *self
+            .next_renewal
+            .lock()
+            .expect("leader lock renewal mutex poisoned") = None;
     }
 }
 
@@ -225,5 +290,27 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(lock.ttl_ms, 1);
+    }
+
+    #[test]
+    fn default_renewal_interval_is_forty_percent_of_ttl() {
+        let lock = RedisLeaderLock::new(
+            RedisClient::open("redis://127.0.0.1/").expect("valid Redis URL"),
+            "test",
+            Duration::from_millis(1_000),
+        );
+        assert_eq!(lock.ttl_ms, 1_000);
+        assert_eq!(lock.renewal_interval_ms, 400);
+    }
+
+    #[test]
+    fn renewal_interval_override_is_clamped_to_ttl() {
+        let lock = RedisLeaderLock::new(
+            RedisClient::open("redis://127.0.0.1/").expect("valid Redis URL"),
+            "test",
+            Duration::from_millis(100),
+        )
+        .with_renewal_interval(Duration::from_secs(5));
+        assert_eq!(lock.renewal_interval_ms, 100);
     }
 }
