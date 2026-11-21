@@ -1,4 +1,6 @@
-use crate::{Error, MultiYieldVault, MultiYieldVaultClient, ScheduleFrequency, MAX_SCHEDULES};
+use crate::{
+    DataKey, Error, MultiYieldVault, MultiYieldVaultClient, ScheduleFrequency, MAX_SCHEDULES,
+};
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, TryIntoVal};
 
@@ -242,6 +244,36 @@ fn test_withdraw_returns_tokens() {
     let received = client.withdraw(&user, &500);
     assert!(received > 0);
     assert_eq!(client.vault_balance(&user), 500);
+}
+
+#[test]
+fn test_withdraw_is_noop_when_total_shares_are_zero() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _, _, vault_id) = setup(&e);
+    let user = Address::generate(&e);
+
+    // Simulate inconsistent legacy state: a balance exists even though supply is zero.
+    e.as_contract(&vault_id, || {
+        e.storage()
+            .persistent()
+            .set(&DataKey::Balance(user.clone()), &1_000i128);
+    });
+
+    assert_eq!(client.withdraw(&user, &500), 0);
+    assert_eq!(client.vault_balance(&user), 1_000);
+    assert_eq!(client.get_vault().total_shares, 0);
+
+    let emitted_noop = e
+        .events()
+        .all()
+        .iter()
+        .filter(|(addr, _, _)| addr == &vault_id)
+        .any(|(_, topics, _)| {
+            let name: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&e);
+            name.ok() == Some(Symbol::new(&e, "withdraw_noop"))
+        });
+    assert!(emitted_noop);
 }
 
 #[test]
