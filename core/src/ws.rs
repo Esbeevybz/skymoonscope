@@ -112,6 +112,14 @@ pub struct FailedPayload {
     pub error_type: String,
 }
 
+/// Emitted when the subscriber falls behind and the broadcast channel drops
+/// messages. The client can use this to detect gaps and retry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaggedPayload {
+    /// Number of events dropped due to the subscriber lagging.
+    pub dropped: u64,
+}
+
 /// All events that can be published on the [`SimulationBus`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -141,6 +149,11 @@ pub enum SimulationEvent {
         data: FailedPayload,
         timestamp: DateTime<Utc>,
     },
+    Lagged {
+        job_id: String,
+        data: LaggedPayload,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 impl SimulationEvent {
@@ -152,6 +165,7 @@ impl SimulationEvent {
             Self::ConsensusCheck { job_id, .. } => job_id,
             Self::Completed { job_id, .. } => job_id,
             Self::Failed { job_id, .. } => job_id,
+            Self::Lagged { job_id, .. } => job_id,
         }
     }
 
@@ -396,7 +410,30 @@ async fn handle_socket(mut socket: WebSocket, job_id: String, state: Arc<crate::
                             skipped = n,
                             "WebSocket consumer lagged — events were skipped"
                         );
-                        // Keep going; the client just missed some progress ticks
+                        
+                        // Send explicit lagged notification to the client
+                        let lagged_event = SimulationEvent::Lagged {
+                            job_id: job_id.clone(),
+                            data: LaggedPayload { dropped: n },
+                            timestamp: Utc::now(),
+                        };
+                        
+                        let json = match serde_json::to_string(&lagged_event) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!(
+                                    job_id = %job_id,
+                                    error = %e,
+                                    "Failed to serialise Lagged event"
+                                );
+                                continue;
+                            }
+                        };
+                        
+                        if socket.send(Message::Text(json)).await.is_err() {
+                            // Client disconnected
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Bus was dropped — server shutting down
@@ -556,6 +593,31 @@ mod tests {
         // Slow consumer receives Lagged error when buffer capacity is exceeded
         let res = rx.recv().await;
         assert!(matches!(res, Err(broadcast::error::RecvError::Lagged(_))));
+    }
+
+    #[test]
+    fn lagged_event_serialises() {
+        let fake_id = JobId::new();
+        let event = SimulationEvent::Lagged {
+            job_id: fake_id.to_string(),
+            data: LaggedPayload { dropped: 42 },
+            timestamp: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).expect("serialise");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["event"], "lagged");
+        assert_eq!(parsed["data"]["dropped"], 42);
+    }
+
+    #[test]
+    fn lagged_event_not_terminal() {
+        let fake_id = JobId::new();
+        let event = SimulationEvent::Lagged {
+            job_id: fake_id.to_string(),
+            data: LaggedPayload { dropped: 10 },
+            timestamp: Utc::now(),
+        };
+        assert!(!event.is_terminal());
     }
 }
 
