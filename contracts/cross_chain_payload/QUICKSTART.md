@@ -45,6 +45,7 @@ fn setup_stellar_chain() -> ChainInfo {
         chain_id: 1,
         chain_name: SorobanString::from_small_str("stellar"),
         network_version: 1,
+        chain_version: 1,
         bridge_contract: BytesN::from_array(&[0u8; 32]),
         consensus_round: 100,
         is_active: true,
