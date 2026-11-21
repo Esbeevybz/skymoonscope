@@ -61,6 +61,31 @@ pub struct TransactionFeeRecord {
     pub recorded_at: DateTime<Utc>,
 }
 
+/// A fee sample that exhausted every write retry and was persisted for later
+/// replay instead of being discarded when the fee collector's in-memory
+/// dead-letter buffer overflowed (ISSUE-057).
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
+pub struct DeadLetterFeeRecord {
+    /// Auto-incrementing row id, usable to replay/delete a single record.
+    pub id: i64,
+    pub ledger_sequence: i64,
+    pub collected_at: DateTime<Utc>,
+    pub base_reserve: i64,
+    pub base_fee: i64,
+    pub max_fee: i64,
+    pub fee_charged: i64,
+    pub transaction_count: i32,
+    pub ledger_close_time: DateTime<Utc>,
+    /// Number of write attempts made before the sample was dead-lettered.
+    pub attempts: i64,
+    /// Error returned by the final write attempt.
+    pub last_error: String,
+    /// When the sample was dead-lettered by the collector.
+    pub enqueued_at: DateTime<Utc>,
+    /// When the record was dropped from the in-memory buffer and persisted.
+    pub dropped_at: DateTime<Utc>,
+}
+
 /// Thread-safe fee data store backed by SQLite
 pub struct FeeStore {
     pool: SqlitePool,
@@ -278,6 +303,84 @@ impl FeeStore {
         .await?;
 
         Ok(count)
+    }
+
+    /// Persist a fee sample that overflowed the collector's in-memory
+    /// dead-letter buffer, so it can be replayed later instead of being lost
+    /// permanently (ISSUE-057). Returns the new row id.
+    pub async fn insert_dead_letter_record(
+        &self,
+        sample: &LedgerFeeSample,
+        attempts: usize,
+        last_error: &str,
+        enqueued_at: DateTime<Utc>,
+        dropped_at: DateTime<Utc>,
+    ) -> Result<i64, FeeStoreError> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO dead_letter_fee_records (
+                ledger_sequence, collected_at, base_reserve, base_fee,
+                max_fee, fee_charged, transaction_count, ledger_close_time,
+                attempts, last_error, enqueued_at, dropped_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+        )
+        .bind(sample.ledger_sequence)
+        .bind(sample.collected_at)
+        .bind(sample.base_reserve)
+        .bind(sample.base_fee)
+        .bind(sample.max_fee)
+        .bind(sample.fee_charged)
+        .bind(sample.transaction_count)
+        .bind(sample.ledger_close_time)
+        .bind(attempts as i64)
+        .bind(last_error)
+        .bind(enqueued_at)
+        .bind(dropped_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// List persisted dead-letter records, earliest-dropped first, so operators
+    /// can inspect and replay them.
+    pub async fn get_dead_letter_records(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<DeadLetterFeeRecord>, FeeStoreError> {
+        let records = sqlx::query_as::<_, DeadLetterFeeRecord>(
+            r#"
+            SELECT
+                id, ledger_sequence, collected_at, base_reserve, base_fee,
+                max_fee, fee_charged, transaction_count, ledger_close_time,
+                attempts, last_error, enqueued_at, dropped_at
+            FROM dead_letter_fee_records
+            ORDER BY dropped_at ASC, id ASC
+            LIMIT ?1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Delete a single persisted dead-letter record once it has been replayed.
+    /// Returns `true` when a row was removed.
+    pub async fn delete_dead_letter_record(&self, id: i64) -> Result<bool, FeeStoreError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM dead_letter_fee_records WHERE id = ?1
+            "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     /// Close the database connection pool

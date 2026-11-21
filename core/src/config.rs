@@ -384,7 +384,14 @@ pub struct AppConfig {
 
     // --- WebSocket event bus ---
 
-    /// Per-subscriber in-flight event buffer capacity. Clamped to [16, 65536].
+    /// Per-subscriber in-flight event buffer capacity. Clamped to [16, 65536];
+    /// a value outside that range is adjusted and logged as a warning.
+    ///
+    /// Tradeoff: memory per subscriber grows linearly with this value, so a
+    /// larger capacity keeps more buffered events (fewer dropped/Lagged events
+    /// under bursty load) at the cost of more RAM per connected subscriber.
+    /// Raise it for high-throughput deployments; the 65536 ceiling keeps an
+    /// untrusted config from exhausting memory.
     /// Env: `EVENT_BUS_CAPACITY` · Default: `256`
     #[serde(default = "default_event_bus_capacity")]
     pub event_bus_capacity: usize,
