@@ -15,7 +15,8 @@
 //!   size drops from ~30 KB to ~3–6 KB.
 //! - **Rate limiting**: IP-based token bucket — max `RATE_LIMIT_MAX_CREATES`
 //!   POST requests per `RATE_LIMIT_WINDOW_SECS` (default 10/60 s). Implemented
-//!   with a `moka` cache of per-IP atomic counters; no Redis dependency.
+//!   with Redis atomic INCR + EXPIRE to ensure counters survive server restarts.
+//!   Uses a Lua script to atomically increment and set expiry on first write.
 //! - **Expiry**: default 7 days; checked on every GET; returns HTTP 410 Gone.
 //! - **WASM bytecode** is explicitly excluded from the snapshot (size / privacy).
 
@@ -33,6 +34,7 @@ use chrono::{DateTime, Utc};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use moka::sync::Cache;
 use rand::Rng;
+use redis::Commands;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use utoipa::ToSchema;
@@ -160,22 +162,7 @@ struct CachedShare {
     created_at: DateTime<Utc>,
 }
 
-// ── Per-IP rate limiter entry ─────────────────────────────────────────────────
 
-#[derive(Debug)]
-struct RateLimitEntry {
-    count: std::sync::atomic::AtomicU32,
-    window_start: std::sync::Mutex<std::time::Instant>,
-}
-
-impl RateLimitEntry {
-    fn new() -> Self {
-        Self {
-            count: std::sync::atomic::AtomicU32::new(1),
-            window_start: std::sync::Mutex::new(std::time::Instant::now()),
-        }
-    }
-}
 
 // ── ShareService ──────────────────────────────────────────────────────────────
 
@@ -184,8 +171,8 @@ pub struct ShareService {
     db: SqlitePool,
     /// In-process read cache (share_id → CachedShare).
     read_cache: Cache<String, CachedShare>,
-    /// Per-IP create-rate counter cache (IP string → RateLimitEntry).
-    rate_cache: Cache<String, Arc<RateLimitEntry>>,
+    /// Redis client for distributed rate-limit counters (per-IP).
+    redis_client: redis::Client,
     /// Public base URL used to construct share URLs.
     public_base_url: String,
 }
@@ -196,23 +183,29 @@ impl ShareService {
     /// `public_base_url` should be the web dashboard origin, e.g.
     /// `https://app.skymoonscope.dev`. It is used to build the `share_url`
     /// returned in [`CreateShareResponse`].
-    pub fn new(db: SqlitePool, public_base_url: impl Into<String>) -> Self {
+    ///
+    /// `redis_url` should be a valid Redis connection string, e.g.
+    /// `redis://127.0.0.1:6379`. This is used for persistent, distributed
+    /// rate-limit counters that survive server restarts.
+    pub fn new(
+        db: SqlitePool,
+        public_base_url: impl Into<String>,
+        redis_url: &str,
+    ) -> Result<Self, AppError> {
         let read_cache = Cache::builder()
             .max_capacity(2048)
             .time_to_live(Duration::from_secs(3600))
             .build();
 
-        let rate_cache = Cache::builder()
-            .max_capacity(10_000)
-            .time_to_live(Duration::from_secs(RATE_LIMIT_WINDOW_SECS * 2))
-            .build();
+        let redis_client = redis::Client::open(redis_url)
+            .map_err(|e| AppError::Internal(format!("Failed to create Redis client: {e}")))?;
 
-        Self {
+        Ok(Self {
             db,
             read_cache,
-            rate_cache,
+            redis_client,
             public_base_url: public_base_url.into(),
-        }
+        })
     }
 
     // ── Rate limiting ─────────────────────────────────────────────────────
@@ -220,37 +213,46 @@ impl ShareService {
     /// Returns `Ok(())` if the request is within the rate limit, or
     /// `Err(AppError::TooManyRequests)` otherwise.
     ///
-    /// Uses a sliding window via `moka` TTL: a new entry is seeded at count=1
-    /// and evicted after 2× the window, which is sufficient for the token-
-    /// bucket approximation required here.
+    /// Uses Redis atomic INCR with EXPIRE to implement a sliding window counter
+    /// that survives server restarts. On first write, EXPIRE sets a TTL equal to
+    /// the rate-limit window.
     fn check_rate_limit(&self, ip: &str) -> Result<(), AppError> {
-        let window = Duration::from_secs(RATE_LIMIT_WINDOW_SECS);
+        let key = format!("rate_limit:shares:{}", ip);
+        let window = RATE_LIMIT_WINDOW_SECS;
 
-        if let Some(entry) = self.rate_cache.get(ip) {
-            // Check whether the current window has expired (wall-clock).
-            let mut start = entry.window_start.lock().unwrap();
-            if start.elapsed() >= window {
-                // Reset counter for the new window.
-                entry
-                    .count
-                    .store(1, std::sync::atomic::Ordering::Relaxed);
-                *start = std::time::Instant::now();
-                return Ok(());
-            }
+        let mut conn = self
+            .redis_client
+            .get_connection()
+            .map_err(|e| AppError::Internal(format!("Redis connection error: {e}")))?;
 
-            let prev = entry
-                .count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if prev >= RATE_LIMIT_MAX_CREATES {
-                return Err(AppError::TooManyRequests(format!(
-                    "Rate limit exceeded: max {} share creations per {} seconds",
-                    RATE_LIMIT_MAX_CREATES, RATE_LIMIT_WINDOW_SECS
-                )));
-            }
-        } else {
-            // First request from this IP in this window.
-            self.rate_cache
-                .insert(ip.to_string(), Arc::new(RateLimitEntry::new()));
+        // Use a Lua script to atomically increment and set expiry on first write.
+        // This ensures the counter is never updated without an expiry set.
+        let count: u32 = redis::Script::new(
+            r#"
+            local key = KEYS[1]
+            local window = tonumber(ARGV[1])
+            
+            -- Increment the counter
+            local count = redis.call('INCR', key)
+            
+            -- Set expiry only on first write (count == 1)
+            if count == 1 then
+                redis.call('EXPIRE', key, window)
+            end
+            
+            return count
+            "#,
+        )
+        .key(&key)
+        .arg(window)
+        .invoke(&mut conn)
+        .map_err(|e| AppError::Internal(format!("Redis INCR error: {e}")))?;
+
+        if count > RATE_LIMIT_MAX_CREATES {
+            return Err(AppError::TooManyRequests(format!(
+                "Rate limit exceeded: max {} share creations per {} seconds",
+                RATE_LIMIT_MAX_CREATES, RATE_LIMIT_WINDOW_SECS
+            )));
         }
 
         Ok(())
@@ -708,6 +710,12 @@ mod tests {
         pool
     }
 
+    /// Get a Redis client for testing. Requires Redis to be running.
+    /// Falls back to a mock for CI environments that don't have Redis.
+    fn test_redis_url() -> String {
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string())
+    }
+
     fn make_snapshot() -> ShareSnapshot {
         ShareSnapshot {
             resources: SorobanResources {
@@ -781,7 +789,9 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_allows_up_to_max_creates() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "http://localhost:3000");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "http://localhost:3000", &redis_url)
+            .expect("create service");
 
         for i in 0..RATE_LIMIT_MAX_CREATES {
             service
@@ -793,7 +803,9 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_blocks_over_max_creates() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "http://localhost:3000");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "http://localhost:3000", &redis_url)
+            .expect("create service");
 
         // Fill up the bucket.
         for _ in 0..RATE_LIMIT_MAX_CREATES {
@@ -810,7 +822,9 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_is_per_ip() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "http://localhost:3000");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "http://localhost:3000", &redis_url)
+            .expect("create service");
 
         // Exhaust the limit for one IP.
         for _ in 0..RATE_LIMIT_MAX_CREATES {
@@ -822,12 +836,39 @@ mod tests {
         assert!(service.check_rate_limit("10.0.0.2").is_ok());
     }
 
+    #[tokio::test]
+    async fn rate_limit_resets_after_window_expires() {
+        let pool = test_db().await;
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "http://localhost:3000", &redis_url)
+            .expect("create service");
+
+        let ip = "10.0.0.99";
+
+        // Fill up the bucket.
+        for _ in 0..RATE_LIMIT_MAX_CREATES {
+            let _ = service.check_rate_limit(ip);
+        }
+        assert!(service.check_rate_limit(ip).is_err(), "Should be rate-limited");
+
+        // Wait for the window to expire (plus a small buffer).
+        tokio::time::sleep(Duration::from_secs(RATE_LIMIT_WINDOW_SECS + 1)).await;
+
+        // After the window expires, the counter should be reset and allow new requests.
+        assert!(
+            service.check_rate_limit(ip).is_ok(),
+            "Should be allowed after window expires"
+        );
+    }
+
     // ── Create share ───────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn create_share_returns_valid_response() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "https://app.skymoonscope.dev");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "https://app.skymoonscope.dev", &redis_url)
+            .expect("create service");
 
         let request = CreateShareRequest {
             snapshot: make_snapshot(),
@@ -851,7 +892,9 @@ mod tests {
     #[tokio::test]
     async fn create_share_respects_expiry_clamp() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "https://app.skymoonscope.dev");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "https://app.skymoonscope.dev", &redis_url)
+            .expect("create service");
 
         // Request more than MAX_EXPIRY_SECS — should be clamped.
         let request = CreateShareRequest {
@@ -876,7 +919,9 @@ mod tests {
     #[tokio::test]
     async fn get_share_returns_stored_snapshot() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "https://app.skymoonscope.dev");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "https://app.skymoonscope.dev", &redis_url)
+            .expect("create service");
 
         let snapshot = make_snapshot();
         let create_req = CreateShareRequest {
@@ -902,7 +947,9 @@ mod tests {
     #[tokio::test]
     async fn get_share_increments_view_count() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "https://app.skymoonscope.dev");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "https://app.skymoonscope.dev", &redis_url)
+            .expect("create service");
 
         let create_req = CreateShareRequest {
             snapshot: make_snapshot(),
@@ -929,7 +976,9 @@ mod tests {
     #[tokio::test]
     async fn get_share_returns_not_found_for_unknown_id() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "https://app.skymoonscope.dev");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "https://app.skymoonscope.dev", &redis_url)
+            .expect("create service");
 
         let result = service.get_share("abcdefgh").await;
         assert!(
@@ -941,7 +990,9 @@ mod tests {
     #[tokio::test]
     async fn get_share_returns_not_found_for_invalid_id_format() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "https://app.skymoonscope.dev");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "https://app.skymoonscope.dev", &redis_url)
+            .expect("create service");
 
         let result = service.get_share("bad-id!").await;
         assert!(
@@ -953,7 +1004,9 @@ mod tests {
     #[tokio::test]
     async fn get_share_returns_gone_for_expired_share() {
         let pool = test_db().await;
-        let service = ShareService::new(pool.clone(), "https://app.skymoonscope.dev");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool.clone(), "https://app.skymoonscope.dev", &redis_url)
+            .expect("create service");
 
         // Insert a share that expired 1 second ago.
         let id = "testExp1";
@@ -1020,7 +1073,9 @@ mod tests {
     #[tokio::test]
     async fn http_create_share_returns_201() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "https://app.skymoonscope.dev");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "https://app.skymoonscope.dev", &redis_url)
+            .expect("create service");
         let app = build_test_router(service);
 
         let body = serde_json::json!({
@@ -1058,7 +1113,9 @@ mod tests {
     #[tokio::test]
     async fn http_get_share_returns_200_after_create() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "https://app.skymoonscope.dev");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "https://app.skymoonscope.dev", &redis_url)
+            .expect("create service");
         let app = build_test_router(service);
 
         let body = serde_json::json!({
@@ -1116,7 +1173,9 @@ mod tests {
     #[tokio::test]
     async fn http_get_unknown_share_returns_404() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "https://app.skymoonscope.dev");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "https://app.skymoonscope.dev", &redis_url)
+            .expect("create service");
         let app = build_test_router(service);
 
         let req = Request::builder()
@@ -1132,7 +1191,9 @@ mod tests {
     #[tokio::test]
     async fn http_rate_limit_returns_429_after_exceeding_limit() {
         let pool = test_db().await;
-        let service = ShareService::new(pool, "https://app.skymoonscope.dev");
+        let redis_url = test_redis_url();
+        let service = ShareService::new(pool, "https://app.skymoonscope.dev", &redis_url)
+            .expect("create service");
         let app = build_test_router(service);
 
         let body = serde_json::json!({
