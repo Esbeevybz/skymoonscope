@@ -47,20 +47,20 @@ impl ProviderStats {
     pub fn record(&self, rtt_us: u64) {
         let count = self.sample_count.fetch_add(1, Ordering::Relaxed);
         if count == 0 {
-            self.ema_rtt_us.store(rtt_us, Ordering::Relaxed);
+            self.ema_rtt_us.store(rtt_us, Ordering::Release);
             return;
         }
 
-        let previous = self.ema_rtt_us.load(Ordering::Relaxed);
+        let previous = self.ema_rtt_us.load(Ordering::Acquire);
         let alpha_num = 2u128;
         let alpha_den = (self.window + 1) as u128;
         let next = ((rtt_us as u128 * alpha_num) + (previous as u128 * (alpha_den - alpha_num)))
             / alpha_den;
-        self.ema_rtt_us.store(next as u64, Ordering::Relaxed);
+        self.ema_rtt_us.store(next as u64, Ordering::Release);
     }
 
     pub fn ema_rtt_us(&self) -> u64 {
-        self.ema_rtt_us.load(Ordering::Relaxed)
+        self.ema_rtt_us.load(Ordering::Acquire)
     }
 
     pub fn sample_count(&self) -> u64 {
