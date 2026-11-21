@@ -7,6 +7,7 @@
 //! whitelisted address (or event shape) but not its bytecode is rejected.
 
 use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -95,6 +96,137 @@ impl ContractRegister {
     }
 }
 
+/// A [`ContractRegister`] whose contents are persisted to SQLite.
+///
+/// The static whitelist (`VERIFIED_CONTRACTS`) is passed in as `seeds` and the
+/// entries previously stored in the `contract_whitelist` table are layered on
+/// top when the register is opened at startup, so dynamic registrations survive
+/// a process restart. Every [`register`](Self::register) call is written
+/// through: the in-memory conflict check runs first, then the entry is
+/// persisted.
+///
+/// The table lives in the same database as the fee store; pass the same
+/// [`SqlitePool`] (see `migrations/004_create_contract_whitelist.sql`).
+pub struct PersistentContractRegister {
+    register: ContractRegister,
+    pool: SqlitePool,
+}
+
+impl PersistentContractRegister {
+    /// Open a persistent register on an existing pool, ensuring the whitelist
+    /// table exists and loading any persisted entries on top of `seeds`.
+    ///
+    /// A persisted `contract_id` that is already present in `seeds` is skipped,
+    /// so the static whitelist keeps precedence over the stored copy.
+    pub async fn new(
+        pool: SqlitePool,
+        seeds: ContractRegister,
+    ) -> Result<Self, ContractRegistryError> {
+        let mut this = Self {
+            register: seeds,
+            pool,
+        };
+        this.ensure_schema().await?;
+
+        let persisted = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT contract_id, wasm_hash
+            FROM contract_whitelist
+            "#,
+        )
+        .fetch_all(&this.pool)
+        .await
+        .map_err(Self::persistence_error)?;
+
+        for (contract_id, wasm_hash) in persisted {
+            if this.register.expected_hash(&contract_id).is_none() {
+                this.register.register(contract_id, wasm_hash)?;
+            }
+        }
+
+        Ok(this)
+    }
+
+    /// Connect to `database_url` (creating the database file if missing) and
+    /// open a persistent register seeded with the static whitelist.
+    pub async fn connect(
+        database_url: &str,
+        seeds: ContractRegister,
+    ) -> Result<Self, ContractRegistryError> {
+        let pool = SqlitePool::connect(database_url)
+            .await
+            .map_err(Self::persistence_error)?;
+        Self::new(pool, seeds).await
+    }
+
+    /// Register `contract_id` write-through. The in-memory conflict check runs
+    /// first — a duplicate id is rejected without touching the database — then
+    /// the entry is persisted so it survives a restart.
+    pub async fn register(
+        &mut self,
+        contract_id: impl Into<String>,
+        wasm_hash: impl Into<String>,
+    ) -> Result<(), ContractRegistryError> {
+        let contract_id = contract_id.into();
+        let wasm_hash = wasm_hash.into().to_lowercase();
+
+        // Reuse the in-memory register's conflict semantics.
+        self.register.register(contract_id.clone(), wasm_hash.clone())?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO contract_whitelist (contract_id, wasm_hash)
+            VALUES (?1, ?2)
+            ON CONFLICT(contract_id) DO NOTHING
+            "#,
+        )
+        .bind(&contract_id)
+        .bind(&wasm_hash)
+        .execute(&self.pool)
+        .await
+        .map_err(Self::persistence_error)?;
+
+        Ok(())
+    }
+
+    /// The underlying in-memory whitelist, e.g. to pass to [`verify_bytecode`].
+    pub fn registry(&self) -> &ContractRegister {
+        &self.register
+    }
+
+    pub fn expected_hash(&self, contract_id: &str) -> Option<&str> {
+        self.register.expected_hash(contract_id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.register.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.register.len()
+    }
+
+    async fn ensure_schema(&self) -> Result<(), ContractRegistryError> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS contract_whitelist (
+                contract_id TEXT PRIMARY KEY,
+                wasm_hash TEXT NOT NULL,
+                registered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(Self::persistence_error)?;
+        Ok(())
+    }
+
+    fn persistence_error(err: sqlx::Error) -> ContractRegistryError {
+        ContractRegistryError::Persistence(err.to_string())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ContractRegistryError {
     #[error("invalid contract whitelist configuration: {0}")]
@@ -120,6 +252,9 @@ pub enum ContractRegistryError {
     },
     #[error("failed to fetch contract bytecode: {0}")]
     Source(String),
+    /// A read or write against the SQLite-backed whitelist failed.
+    #[error("contract registry persistence failed: {0}")]
+    Persistence(String),
 }
 
 /// Fetches a contract's live WASM bytecode so it can be hashed and compared
@@ -310,5 +445,77 @@ mod tests {
             .expect("new contract id registers");
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.expected_hash("C2"), Some("cafebabe"));
+    }
+
+    async fn in_memory_pool() -> SqlitePool {
+        use sqlx::sqlite::SqlitePoolOptions;
+        // A single connection keeps the `:memory:` database shared across the
+        // two opens that simulate a restart.
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite pool")
+    }
+
+    fn seeds() -> ContractRegister {
+        ContractRegister::from_json(r#"[{"contract_id":"CSEED","wasm_hash":"aa"}]"#)
+            .expect("valid seed whitelist")
+    }
+
+    #[tokio::test]
+    async fn register_writes_dynamic_entries_through_to_sqlite() {
+        let pool = in_memory_pool().await;
+        let mut register = PersistentContractRegister::new(pool, seeds())
+            .await
+            .expect("open persistent register");
+
+        register
+            .register("CDYNAMIC", "DEADBEEF")
+            .await
+            .expect("dynamic registration persists");
+
+        assert_eq!(register.expected_hash("CDYNAMIC"), Some("deadbeef"));
+        assert_eq!(register.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn registrations_survive_a_restart() {
+        let pool = in_memory_pool().await;
+        let mut first = PersistentContractRegister::new(pool.clone(), seeds())
+            .await
+            .expect("open persistent register");
+        first
+            .register("CDYNAMIC", "CAFEBABE")
+            .await
+            .expect("dynamic registration persists");
+
+        // Reopen from the same database with only the static seeds, simulating
+        // a process restart.
+        let reopened = PersistentContractRegister::new(pool, seeds())
+            .await
+            .expect("reopen persistent register");
+
+        assert_eq!(reopened.expected_hash("CDYNAMIC"), Some("cafebabe"));
+        // The static seed is preserved and not overwritten by persistence.
+        assert_eq!(reopened.expected_hash("CSEED"), Some("aa"));
+    }
+
+    #[tokio::test]
+    async fn write_through_rejects_a_duplicate_without_persisting_it() {
+        let pool = in_memory_pool().await;
+        let mut register = PersistentContractRegister::new(pool.clone(), seeds())
+            .await
+            .expect("open persistent register");
+
+        register
+            .register("CSEED", "cafebabe")
+            .await
+            .expect_err("duplicate contract id is a conflict");
+
+        let reopened = PersistentContractRegister::new(pool, seeds())
+            .await
+            .expect("reopen persistent register");
+        assert_eq!(reopened.expected_hash("CSEED"), Some("aa"));
     }
 }

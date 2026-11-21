@@ -180,12 +180,26 @@ impl SimulationBus {
 
     /// Create a new bus with an explicit channel capacity.
     ///
-    /// `capacity` is clamped to `[BUS_CAPACITY_MIN, BUS_CAPACITY_MAX]`.
+    /// `capacity` is clamped to `[BUS_CAPACITY_MIN, BUS_CAPACITY_MAX]`; a
+    /// request outside that range is logged at `warn` so an operator can see
+    /// that their configured `EVENT_BUS_CAPACITY` was adjusted. Memory per
+    /// subscriber grows linearly with the capacity, so raising it trades RAM
+    /// for fewer dropped events under load.
     /// Slow subscribers that fall more than `capacity` events behind receive
     /// [`RecvError::Lagged`] on the next receive call. Tokio's broadcast channel
     /// drops the oldest unconsumed events, keeping memory bounded per subscriber.
     pub fn with_capacity(capacity: usize) -> Arc<Self> {
         let clamped = capacity.clamp(BUS_CAPACITY_MIN, BUS_CAPACITY_MAX);
+        if clamped != capacity {
+            tracing::warn!(
+                requested = capacity,
+                applied = clamped,
+                min = BUS_CAPACITY_MIN,
+                max = BUS_CAPACITY_MAX,
+                "SimulationBus capacity clamped to the allowed range; \
+                 memory per subscriber scales with the capacity"
+            );
+        }
         let (sender, _) = broadcast::channel(clamped);
         Arc::new(Self { sender })
     }
