@@ -3,7 +3,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    Address, BytesN, Env,
+    Address, BytesN, Env, TryIntoVal,
 };
 
 #[test]
@@ -15,18 +15,21 @@ fn test_proxy_upgrade_with_timelock() {
     let proxy_id = env.register(Proxy, ());
     let impl_v1_id = env.register(ProxyLogicV1, ());
     let impl_v2_id = env.register(ProxyLogicV2, ());
+    let logic_hash = BytesN::from_array(&env, &[2u8; 32]);
 
     let proxy = ProxyClient::new(&env, &proxy_id);
 
     proxy.initialize(&admin, &impl_v1_id);
     assert_eq!(proxy.get_admin(), admin);
     assert_eq!(proxy.get_implementation(), impl_v1_id);
+    assert_eq!(proxy.interface_version(), 1);
 
     // 1. Propose upgrade
-    proxy.propose_upgrade(&impl_v2_id);
+    proxy.propose_upgrade(&impl_v2_id, &logic_hash);
 
     let pending = proxy.get_pending_upgrade().unwrap();
     assert_eq!(pending.new_implementation, impl_v2_id);
+    assert_eq!(pending.logic_hash, logic_hash);
     assert_eq!(pending.eta, env.ledger().timestamp() + 172_800);
 
     // 2. Fast-forward time by 48 hours (172,800 seconds)
@@ -36,7 +39,14 @@ fn test_proxy_upgrade_with_timelock() {
     // 3. Execute upgrade
     proxy.execute_upgrade();
     assert_eq!(proxy.get_implementation(), impl_v2_id);
+    assert_eq!(proxy.interface_version(), 2);
     assert_eq!(proxy.get_pending_upgrade(), None);
+
+    let events = env.events().all();
+    let (_, _, data) = events.get(events.len() - 1).unwrap();
+    let event: UpgradedEvent = data.try_into_val(&env).unwrap();
+    assert_eq!(event.logic_hash, logic_hash);
+    assert_eq!(event.interface_version, 2);
 }
 
 #[test]
@@ -49,11 +59,12 @@ fn test_execute_upgrade_before_timelock_fails() {
     let proxy_id = env.register(Proxy, ());
     let impl_v1_id = env.register(ProxyLogicV1, ());
     let impl_v2_id = env.register(ProxyLogicV2, ());
+    let logic_hash = BytesN::from_array(&env, &[2u8; 32]);
 
     let proxy = ProxyClient::new(&env, &proxy_id);
     proxy.initialize(&admin, &impl_v1_id);
 
-    proxy.propose_upgrade(&impl_v2_id);
+    proxy.propose_upgrade(&impl_v2_id, &logic_hash);
 
     // Try executing immediately without advancing time -> should panic
     proxy.execute_upgrade();
@@ -68,11 +79,12 @@ fn test_cancel_upgrade() {
     let proxy_id = env.register(Proxy, ());
     let impl_v1_id = env.register(ProxyLogicV1, ());
     let impl_v2_id = env.register(ProxyLogicV2, ());
+    let logic_hash = BytesN::from_array(&env, &[2u8; 32]);
 
     let proxy = ProxyClient::new(&env, &proxy_id);
     proxy.initialize(&admin, &impl_v1_id);
 
-    proxy.propose_upgrade(&impl_v2_id);
+    proxy.propose_upgrade(&impl_v2_id, &logic_hash);
     assert!(proxy.get_pending_upgrade().is_some());
 
     proxy.cancel_upgrade();
@@ -105,10 +117,11 @@ fn deny_all_auths(env: &Env) {
 fn test_legacy_upgrade_to_cannot_skip_timelock() {
     let (env, client, _admin, impl_v1_id) = setup();
     let impl_v2_id = env.register(ProxyLogicV2, ());
+    let logic_hash = BytesN::from_array(&env, &[2u8; 32]);
 
     // `upgrade_to` is the legacy alias for `propose_upgrade`: it must not apply
     // the new implementation immediately.
-    client.upgrade_to(&impl_v2_id);
+    client.upgrade_to(&impl_v2_id, &logic_hash);
 
     assert_eq!(client.get_implementation(), impl_v1_id);
     let pending = client.get_pending_upgrade().unwrap();
@@ -124,10 +137,11 @@ fn test_legacy_upgrade_to_cannot_skip_timelock() {
 fn test_non_authorized_caller_cannot_propose_upgrade() {
     let (env, client, _admin, impl_v1_id) = setup();
     let impl_v2_id = env.register(ProxyLogicV2, ());
+    let logic_hash = BytesN::from_array(&env, &[2u8; 32]);
 
     deny_all_auths(&env);
 
-    assert!(client.try_propose_upgrade(&impl_v2_id).is_err());
+    assert!(client.try_propose_upgrade(&impl_v2_id, &logic_hash).is_err());
     assert_eq!(client.get_pending_upgrade(), None);
     assert_eq!(client.get_implementation(), impl_v1_id);
 }
@@ -136,8 +150,9 @@ fn test_non_authorized_caller_cannot_propose_upgrade() {
 fn test_non_authorized_caller_cannot_execute_upgrade() {
     let (env, client, _admin, impl_v1_id) = setup();
     let impl_v2_id = env.register(ProxyLogicV2, ());
+    let logic_hash = BytesN::from_array(&env, &[2u8; 32]);
 
-    client.propose_upgrade(&impl_v2_id);
+    client.propose_upgrade(&impl_v2_id, &logic_hash);
     env.ledger()
         .set_timestamp(env.ledger().timestamp() + TIMELOCK_DELAY);
 
@@ -150,9 +165,10 @@ fn test_non_authorized_caller_cannot_execute_upgrade() {
 fn test_non_authorized_caller_cannot_cancel_or_set_storage() {
     let (env, client, _admin, _) = setup();
     let impl_v2_id = env.register(ProxyLogicV2, ());
+    let logic_hash = BytesN::from_array(&env, &[2u8; 32]);
     let key = BytesN::from_array(&env, &[7u8; 32]);
 
-    client.propose_upgrade(&impl_v2_id);
+    client.propose_upgrade(&impl_v2_id, &logic_hash);
 
     deny_all_auths(&env);
     assert!(client.try_cancel_upgrade().is_err());
@@ -200,15 +216,19 @@ fn test_set_admin_transfers_authority() {
     // With authorization withdrawn, nobody can act.
     deny_all_auths(&env);
     let impl_v2_id = env.register(ProxyLogicV2, ());
-    assert!(client.try_propose_upgrade(&impl_v2_id).is_err());
+    let logic_hash = BytesN::from_array(&env, &[2u8; 32]);
+    assert!(client
+        .try_propose_upgrade(&impl_v2_id, &logic_hash)
+        .is_err());
 }
 
 #[test]
 fn test_admin_can_still_upgrade_end_to_end() {
     let (env, client, _admin, _) = setup();
     let impl_v2_id = env.register(ProxyLogicV2, ());
+    let logic_hash = BytesN::from_array(&env, &[2u8; 32]);
 
-    client.propose_upgrade(&impl_v2_id);
+    client.propose_upgrade(&impl_v2_id, &logic_hash);
     env.ledger()
         .set_timestamp(env.ledger().timestamp() + TIMELOCK_DELAY);
     client.execute_upgrade();
