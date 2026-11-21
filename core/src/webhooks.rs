@@ -26,7 +26,7 @@ pub const SIGNATURE_HEADER: &str = "x-Sky Moon Scope-signature";
 pub const DELIVERY_HEADER: &str = "x-Sky Moon Scope-delivery";
 pub const TIMESTAMP_HEADER: &str = "x-Sky Moon Scope-timestamp";
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ContractSubscription {
     pub id: Uuid,
     pub contract_id: String,
@@ -37,6 +37,60 @@ pub struct ContractSubscription {
     #[serde(skip_serializing)]
     pub signing_secret: String,
     pub active: bool,
+}
+
+impl<'de> Deserialize<'de> for ContractSubscription {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SubscriptionHelper {
+            #[serde(default)]
+            id: Option<Uuid>,
+            contract_id: String,
+            #[serde(default)]
+            event_types: Vec<String>,
+            callback_url: String,
+            signing_secret: String,
+            #[serde(default = "default_active")]
+            active: bool,
+        }
+
+        fn default_active() -> bool {
+            true
+        }
+
+        let helper = SubscriptionHelper::deserialize(deserializer)?;
+
+        // Validate signing_secret length
+        if helper.signing_secret.len() < 32 {
+            return Err(serde::de::Error::custom(
+                "signing_secret must contain at least 32 bytes",
+            ));
+        }
+
+        // Validate contract_id
+        if helper.contract_id.trim().is_empty() {
+            return Err(serde::de::Error::custom("contract_id cannot be empty"));
+        }
+
+        // Validate callback_url
+        if !(helper.callback_url.starts_with("http://") || helper.callback_url.starts_with("https://")) {
+            return Err(serde::de::Error::custom(
+                "callback_url must use http or https",
+            ));
+        }
+
+        Ok(ContractSubscription {
+            id: helper.id.unwrap_or_else(Uuid::new_v4),
+            contract_id: helper.contract_id,
+            event_types: helper.event_types,
+            callback_url: helper.callback_url,
+            signing_secret: helper.signing_secret,
+            active: helper.active,
+        })
+    }
 }
 
 impl ContractSubscription {
@@ -465,6 +519,77 @@ mod tests {
     fn rejects_weak_subscription_configuration() {
         let result = ContractSubscription::new("", Vec::new(), "https://example.com", "short");
         assert!(matches!(result, Err(WebhookError::InvalidSubscription(_))));
+    }
+
+    #[test]
+    fn deserialization_rejects_signing_secret_shorter_than_32_bytes() {
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "contract_id": "CABC",
+            "event_types": [],
+            "callback_url": "https://example.com/webhook",
+            "signing_secret": ""
+        }"#;
+        let result: Result<ContractSubscription, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("signing_secret must contain at least 32 bytes"));
+    }
+
+    #[test]
+    fn deserialization_rejects_short_signing_secret() {
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "contract_id": "CABC",
+            "event_types": [],
+            "callback_url": "https://example.com/webhook",
+            "signing_secret": "short"
+        }"#;
+        let result: Result<ContractSubscription, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("signing_secret must contain at least 32 bytes"));
+    }
+
+    #[test]
+    fn deserialization_accepts_valid_signing_secret() {
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "contract_id": "CABC",
+            "event_types": [],
+            "callback_url": "https://example.com/webhook",
+            "signing_secret": "a-secret-that-is-at-least-thirty-two-bytes"
+        }"#;
+        let result: Result<ContractSubscription, _> = serde_json::from_str(json);
+        assert!(result.is_ok());
+        let subscription = result.unwrap();
+        assert_eq!(subscription.signing_secret, "a-secret-that-is-at-least-thirty-two-bytes");
+    }
+
+    #[test]
+    fn deserialization_rejects_invalid_contract_id() {
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "contract_id": "",
+            "event_types": [],
+            "callback_url": "https://example.com/webhook",
+            "signing_secret": "a-secret-that-is-at-least-thirty-two-bytes"
+        }"#;
+        let result: Result<ContractSubscription, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("contract_id cannot be empty"));
+    }
+
+    #[test]
+    fn deserialization_rejects_invalid_callback_url() {
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "contract_id": "CABC",
+            "event_types": [],
+            "callback_url": "ftp://example.com/webhook",
+            "signing_secret": "a-secret-that-is-at-least-thirty-two-bytes"
+        }"#;
+        let result: Result<ContractSubscription, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("callback_url must use http or https"));
     }
 
     #[tokio::test]
