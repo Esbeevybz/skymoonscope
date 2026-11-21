@@ -260,6 +260,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub inbound_webhook_secret: String,
 
+    /// Allowed inbound webhook clock skew in seconds; zero requires the current second.
+    /// Env: `WEBHOOK_TIMESTAMP_TOLERANCE_SECS`; default: 300.
+    #[serde(default = "crate::webhook_validation::default_timestamp_tolerance_secs")]
+    pub webhook_timestamp_tolerance_secs: u64,
+
     // --- Provider registry ---
 
     /// Stable identifier for this node in the gossip registry.
@@ -601,6 +606,10 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         .set_default("cors_allowed_origins", "")?
         .set_default("allowed_origins", "")?
         .set_default("inbound_webhook_secret", "")?
+        .set_default(
+            "webhook_timestamp_tolerance_secs",
+            crate::webhook_validation::default_timestamp_tolerance_secs(),
+        )?
         // Alert deduplication window (issue #24); resolved at alarm-manager
         // initialisation in `main.rs`.
         .set_default(
@@ -626,6 +635,47 @@ mod tests {
     use super::*;
     use std::env;
 
+    #[test]
+    fn webhook_timestamp_tolerance_defaults_to_five_minutes() {
+        let cfg: AppConfig = Config::builder()
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(cfg.webhook_timestamp_tolerance_secs, 300);
+    }
+
+    #[test]
+    fn webhook_timestamp_tolerance_loads_environment_values() {
+        // An explicit source avoids changing the process environment in parallel tests.
+        for value in ["0", "30", "900"] {
+            let source = [("WEBHOOK_TIMESTAMP_TOLERANCE_SECS".into(), value.into())]
+                .into_iter()
+                .collect();
+            let cfg: AppConfig = Config::builder()
+                .add_source(config::Environment::default().source(Some(source)))
+                .build()
+                .unwrap()
+                .try_deserialize()
+                .unwrap();
+            assert_eq!(
+                cfg.webhook_timestamp_tolerance_secs,
+                value.parse::<u64>().unwrap()
+            );
+        }
+        for value in ["-1", "invalid", "1.5", "18446744073709551616"] {
+            let source = [("WEBHOOK_TIMESTAMP_TOLERANCE_SECS".into(), value.into())]
+                .into_iter()
+                .collect();
+            let result = Config::builder()
+                .add_source(config::Environment::default().source(Some(source)))
+                .build()
+                .unwrap()
+                .try_deserialize::<AppConfig>();
+            assert!(result.is_err(), "invalid tolerance {value} should be rejected");
+        }
+    }
+
     /// Helper: remove a set of env vars after the test, regardless of outcome.
     struct EnvGuard(Vec<String>);
     impl Drop for EnvGuard {
@@ -639,6 +689,29 @@ mod tests {
     // ------------------------------------------------------------------
     // Defaults
     // ------------------------------------------------------------------
+
+    #[test]
+    fn webhook_timestamp_tolerance_defaults_and_overrides() {
+        let defaults: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.webhook_timestamp_tolerance_secs, 300);
+        for seconds in [0, 30, 900] {
+            let config: AppConfig = serde_json::from_value(serde_json::json!({
+                "webhook_timestamp_tolerance_secs": seconds
+            }))
+            .unwrap();
+            assert_eq!(config.webhook_timestamp_tolerance_secs, seconds);
+        }
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!("invalid"),
+            serde_json::json!(1.5),
+        ] {
+            assert!(serde_json::from_value::<AppConfig>(serde_json::json!({
+                "webhook_timestamp_tolerance_secs": invalid
+            }))
+            .is_err());
+        }
+    }
 
     #[test]
     fn defaults_are_applied_when_no_env_is_set() {
@@ -784,6 +857,7 @@ mod tests {
             rpc_providers: String::new(),
             allowed_origins: String::new(),
             inbound_webhook_secret: String::new(),
+            webhook_timestamp_tolerance_secs: 300,
             registry_instance_id: String::new(),
             registry_public_url: String::new(),
             registry_seed_peers: String::new(),
@@ -826,6 +900,7 @@ mod tests {
             redis_url: "redis://127.0.0.1:6379".to_string(),
             rpc_providers: String::new(),
             inbound_webhook_secret: String::new(),
+            webhook_timestamp_tolerance_secs: 300,
             registry_instance_id: String::new(),
             registry_public_url: String::new(),
             registry_seed_peers: String::new(),
@@ -882,6 +957,7 @@ mod tests {
             redis_url: "redis://127.0.0.1:6379".to_string(),
             rpc_providers: String::new(),
             inbound_webhook_secret: String::new(),
+            webhook_timestamp_tolerance_secs: 300,
             registry_instance_id: String::new(),
             registry_public_url: String::new(),
             registry_seed_peers: String::new(),

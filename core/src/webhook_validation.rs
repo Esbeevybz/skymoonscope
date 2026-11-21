@@ -8,9 +8,9 @@
 //!   - `x-Sky Moon Scope-timestamp` — Unix timestamp (seconds) as an ASCII integer.
 //!   - `x-Sky Moon Scope-delivery` — opaque delivery UUID (validated for presence only).
 //!
-//! **Replay protection:** timestamps outside [`MAX_TIMESTAMP_SKEW_SECS`] are
-//! rejected, and delivery nonces plus authenticated signatures are cached for
-//! the same window.
+//! **Replay protection:** timestamps outside the configured tolerance are
+//! rejected (default: [`MAX_TIMESTAMP_SKEW_SECS`]). Delivery nonces and
+//! authenticated signatures are retained through the full acceptance window.
 //!
 //! **Constant-time comparison:** signature bytes are compared with
 //! [`hmac::Mac::verify_slice`], which is constant-time by construction and avoids
@@ -51,13 +51,33 @@ use crate::webhooks::{DELIVERY_HEADER, SIGNATURE_HEADER, TIMESTAMP_HEADER};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Maximum allowed clock skew (seconds) between the timestamp in the request
+/// Default allowed clock skew (seconds) between the timestamp in the request
 /// header and the server's wall clock. Requests older than this are rejected
 /// to prevent replay attacks.
 ///
 /// Five minutes is the industry-standard window.
 pub const MAX_TIMESTAMP_SKEW_SECS: u64 = 300;
 
+/// Default shared by the library and server configuration loaders.
+pub fn default_timestamp_tolerance_secs() -> u64 {
+    MAX_TIMESTAMP_SKEW_SECS
+}
+
+/// Configured clock skew, injected as an Axum extension by the server.
+#[derive(Clone, Copy)]
+pub struct InboundWebhookTimestampTolerance(pub u64);
+
+impl Default for InboundWebhookTimestampTolerance {
+    fn default() -> Self {
+        Self(default_timestamp_tolerance_secs())
+    }
+}
+
+impl InboundWebhookTimestampTolerance {
+    fn accepts(self, request_ts: u64, now_secs: u64) -> bool {
+        now_secs.abs_diff(request_ts) <= self.0
+    }
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared secret state
 // ─────────────────────────────────────────────────────────────────────────────
@@ -73,9 +93,16 @@ pub struct InboundWebhookNonceCache {
 }
 
 impl InboundWebhookNonceCache {
-    fn check_and_store(&self, nonce: String, signature: String, now_secs: u64) -> bool {
+    fn check_and_store(
+        &self,
+        nonce: String,
+        signature: String,
+        now_secs: u64,
+        request_ts: u64,
+        tolerance_secs: u64,
+    ) -> bool {
         let mut nonces = self.nonces.lock().expect("webhook nonce cache poisoned");
-        nonces.retain(|_, expires_at| *expires_at > now_secs);
+        nonces.retain(|_, expires_at| *expires_at >= now_secs);
 
         let nonce_key = format!("nonce:{nonce}");
         let signature_key = format!("signature:{signature}");
@@ -83,7 +110,9 @@ impl InboundWebhookNonceCache {
             return false;
         }
 
-        let expires_at = now_secs.saturating_add(MAX_TIMESTAMP_SKEW_SECS);
+        // Future-dated signatures remain valid after now + tolerance. Keep them
+        // cached through their last accepted second, including a zero window.
+        let expires_at = now_secs.max(request_ts).saturating_add(tolerance_secs);
         nonces.insert(nonce_key, expires_at);
         nonces.insert(signature_key, expires_at);
         true
@@ -153,9 +182,13 @@ where
             .unwrap_or_default()
             .as_secs();
 
-        if now_secs.saturating_sub(request_ts) > MAX_TIMESTAMP_SKEW_SECS
-            || request_ts.saturating_sub(now_secs) > MAX_TIMESTAMP_SKEW_SECS
-        {
+        let tolerance = req
+            .extensions()
+            .get::<InboundWebhookTimestampTolerance>()
+            .copied()
+            .unwrap_or_default();
+
+        if !tolerance.accepts(request_ts, now_secs) {
             return Err(WebhookValidationError::TimestampExpired);
         }
 
@@ -175,7 +208,13 @@ where
             return Err(WebhookValidationError::InvalidSignature);
         }
 
-        if !nonce_cache.check_and_store(delivery_id, signature_val, now_secs) {
+        if !nonce_cache.check_and_store(
+            delivery_id,
+            signature_val,
+            now_secs,
+            request_ts,
+            tolerance.0,
+        ) {
             return Err(WebhookValidationError::NonceAlreadyUsed);
         }
 
@@ -246,7 +285,7 @@ impl IntoResponse for WebhookValidationError {
             ),
             Self::TimestampExpired => (
                 StatusCode::UNAUTHORIZED,
-                format!("Request timestamp expired (max skew: {MAX_TIMESTAMP_SKEW_SECS}s)"),
+                "Request timestamp outside configured tolerance".to_string(),
             ),
             Self::InvalidSignature => (
                 StatusCode::UNAUTHORIZED,
@@ -296,6 +335,70 @@ mod tests {
 
     const SECRET: &str = "a-secret-that-is-at-least-thirty-two-bytes";
     const BODY: &[u8] = br#"{"event":"transfer","amount":"42"}"#;
+
+    #[tokio::test]
+    async fn extractor_uses_configured_timestamp_tolerance() {
+        for (seconds, offset, expected) in [
+            (30, -120, StatusCode::UNAUTHORIZED),
+            (30, 120, StatusCode::UNAUTHORIZED),
+            (900, -600, StatusCode::OK),
+            (900, 600, StatusCode::OK),
+            (900, -1_200, StatusCode::UNAUTHORIZED),
+            (900, 1_200, StatusCode::UNAUTHORIZED),
+        ] {
+            let app = Router::new()
+                .route(
+                    "/test",
+                    post(|ValidatedWebhook(_): ValidatedWebhook| async { StatusCode::OK }),
+                )
+                .layer(Extension(InboundWebhookSecret(Arc::new(SECRET.into()))))
+                .layer(Extension(InboundWebhookNonceCache::default()))
+                .layer(Extension(InboundWebhookTimestampTolerance(seconds)));
+            let timestamp = (now_str().parse::<i64>().unwrap() + offset).to_string();
+            let signature = format!("sha256={}", sign(SECRET, &timestamp, BODY));
+            let req = Request::builder()
+                .method("POST")
+                .uri("/test")
+                .header(TIMESTAMP_HEADER, &timestamp)
+                .header(SIGNATURE_HEADER, &signature)
+                .header(DELIVERY_HEADER, "configured-tolerance")
+                .body(Body::from(BODY))
+                .unwrap();
+            assert_eq!(app.oneshot(req).await.unwrap().status(), expected);
+        }
+    }
+
+    #[test]
+    fn timestamp_tolerance_checks_both_inclusive_boundaries() {
+        assert_eq!(InboundWebhookTimestampTolerance::default().0, 300);
+        for seconds in [0, 30, 300, 900] {
+            let tolerance = InboundWebhookTimestampTolerance(seconds);
+            assert!(tolerance.accepts(1000 - seconds, 1000));
+            assert!(tolerance.accepts(1000 + seconds, 1000));
+            assert!(!tolerance.accepts(999 - seconds, 1000));
+            assert!(!tolerance.accepts(1001 + seconds, 1000));
+        }
+        assert!(!InboundWebhookTimestampTolerance(300).accepts(u64::MAX, 0));
+        assert!(InboundWebhookTimestampTolerance(u64::MAX).accepts(0, u64::MAX));
+    }
+
+    #[test]
+    fn replay_cache_covers_future_timestamp_and_inclusive_expiry() {
+        let cache = InboundWebhookNonceCache::default();
+        assert!(cache.check_and_store("delivery".into(), "signature".into(), 1000, 1900, 900));
+        // The signature is still valid long after the former 300-second TTL.
+        assert!(!cache.check_and_store("other".into(), "signature".into(), 2800, 1900, 900));
+        assert!(!cache.check_and_store("delivery".into(), "other".into(), 2800, 1900, 900));
+        assert!(cache.check_and_store("delivery".into(), "signature".into(), 2801, 2801, 900));
+    }
+
+    #[test]
+    fn zero_tolerance_still_prevents_replay_in_the_same_second() {
+        let cache = InboundWebhookNonceCache::default();
+        assert!(cache.check_and_store("delivery".into(), "signature".into(), 1000, 1000, 0));
+        assert!(!cache.check_and_store("delivery".into(), "signature".into(), 1000, 1000, 0));
+        assert!(cache.check_and_store("delivery".into(), "signature".into(), 1001, 1001, 0));
+    }
 
     #[test]
     fn valid_signature_is_accepted() {
