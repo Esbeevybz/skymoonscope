@@ -802,6 +802,11 @@ impl MultiYieldVault {
         }
         to.require_auth();
         let mut vault = load_vault(&e)?;
+        if vault.total_shares == 0 {
+            e.events()
+                .publish((Symbol::new(&e, "withdraw_noop"), to), shares);
+            return Ok(0);
+        }
         let token = soroban_sdk::token::Client::new(&e, &vault.deposit_token);
 
         let bal_key = DataKey::Balance(to.clone());
