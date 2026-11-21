@@ -124,6 +124,8 @@ pub struct ResourceDelta {
 /// A single regression alert for a resource that exceeds the threshold.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RegressionFlag {
+    // Keep this object-shaped payload forward-compatible: older clients must
+    // continue to deserialize flags when the server adds new fields.
     /// The resource that regressed (e.g. "cpu_instructions")
     pub resource: String,
     /// Percentage change rounded to two decimal places
@@ -559,6 +561,24 @@ mod tests {
         assert_eq!(deserialized.current.cpu_instructions, 1150);
         assert_eq!(deserialized.base.cpu_instructions, 1000);
         assert!((deserialized.deltas.cpu_instructions - 15.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_regression_report_ignores_future_flag_fields() {
+        let json = r#"
+        {
+            "current": {"cpu_instructions": 1150, "ram_bytes": 2000, "ledger_read_bytes": 500, "ledger_write_bytes": 300, "transaction_size_bytes": 100},
+            "base": {"cpu_instructions": 1000, "ram_bytes": 2000, "ledger_read_bytes": 400, "ledger_write_bytes": 300, "transaction_size_bytes": 100},
+            "deltas": {"cpu_instructions": 15.0, "ram_bytes": 0.0, "ledger_read_bytes": 25.0, "ledger_write_bytes": 0.0, "transaction_size_bytes": 0.0},
+            "regression_flags": [{"resource": "cpu_instructions", "change_percent": 15.0, "severity": "high", "flag_code": "future_server_flag"}],
+            "summary": "2 regression(s) detected"
+        }
+        "#;
+
+        let report: RegressionReport = serde_json::from_str(json)
+            .expect("new server flag fields must not break older clients");
+        assert_eq!(report.regression_flags.len(), 1);
+        assert_eq!(report.regression_flags[0].resource, "cpu_instructions");
     }
 
     #[test]
