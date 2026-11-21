@@ -212,6 +212,18 @@ impl EventStreamService for EventStreamServiceImpl {
                             skipped = skipped,
                             "gRPC stream lagged; some events were dropped"
                         );
+                        // Send explicit lagged notification to the client before closing
+                        if let Some(lagged_event) = translate_lagged_event(skipped) {
+                            if let Err(e) = tx.try_send(lagged_event) {
+                                tracing::error!(
+                                    error = ?e,
+                                    "failed to send lagged event to gRPC stream"
+                                );
+                            }
+                        }
+                        // After notifying about the lag, stop consuming from the bus
+                        // so the stream can close gracefully
+                        break;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -385,6 +397,23 @@ fn translate_event(
         event_type,
         topics_json,
         value_json,
+        tx_hash: String::new(),
+    })
+}
+
+/// Create a lagged notification event for gRPC clients.
+///
+/// When the broadcast channel drops messages due to a slow subscriber,
+/// we synthesize a special `ContractEvent` with a reserved event type
+/// to notify the client about the dropped message count.
+fn translate_lagged_event(dropped: u64) -> Option<ContractEvent> {
+    Some(ContractEvent {
+        ledger_sequence: 0,
+        ledger_close_time: chrono::Utc::now().timestamp(),
+        contract_id: String::new(), // no contract associated with this meta-event
+        event_type: "lagged".to_string(),
+        topics_json: "[]".to_string(),
+        value_json: serde_json::json!({ "dropped": dropped }).to_string(),
         tx_hash: String::new(),
     })
 }
