@@ -1,7 +1,7 @@
 #![cfg(test)]
 use super::*;
-use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
-use soroban_sdk::{token, vec, Address, Env, IntoVal, Symbol, Vec};
+use soroban_sdk::testutils::{Address as _, Events, Ledger, LedgerInfo};
+use soroban_sdk::{token, vec, Address, Env, IntoVal, Symbol, TryIntoVal, Vec};
 use token_contract::TokenClient;
 
 #[test]
@@ -254,5 +254,46 @@ fn test_buy_settles_at_floor_after_the_auction_window() {
     // The buyer paid exactly the floor, not a decayed-below-floor amount.
     assert_eq!(payment.balance(&seller), end_price);
     assert_eq!(payment.balance(&buyer), 1_000_000 - end_price);
+    assert!(auction.is_sold());
+}
+
+#[test]
+fn test_expire_emits_event_closes_bidding_and_allows_reclaim() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let duration: u32 = 40;
+    let (auction, _, buyer, seller) = setup_auction(&env, 900, 300, duration);
+
+    set_sequence(&env, duration);
+    assert!(auction.try_expire().is_err(), "expiry requires a later ledger");
+
+    set_sequence(&env, duration + 1);
+    auction.expire();
+    assert!(auction.try_expire().is_err(), "expiry event must not repeat");
+    assert!(auction.try_buy(&buyer).is_err(), "expired auctions cannot be bought");
+    assert!(!auction.is_sold(), "expiry is distinct from a completed sale");
+
+    let expiry_topic = Symbol::new(&env, "auction_expired").into_val(&env);
+    let expired_events: Vec<_> = env
+        .events()
+        .all()
+        .iter()
+        .filter(|(contract_id, topics, _)| {
+            contract_id == &auction.address
+                && topics.len() == 1
+                && topics.get(0).unwrap() == expiry_topic
+        })
+        .collect();
+    assert_eq!(expired_events.len(), 1);
+
+    let (_, _, data) = expired_events[0];
+    let event: AuctionExpiredEvent = data.try_into_val(&env).unwrap();
+    assert_eq!(event.seller, seller);
+    assert_eq!(event.token_id, 1);
+    assert_eq!(event.end_ledger, duration);
+
+    // Expiring the auction must not prevent the seller's existing reclaim flow.
+    auction.reclaim();
     assert!(auction.is_sold());
 }
