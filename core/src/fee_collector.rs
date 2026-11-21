@@ -85,7 +85,9 @@ pub struct FeeWritePolicy {
     pub backoff_multiplier: u32,
     /// Upper bound for the inter-attempt delay.
     pub max_backoff: Duration,
-    /// Maximum number of records retained in the dead-letter buffer.
+    /// Maximum number of records retained in the in-memory dead-letter buffer.
+    /// Records that overflow the buffer are persisted to the durable
+    /// `dead_letter_fee_records` table rather than being discarded.
     pub dead_letter_capacity: usize,
     /// Consecutive exhausted writes that trigger a `sys_alarms` alert.
     /// `0` disables alerting.
@@ -307,6 +309,11 @@ impl FeeCollector {
     /// Push a permanently-failed sample onto the bounded dead-letter
     /// buffer and raise a `sys_alarms` alert when the consecutive-failure
     /// threshold is crossed.
+    ///
+    /// Records that cannot stay in the bounded buffer — because it is full or
+    /// because its capacity is `0` — are written through to the durable
+    /// `dead_letter_fee_records` table (see [`FeeStore::insert_dead_letter_record`])
+    /// instead of being discarded, so no fee sample is lost permanently.
     async fn enqueue_dead_letter(
         &self,
         sample: &LedgerFeeSample,
@@ -321,18 +328,29 @@ impl FeeCollector {
         };
 
         let capacity = self.write_policy.dead_letter_capacity;
-        if capacity == 0 {
-            self.dead_letters_dropped.fetch_add(1, Ordering::Relaxed);
+        // Collect the records that must leave the bounded in-memory buffer so
+        // they can be persisted durably. The lock is released before any await.
+        let overflowed = if capacity == 0 {
+            vec![record]
         } else {
             let mut buffer = self
                 .dead_letters
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut overflowed = Vec::new();
             while buffer.len() >= capacity {
-                buffer.pop_front();
-                self.dead_letters_dropped.fetch_add(1, Ordering::Relaxed);
+                match buffer.pop_front() {
+                    Some(evicted) => overflowed.push(evicted),
+                    None => break,
+                }
             }
             buffer.push_back(record);
+            overflowed
+        };
+
+        for record in overflowed {
+            self.dead_letters_dropped.fetch_add(1, Ordering::Relaxed);
+            self.persist_dead_letter(&record).await;
         }
 
         let consecutive = self
@@ -344,6 +362,38 @@ impl FeeCollector {
         // worth of failures, so a sustained outage does not page per record.
         if threshold > 0 && (consecutive == threshold || consecutive % threshold == 0) {
             self.raise_fee_store_alarm(consecutive).await;
+        }
+    }
+
+    /// Write an overflowed dead-letter record through to the durable store so it
+    /// can be replayed later. Best-effort: if the store is also unavailable the
+    /// failure is logged, since there is no other durable place to put it.
+    async fn persist_dead_letter(&self, record: &DeadLetterRecord) {
+        match self
+            .store
+            .insert_dead_letter_record(
+                &record.sample,
+                record.attempts,
+                &record.last_error,
+                record.enqueued_at,
+                Utc::now(),
+            )
+            .await
+        {
+            Ok(id) => {
+                tracing::warn!(
+                    ledger = record.sample.ledger_sequence,
+                    dead_letter_id = id,
+                    "Dead-letter buffer full; persisted overflowed fee record for later replay"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    ledger = record.sample.ledger_sequence,
+                    error = %e,
+                    "Failed to persist overflowed dead-letter fee record; record dropped"
+                );
+            }
         }
     }
 
@@ -1236,5 +1286,91 @@ mod tests {
         assert_eq!(collector.dead_letter_len(), 0);
         assert_eq!(collector.consecutive_store_failures(), 0);
         assert_eq!(collector.alarms_raised(), 0);
+    }
+
+    /// A store whose `ledger_fee_samples` table is missing (so sample writes
+    /// fail deterministically) but whose durable dead-letter table exists, so
+    /// overflowed records can still be persisted.
+    async fn dead_letter_only_store() -> Arc<FeeStore> {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        sqlx::query(
+            "CREATE TABLE dead_letter_fee_records (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                ledger_sequence BIGINT NOT NULL, \
+                collected_at TIMESTAMP NOT NULL, \
+                base_reserve BIGINT NOT NULL, \
+                base_fee BIGINT NOT NULL, \
+                max_fee BIGINT NOT NULL, \
+                fee_charged BIGINT NOT NULL, \
+                transaction_count INTEGER NOT NULL, \
+                ledger_close_time TIMESTAMP NOT NULL, \
+                attempts INTEGER NOT NULL, \
+                last_error TEXT NOT NULL, \
+                enqueued_at TIMESTAMP NOT NULL, \
+                dropped_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create dead_letter_fee_records");
+        Arc::new(FeeStore::new(pool))
+    }
+
+    #[tokio::test]
+    async fn overflowed_dead_letters_are_persisted_not_dropped() {
+        let policy = FeeWritePolicy {
+            max_attempts: 1,
+            dead_letter_capacity: 1,
+            alarm_after_consecutive_failures: 0,
+            ..fast_policy()
+        };
+        let store = dead_letter_only_store().await;
+        let collector = collector_with(Arc::clone(&store), policy);
+
+        for ledger in [1, 2] {
+            let _ = collector.persist_sample_with_retry(&sample(ledger)).await;
+        }
+
+        // Ledger 1 overflowed the capacity-1 buffer and was evicted...
+        assert_eq!(collector.dead_letter_len(), 1);
+        assert_eq!(collector.dead_letter_snapshot()[0].sample.ledger_sequence, 2);
+        assert_eq!(collector.dead_letters_dropped(), 1);
+
+        // ...but it is durably persisted for replay instead of being discarded.
+        let persisted = store
+            .get_dead_letter_records(10)
+            .await
+            .expect("list persisted dead letters");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].ledger_sequence, 1);
+        assert_eq!(persisted[0].attempts, 1);
+        assert!(!persisted[0].last_error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_persists_every_dead_letter_durably() {
+        let policy = FeeWritePolicy {
+            max_attempts: 1,
+            dead_letter_capacity: 0,
+            alarm_after_consecutive_failures: 0,
+            ..fast_policy()
+        };
+        let store = dead_letter_only_store().await;
+        let collector = collector_with(Arc::clone(&store), policy);
+
+        let _ = collector.persist_sample_with_retry(&sample(7)).await;
+
+        assert_eq!(collector.dead_letter_len(), 0);
+        assert_eq!(collector.dead_letters_dropped(), 1);
+        let persisted = store
+            .get_dead_letter_records(10)
+            .await
+            .expect("list persisted dead letters");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].ledger_sequence, 7);
     }
 }
