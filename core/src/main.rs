@@ -203,7 +203,14 @@ struct AppConfig {
     /// Broadcast channel capacity for the WebSocket event bus (issue #565).
     /// Controls the per-subscriber in-flight event buffer; slow consumers
     /// that fall behind receive `RecvError::Lagged` (backpressure via drop).
-    /// Clamped to [16, 65536]. Default 256.
+    /// Clamped to [16, 65536]; a value outside that range is adjusted and a
+    /// warning is logged at startup.
+    ///
+    /// Tradeoff: memory per subscriber grows linearly with this value, so a
+    /// larger capacity keeps more buffered events (fewer dropped events under
+    /// bursty load) at the cost of more RAM per connected subscriber. Raise it
+    /// for high-throughput deployments; the 65536 ceiling keeps a
+    /// misconfiguration from exhausting memory. Default 256.
     #[serde(default = "default_event_bus_capacity")]
     event_bus_capacity: usize,
     /// Emit structured JSON log lines instead of the default human-readable
