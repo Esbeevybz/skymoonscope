@@ -16,12 +16,16 @@ struct MockOracle;
 #[derive(Clone)]
 enum OracleDataKey {
     Price,
+    UpdatedLedger,
 }
 
 #[contractimpl]
 impl MockOracle {
     pub fn set_price(e: Env, price: i128) {
         e.storage().instance().set(&OracleDataKey::Price, &price);
+        e.storage()
+            .instance()
+            .set(&OracleDataKey::UpdatedLedger, &e.ledger().sequence());
     }
 
     pub fn latest_price(e: Env) -> i128 {
@@ -29,6 +33,13 @@ impl MockOracle {
             .instance()
             .get(&OracleDataKey::Price)
             .unwrap_or(100_000_000i128)
+    }
+
+    pub fn last_updated_ledger(e: Env) -> u32 {
+        e.storage()
+            .instance()
+            .get(&OracleDataKey::UpdatedLedger)
+            .unwrap_or(0)
     }
 }
 
@@ -1188,7 +1199,7 @@ fn test_oracle_fee_scheduling_and_timelock_execution() {
     let oracle = MockOracleClient::new(&e, &oracle_id);
     oracle.set_price(&100_000_000);
 
-    client.configure_fee_oracle(&oracle_id, &30, &5);
+    client.configure_fee_oracle(&oracle_id, &30, &5, &5);
 
     // First sync seeds the initial price and does not schedule.
     let first_sync = client.sync_fee_from_oracle();
@@ -1237,13 +1248,51 @@ fn test_oracle_low_volatility_keeps_base_fee() {
     let oracle_id = e.register(MockOracle, ());
     let oracle = MockOracleClient::new(&e, &oracle_id);
     oracle.set_price(&100_000_000);
-    client.configure_fee_oracle(&oracle_id, &30, &3);
+    client.configure_fee_oracle(&oracle_id, &30, &3, &3);
 
     assert!(client.sync_fee_from_oracle().is_none());
     // 0.2% move => 20 bps, below low threshold.
     oracle.set_price(&100_200_000);
     assert!(client.sync_fee_from_oracle().is_none());
     assert_eq!(client.get_fee(), 30);
+}
+
+#[test]
+fn test_oracle_price_must_be_within_configured_ledger_age() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let contract_id = e.register(LiquidityPool, ());
+    let client = LiquidityPoolClient::new(&e, &contract_id);
+
+    let admin = Address::generate(&e);
+    let token_a = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = e
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    client.initialize(&admin, &token_a, &token_b);
+
+    let oracle_id = e.register(MockOracle, ());
+    let oracle = MockOracleClient::new(&e, &oracle_id);
+    oracle.set_price(&100_000_000);
+    client.configure_fee_oracle(&oracle_id, &30, &5, &5);
+
+    assert!(client.sync_fee_from_oracle().is_none());
+
+    let mut ledger_info = e.ledger().get();
+    ledger_info.sequence_number += 5;
+    e.ledger().set(ledger_info);
+    assert!(client.sync_fee_from_oracle().is_none());
+
+    let mut ledger_info = e.ledger().get();
+    ledger_info.sequence_number += 1;
+    e.ledger().set(ledger_info);
+    assert_eq!(
+        client.try_sync_fee_from_oracle(),
+        Err(Ok(Error::InvalidOraclePrice))
+    );
 }
 
 #[test]

@@ -138,6 +138,7 @@ pub struct JitPenaltyEvent {
 pub const MAX_FEE_BPS: i128 = 100;
 pub const DEFAULT_BASE_FEE_BPS: i128 = 30;
 pub const DEFAULT_FEE_TIMELOCK_LEDGERS: u32 = 120;
+pub const DEFAULT_MAX_ORACLE_AGE_LEDGERS: u32 = 30;
 pub const DEFAULT_LP_FEE_BPS: i128 = 5;
 pub const MAX_LP_FEE_BPS: i128 = 100;
 pub const MIN_HOLDING_PERIOD: u32 = 10;
@@ -157,6 +158,7 @@ pub const REWARD_PRECISION: i128 = 1_000_000_000_000;
 #[soroban_sdk::contractclient(name = "PriceOracleClient")]
 pub trait PriceOracle {
     fn latest_price(e: Env) -> i128;
+    fn last_updated_ledger(e: Env) -> u32;
 }
 
 // On-chain data types
@@ -216,6 +218,7 @@ pub enum DataKey {
     AccumulatedRewardPerShare,
     LpFeeBps,
     DepositLedger(Address),
+    MaxOracleAgeLedgers,
 }
 
 fn sqrt(x: i128) -> i128 {
@@ -670,14 +673,17 @@ impl LiquidityPool {
 
     /// Attaches a price oracle and configures dynamic-fee parameters.
     ///
-    /// When an oracle is configured, calling [`refresh_oracle_fee`](Self::refresh_oracle_fee)
+    /// When an oracle is configured, calling [`sync_fee_from_oracle`](Self::sync_fee_from_oracle)
     /// will read the latest price, compute volatility, and schedule a fee
     /// update via the timelock if the target fee differs from the current one.
+    /// The oracle must also report the ledger of its latest update; prices
+    /// older than `max_oracle_age_ledgers` are rejected.
     ///
     /// # Parameters
     /// - `oracle`          – Contract address implementing [`PriceOracle`].
     /// - `base_fee_bps`    – Baseline fee used when volatility is below the low threshold.
     /// - `timelock_ledgers` – Ledgers the scheduled fee update must wait before it can be executed.
+    /// - `max_oracle_age_ledgers` – Maximum age, in ledgers, for an oracle price.
     ///
     /// # Errors
     /// - [`Error::InvalidFee`] if `base_fee_bps` is outside `0..=MAX_FEE_BPS`.
@@ -686,6 +692,7 @@ impl LiquidityPool {
         oracle: Address,
         base_fee_bps: i128,
         timelock_ledgers: u32,
+        max_oracle_age_ledgers: u32,
     ) -> Result<(), Error> {
         if !(0..=MAX_FEE_BPS).contains(&base_fee_bps) {
             return Err(Error::InvalidFee);
@@ -703,6 +710,9 @@ impl LiquidityPool {
                 timelock_ledgers,
             },
         );
+        e.storage()
+            .instance()
+            .set(&DataKey::MaxOracleAgeLedgers, &max_oracle_age_ledgers);
         Ok(())
     }
     pub fn get_last_volatility_bps(e: Env) -> i128 {
@@ -715,6 +725,10 @@ impl LiquidityPool {
     pub fn get_pending_fee_update(e: Env) -> Option<PendingFeeUpdate> {
         e.storage().instance().get(&DataKey::PendingFeeUpdate)
     }
+    /// Reads the configured oracle and schedules a fee change from its volatility.
+    ///
+    /// Returns [`Error::InvalidOraclePrice`] for non-positive, future-dated, or
+    /// stale observations.
     pub fn sync_fee_from_oracle(e: Env) -> Result<Option<PendingFeeUpdate>, Error> {
         let mut cfg: OracleConfig = e
             .storage()
@@ -722,6 +736,19 @@ impl LiquidityPool {
             .get(&DataKey::Oracle)
             .ok_or(Error::OracleNotConfigured)?;
         let oracle_client = PriceOracleClient::new(&e, &cfg.oracle);
+        let current_ledger = e.ledger().sequence();
+        let updated_ledger = oracle_client.last_updated_ledger();
+        let max_oracle_age_ledgers: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::MaxOracleAgeLedgers)
+            .unwrap_or(DEFAULT_MAX_ORACLE_AGE_LEDGERS);
+        let Some(oracle_age) = current_ledger.checked_sub(updated_ledger) else {
+            return Err(Error::InvalidOraclePrice);
+        };
+        if oracle_age > max_oracle_age_ledgers {
+            return Err(Error::InvalidOraclePrice);
+        }
         let current_price = oracle_client.latest_price();
         if current_price <= 0 {
             return Err(Error::InvalidOraclePrice);

@@ -30,12 +30,14 @@ pub enum DataKey {
     CumulativePrice,
     TotalTime,
     LastUpdateTimestamp,
+    LastUpdateLedger,
     LastPrice,
     MinUpdateIntervalSeconds,
 }
 
 pub trait PriceOracle {
     fn latest_price(e: Env) -> i128;
+    fn last_updated_ledger(e: Env) -> u32;
 }
 
 #[contract]
@@ -73,6 +75,9 @@ impl TwapOracle {
         e.storage()
             .instance()
             .set(&DataKey::LastUpdateTimestamp, &0u64);
+        e.storage()
+            .instance()
+            .set(&DataKey::LastUpdateLedger, &e.ledger().sequence());
         e.storage().instance().set(&DataKey::LastPrice, &0u128);
         e.storage().instance().set(
             &DataKey::MinUpdateIntervalSeconds,
@@ -163,6 +168,9 @@ impl TwapOracle {
             .set(&DataKey::LastUpdateTimestamp, &now);
         e.storage()
             .instance()
+            .set(&DataKey::LastUpdateLedger, &e.ledger().sequence());
+        e.storage()
+            .instance()
             .set(&DataKey::LastPrice, &(current_price as u128));
 
         Ok(())
@@ -207,5 +215,13 @@ impl PriceOracle for TwapOracle {
     /// Returns the latest TWAP price.
     fn latest_price(e: Env) -> i128 {
         Self::get_twap(e)
+    }
+
+    /// Returns the ledger sequence at which the oracle was last updated.
+    fn last_updated_ledger(e: Env) -> u32 {
+        e.storage()
+            .instance()
+            .get(&DataKey::LastUpdateLedger)
+            .unwrap_or(0)
     }
 }

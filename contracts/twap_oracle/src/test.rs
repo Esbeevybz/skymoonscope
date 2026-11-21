@@ -1,5 +1,8 @@
 #![cfg(test)]
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env,
+};
 
 use crate::{Error, TwapOracle, TwapOracleClient};
 
@@ -28,7 +31,10 @@ fn test_initialize() {
 #[test]
 fn test_update_and_get_twap() {
     let e = Env::default();
-    e.ledger().with_mut(|li| li.timestamp = 1000);
+    e.ledger().with_mut(|li| {
+        li.timestamp = 1000;
+        li.sequence_number = 10;
+    });
 
     let contract_id = e.register(TwapOracle, ());
     let client = TwapOracleClient::new(&e, &contract_id);
@@ -40,13 +46,18 @@ fn test_update_and_get_twap() {
 
     // First update
     assert_eq!(client.update_price(&100), Ok(()));
+    assert_eq!(client.last_updated_ledger(), 10);
     assert_eq!(client.get_twap(), 0); // No time elapsed yet
 
     // Advance time
-    e.ledger().with_mut(|li| li.timestamp = 1010);
+    e.ledger().with_mut(|li| {
+        li.timestamp = 1010;
+        li.sequence_number = 12;
+    });
 
     // Second update
     assert_eq!(client.update_price(&110), Ok(()));
+    assert_eq!(client.last_updated_ledger(), 12);
     // TWAP = (100 * 10) / 10 = 100
     assert_eq!(client.get_twap(), 100);
 
