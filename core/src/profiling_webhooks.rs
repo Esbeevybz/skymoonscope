@@ -115,10 +115,12 @@ pub async fn deliver_profiling_webhook(
 ) -> Result<(), WebhookError> {
     webhook_config.validate()?;
 
-    let body = serde_json::to_vec(&payload)?;
     let timeout = Duration::from_secs(webhook_config.timeout_secs);
+    let mut payload = payload;
 
     for attempt in 1..=webhook_config.max_retries {
+        payload.timestamp = Utc::now().to_rfc3339();
+        let body = serde_json::to_vec(&payload)?;
         let mut request = client
             .post(&webhook_config.config.callback_url)
             .header("Content-Type", "application/json")
@@ -187,6 +189,90 @@ pub async fn deliver_profiling_webhook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Bytes, extract::State, http::HeaderMap, routing::post, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    #[derive(Clone)]
+    struct RetryState {
+        attempts: Arc<AtomicUsize>,
+        deliveries: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,
+    }
+
+    async fn receive_retry(
+        State(state): State<RetryState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::http::StatusCode {
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        let timestamp = payload["timestamp"].as_str().unwrap().to_string();
+        let signature = headers
+            .get(WEBHOOK_SIGNATURE_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        state
+            .deliveries
+            .lock()
+            .unwrap()
+            .push((timestamp, signature, body.to_vec()));
+
+        if state.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            axum::http::StatusCode::OK
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_uses_fresh_timestamp_and_signature() {
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let state = RetryState {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            deliveries: deliveries.clone(),
+        };
+        let app = Router::new()
+            .route("/webhook", post(receive_retry))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let secret = "a-secret-that-is-at-least-thirty-two-bytes";
+        let config = ProfileWebhookConfig {
+            config: WebhookConfig {
+                callback_url: format!("http://{address}/webhook"),
+                headers: None,
+                secret: Some(secret.to_string()),
+            },
+            timeout_secs: 5,
+            max_retries: 2,
+        };
+        let payload = ProfilingWebhookPayload {
+            request_id: Some("req-123".to_string()),
+            function_name: "transfer".to_string(),
+            result: json!({"total_instructions": 1000}),
+            timestamp: "stale timestamp".to_string(),
+        };
+
+        deliver_profiling_webhook(&reqwest::Client::new(), &config, payload)
+            .await
+            .unwrap();
+
+        let deliveries = deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert_ne!(deliveries[0].0, deliveries[1].0);
+        for (_, signature, body) in deliveries.iter() {
+            assert_eq!(&sign_webhook_payload(secret, body), signature);
+        }
+    }
 
     #[test]
     fn test_webhook_config_validation_success() {

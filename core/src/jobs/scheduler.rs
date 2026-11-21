@@ -550,18 +550,18 @@ impl JobWorker {
         timeout_secs: u64,
         max_retries: u32,
     ) {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "job_id": job_id.to_string(),
             "status": status,
             "result": result,
-            "timestamp": Utc::now().to_rfc3339(),
         });
 
-        let body = serde_json::to_vec(&payload).unwrap_or_default();
         let timeout = Duration::from_secs(timeout_secs);
         let mut last_error = None;
 
         for attempt in 1..=max_retries {
+            payload["timestamp"] = serde_json::Value::String(Utc::now().to_rfc3339());
+            let body = serde_json::to_vec(&payload).unwrap_or_default();
             let mut request = client
                 .post(&config.callback_url)
                 .header("Content-Type", "application/json")
@@ -615,5 +615,90 @@ impl JobIdExt for JobId {
     fn from_str_ext(s: &str) -> Option<Self> {
         use std::str::FromStr;
         JobId::from_str(s).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Bytes, extract::State, http::HeaderMap, routing::post, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    #[derive(Clone)]
+    struct RetryState {
+        attempts: Arc<AtomicUsize>,
+        deliveries: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,
+    }
+
+    async fn receive_retry(
+        State(state): State<RetryState>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::http::StatusCode {
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let timestamp = payload["timestamp"].as_str().unwrap().to_string();
+        let signature = headers
+            .get(WEBHOOK_SIGNATURE_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        state
+            .deliveries
+            .lock()
+            .unwrap()
+            .push((timestamp, signature, body.to_vec()));
+
+        if state.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            axum::http::StatusCode::OK
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_retry_uses_fresh_timestamp_and_signature() {
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let state = RetryState {
+            attempts: Arc::new(AtomicUsize::new(0)),
+            deliveries: deliveries.clone(),
+        };
+        let app = Router::new()
+            .route("/webhook", post(receive_retry))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let secret = "a-secret-that-is-at-least-thirty-two-bytes";
+        let config = WebhookConfig {
+            callback_url: format!("http://{address}/webhook"),
+            headers: None,
+            secret: Some(secret.to_string()),
+        };
+        JobWorker::send_webhook(
+            &Client::new(),
+            &config,
+            &JobId::new(),
+            JobStatus::Completed,
+            None,
+            5,
+            2,
+        )
+        .await;
+
+        let deliveries = deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert_ne!(deliveries[0].0, deliveries[1].0);
+        for (_, signature, body) in deliveries.iter() {
+            assert_eq!(&sign_webhook_payload(secret, body), signature);
+        }
     }
 }
