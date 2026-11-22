@@ -19,8 +19,9 @@ use soroban_sdk::xdr::{
     Preconditions, ReadXdr, SequenceNumber, SignatureHint, TimeBounds, TimePoint, Transaction,
     TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, WriteXdr,
 };
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use stellar_strkey::Strkey;
 use utoipa::ToSchema;
@@ -40,6 +41,9 @@ pub struct AuthState {
     /// Emergency pause flag for message verification.
     /// When true, all verification endpoints reject requests.
     pub emergency_verification_paused: Arc<AtomicBool>,
+    /// Server-side store of issued challenge nonces, keyed by client public key.
+    /// Maps client pubkey -> (nonce bytes, expiry timestamp in seconds).
+    pub challenges: Mutex<HashMap<[u8; 32], (Vec<u8>, u64)>>,
 }
 
 impl AuthState {
@@ -89,6 +93,7 @@ impl AuthState {
             server_public_key,
             network_passphrase,
             emergency_verification_paused: Arc::new(AtomicBool::new(emergency_verification_paused)),
+            challenges: Mutex::new(HashMap::new()),
         }
     }
 
@@ -204,6 +209,17 @@ fn build_challenge_envelope(
     let mut nonce = [0u8; 48];
     rand::thread_rng().fill_bytes(&mut nonce);
     let nonce_value = BASE64.encode(nonce);
+
+    // Record the issued nonce server-side so it can be verified (and consumed) later.
+    {
+        let mut challenges = state
+            .challenges
+            .lock()
+            .map_err(|_| AppError::Internal("Challenge store lock poisoned".into()))?;
+        // Opportunistically purge expired entries.
+        challenges.retain(|_, (_, expiry)| *expiry >= now);
+        challenges.insert(*client_pubkey, (nonce.to_vec(), now + CHALLENGE_EXPIRY_SECS));
+    }
 
     let data_name = format!("{WEB_AUTH_DOMAIN} auth");
     let manage_data = ManageDataOp {
@@ -328,7 +344,7 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
         }
     };
 
-    match &ops[0].body {
+    let nonce_bytes = match &ops[0].body {
         OperationBody::ManageData(md) => {
             let name = std::str::from_utf8(md.data_name.as_ref())
                 .map_err(|_| AppError::BadRequest("Invalid data name encoding".into()))?;
@@ -336,8 +352,42 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
             if name != expected {
                 return Err(AppError::BadRequest("Invalid manage_data key".into()));
             }
+
+            let data_value = md
+                .data_value
+                .as_ref()
+                .ok_or_else(|| AppError::BadRequest("Missing nonce value".into()))?;
+            BASE64
+                .decode(data_value.as_ref())
+                .map_err(|_| AppError::BadRequest("Nonce value is not valid base64".into()))?
         }
         _ => return Err(AppError::BadRequest("Expected ManageData operation".into())),
+    };
+
+    // Verify the nonce against the server-side store and consume it to prevent replay.
+    {
+        let mut challenges = state
+            .challenges
+            .lock()
+            .map_err(|_| AppError::Internal("Challenge store lock poisoned".into()))?;
+        // Opportunistically purge expired entries.
+        challenges.retain(|_, (_, expiry)| *expiry >= now);
+
+        let (stored_nonce, expiry) = challenges
+            .get(&client_key)
+            .ok_or_else(|| AppError::Unauthorized("No pending challenge for account".into()))?;
+
+        if now > *expiry {
+            challenges.remove(&client_key);
+            return Err(AppError::Unauthorized("Challenge expired".into()));
+        }
+
+        if stored_nonce.as_slice() != nonce_bytes.as_slice() {
+            return Err(AppError::Unauthorized("Challenge nonce mismatch".into()));
+        }
+
+        // Consume the challenge so it cannot be replayed.
+        challenges.remove(&client_key);
     }
 
     let net_id = network_id(&state.network_passphrase);

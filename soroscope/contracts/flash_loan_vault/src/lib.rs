@@ -2,9 +2,15 @@
 //! # Flash Loan Vault
 //!
 //! A dedicated vault contract that enables atomic flash loans on Soroban.
-//! Users can borrow the full vault balance for 0 fee (or a small configurable
-//! fee) as long as they return the borrowed amount (+ fee) before the
-//! invocation completes.
+//! Users can borrow the full vault balance for a small configurable fee
+//! (minimum 1 bps, maximum 100 bps) as long as they return the borrowed
+//! amount (+ fee) before the invocation completes.
+//!
+//! ## Receiver Whitelist
+//!
+//! Only receiver contracts explicitly approved by the vault admin may be
+//! invoked as flash loan receivers. This prevents arbitrary caller-supplied
+//! addresses from being called in the vault's context.
 //!
 //! ## Safety Model
 //!
@@ -58,7 +64,7 @@ pub enum Error {
     InsufficientVaultBalance = 6,
     /// Invalid amount (zero or negative).
     InvalidAmount = 7,
-    /// Fee basis points out of valid range (0–100).
+    /// Fee basis points out of valid range (1–100).
     InvalidFee = 8,
     /// Contract is paused.
     Paused = 9,
@@ -112,7 +118,7 @@ pub enum DataKey {
     Admin,
     /// The token this vault lends.
     Token,
-    /// Flash loan fee in basis points (0–100).
+    /// Flash loan fee in basis points (1–100).
     FeeBps,
     /// Reentrancy guard: true while a flash loan callback is executing.
     FlashLoanActive,
@@ -122,6 +128,8 @@ pub enum DataKey {
     TotalDeposited,
     /// Temporary record of the last borrow for a borrower address.
     BorrowRecord(Address),
+    /// Admin-managed whitelist of approved flash loan receivers.
+    ReceiverWhitelist(Address),
 }
 
 // ── Flash loan receiver interface ────────────────────────────────────────────
@@ -138,7 +146,7 @@ pub trait FlashLoanReceiver {
     /// # Arguments
     /// * `token`     – address of the borrowed token
     /// * `amount`    – amount borrowed
-    /// * `fee`       – fee owed to the vault (may be 0)
+    /// * `fee`       – fee owed to the vault (always >= 1 bps of amount)
     /// * `initiator` – address that initiated the flash loan
     fn execute_operation(e: Env, token: Address, amount: i128, fee: i128, initiator: Address);
 }
@@ -148,8 +156,11 @@ pub trait FlashLoanReceiver {
 /// Maximum fee in basis points (1%).
 pub const MAX_FEE_BPS: i128 = 100;
 
-/// Default fee: 0 bps (free flash loans).
-pub const DEFAULT_FEE_BPS: i128 = 0;
+/// Minimum fee in basis points. A zero fee is not permitted.
+pub const MIN_FEE_BPS: i128 = 1;
+
+/// Default fee: 1 bps (the minimum allowed fee).
+pub const DEFAULT_FEE_BPS: i128 = MIN_FEE_BPS;
 
 /// Pause type flag for flash loan operations (bit 6, after existing flags).
 pub const FLASH_LOAN_PAUSE_FLAG: u32 = 1 << 6;
@@ -240,6 +251,19 @@ fn set_borrow_paused(e: &Env, paused: bool) {
     e.storage().instance().set(&DataKey::BorrowPaused, &paused);
 }
 
+fn is_receiver_whitelisted(e: &Env, receiver: &Address) -> bool {
+    e.storage()
+        .instance()
+        .get(&DataKey::ReceiverWhitelist(receiver.clone()))
+        .unwrap_or(false)
+}
+
+fn set_receiver_whitelisted(e: &Env, receiver: &Address, allowed: bool) {
+    e.storage()
+        .instance()
+        .set(&DataKey::ReceiverWhitelist(receiver.clone()), &allowed);
+}
+
 // ── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -251,7 +275,7 @@ impl FlashLoanVault {
 
     /// Initialize the vault with an admin and the token to lend.
     ///
-    /// Can only be called once. Sets the fee to 0 bps by default.
+    /// Can only be called once. Sets the fee to the minimum (1 bps) by default.
     pub fn initialize(e: Env, admin: Address, token: Address) -> Result<(), Error> {
         if e.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -344,11 +368,13 @@ impl FlashLoanVault {
         Ok(())
     }
 
-    /// Admin-only: set the flash loan fee in basis points (0–100).
+    /// Admin-only: set the flash loan fee in basis points (1–100).
+    ///
+    /// A zero fee is rejected: flash loans must always cost at least 1 bps.
     pub fn set_fee(e: Env, fee_bps: i128) -> Result<(), Error> {
         check_no_flash_loan_active(&e)?;
 
-        if !(0..=MAX_FEE_BPS).contains(&fee_bps) {
+        if !(MIN_FEE_BPS..=MAX_FEE_BPS).contains(&fee_bps) {
             return Err(Error::InvalidFee);
         }
         let admin = load_admin(&e)?;
@@ -396,6 +422,37 @@ impl FlashLoanVault {
     /// View: is borrow paused?
     pub fn get_borrow_paused(e: Env) -> bool {
         is_borrow_paused(&e)
+    }
+
+    /// Admin-only: approve a receiver contract for flash loans.
+    pub fn add_receiver(e: Env, receiver: Address) -> Result<(), Error> {
+        check_no_flash_loan_active(&e)?;
+
+        let admin = load_admin(&e)?;
+        admin.require_auth();
+
+        if !receiver.is_contract() {
+            return Err(Error::InvalidReceiver);
+        }
+
+        set_receiver_whitelisted(&e, &receiver, true);
+        Ok(())
+    }
+
+    /// Admin-only: revoke a receiver contract from the flash loan whitelist.
+    pub fn remove_receiver(e: Env, receiver: Address) -> Result<(), Error> {
+        check_no_flash_loan_active(&e)?;
+
+        let admin = load_admin(&e)?;
+        admin.require_auth();
+
+        set_receiver_whitelisted(&e, &receiver, false);
+        Ok(())
+    }
+
+    /// View: is the given receiver approved for flash loans?
+    pub fn is_receiver_allowed(e: Env, receiver: Address) -> bool {
+        is_receiver_whitelisted(&e, &receiver)
     }
 
     /// Admin-only: emergency pause all operations.
@@ -450,7 +507,12 @@ impl FlashLoanVault {
         initiator.require_auth();
 
         // 4b. Verify receiver implements the flash loan callback interface.
+        // First line of defence: the receiver must be a contract.
         if !receiver.is_contract() {
+            return Err(Error::InvalidReceiver);
+        }
+        // Second line of defence: only admin-approved receivers may be called.
+        if !is_receiver_whitelisted(&e, &receiver) {
             return Err(Error::InvalidReceiver);
         }
 
