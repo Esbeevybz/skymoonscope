@@ -12,6 +12,29 @@ use std::io::Cursor;
 use stellar_strkey::Strkey;
 use thiserror::Error;
 
+/// Maximum size, in bytes, of a base64-decoded XDR payload accepted by the
+/// decoder.  This bounds the amount of memory an untrusted caller can force
+/// the server to allocate while parsing.
+pub const MAX_XDR_PAYLOAD_BYTES: usize = 64 * 1024;
+
+/// Maximum nesting depth permitted while parsing untrusted XDR.
+const MAX_XDR_DEPTH: u32 = 500;
+
+/// Maximum length of a variable-length XDR container (vectors, strings, ...).
+const MAX_XDR_LENGTH: u32 = 1_000_000;
+
+/// Build a bounded [`Limits`] configuration for parsing untrusted XDR.
+///
+/// Unlike [`Limits::none`], this caps the total input size, nesting depth and
+/// container lengths so a malformed payload cannot exhaust server memory.
+fn bounded_limits() -> Limits {
+    Limits {
+        depth: MAX_XDR_DEPTH,
+        len: MAX_XDR_LENGTH,
+        input: MAX_XDR_PAYLOAD_BYTES,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DecodedTransactionResult {
     pub invocations: Vec<DecodedInvocation>,
@@ -83,6 +106,8 @@ pub enum XdrDecodeError {
     CorruptPayload(XdrDecodeErrorInfo),
     #[error("transaction metadata does not contain Soroban execution data")]
     MissingSorobanMetadata,
+    #[error("XDR payload too large: {size} bytes exceeds the {limit} byte limit")]
+    PayloadTooLarge { size: usize, limit: usize },
 }
 
 impl XdrDecodeError {
@@ -92,6 +117,7 @@ impl XdrDecodeError {
             XdrDecodeError::InvalidBase64 { offset, .. } => *offset,
             XdrDecodeError::CorruptPayload(info) => info.offset,
             XdrDecodeError::MissingSorobanMetadata => None,
+            XdrDecodeError::PayloadTooLarge { .. } => None,
         }
     }
 
@@ -117,6 +143,11 @@ impl XdrDecodeError {
                 kind: "soroban_metadata".to_string(),
                 offset: None,
                 message: "transaction metadata does not contain Soroban execution data".to_string(),
+            },
+            XdrDecodeError::PayloadTooLarge { size, limit } => XdrDecodeErrorInfo {
+                kind: "payload_size".to_string(),
+                offset: None,
+                message: format!("XDR payload too large: {size} bytes exceeds the {limit} byte limit"),
             },
         }
     }
@@ -144,8 +175,15 @@ impl XdrTransactionResultDecoder {
             }
         };
 
+        if bytes.len() > MAX_XDR_PAYLOAD_BYTES {
+            return Err(XdrDecodeError::PayloadTooLarge {
+                size: bytes.len(),
+                limit: MAX_XDR_PAYLOAD_BYTES,
+            });
+        }
+
         let mut cursor = Cursor::new(&bytes);
-        match T::read_xdr(&mut cursor, Limits::none()) {
+        match T::read_xdr(&mut cursor, bounded_limits()) {
             Ok(val) => Ok(val),
             Err(source) => {
                 let offset = Some(cursor.position() as usize);
@@ -504,5 +542,45 @@ mod tests {
         assert!(XdrTransactionResultDecoder::decode_soroban_meta_xdr(&garbage).is_err());
         assert!(XdrTransactionResultDecoder::decode_envelope(&garbage).is_err());
         assert!(XdrTransactionResultDecoder::decode(&garbage, Some(&garbage)).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_payload_before_parsing() {
+        // A base64 blob whose decoded size exceeds the 64 KB cap must be
+        // rejected without attempting to parse it.
+        let oversized = BASE64.encode(vec![0u8; MAX_XDR_PAYLOAD_BYTES + 1]);
+        let error = XdrTransactionResultDecoder::decode_soroban_meta_xdr(&oversized).unwrap_err();
+        match error {
+            XdrDecodeError::PayloadTooLarge { size, limit } => {
+                assert_eq!(size, MAX_XDR_PAYLOAD_BYTES + 1);
+                assert_eq!(limit, MAX_XDR_PAYLOAD_BYTES);
+            }
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
+        assert!(XdrTransactionResultDecoder::decode_result_meta(&oversized).is_err());
+        assert!(XdrTransactionResultDecoder::decode_envelope(&oversized).is_err());
+    }
+
+    #[test]
+    fn accepts_payload_at_size_limit() {
+        // A payload exactly at the cap must still be parsed (and fail only
+        // because the bytes are not valid XDR, not because of the size guard).
+        let at_limit = BASE64.encode(vec![0u8; MAX_XDR_PAYLOAD_BYTES]);
+        let error = XdrTransactionResultDecoder::decode_soroban_meta_xdr(&at_limit).unwrap_err();
+        assert!(!matches!(error, XdrDecodeError::PayloadTooLarge { .. }));
+    }
+
+    #[test]
+    fn normal_payloads_still_decode_with_bounded_limits() {
+        let meta = SorobanTransactionMeta {
+            ext: SorobanTransactionMetaExt::V0,
+            events: VecM::default(),
+            return_value: ScVal::U32(99),
+            diagnostic_events: VecM::default(),
+        };
+        let xdr = meta.to_xdr_base64(Limits::none()).unwrap();
+        assert!(xdr.len() < MAX_XDR_PAYLOAD_BYTES);
+        let decoded = XdrTransactionResultDecoder::decode_soroban_meta_xdr(&xdr).unwrap();
+        assert_eq!(decoded.return_value, "99");
     }
 }

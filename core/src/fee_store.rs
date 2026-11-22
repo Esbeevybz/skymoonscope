@@ -86,6 +86,20 @@ pub struct DeadLetterFeeRecord {
     pub dropped_at: DateTime<Utc>,
 }
 
+/// Ensure a SQLite database URL carries the `sqlite://` scheme so that
+/// connection options (WAL mode, busy timeout, pool limits) are honoured.
+///
+/// - `sqlite://...` and `sqlite::memory:` are returned unchanged.
+/// - Bare file paths (e.g. `/tmp/fees.db` or `fees.db`) are prefixed with
+///   `sqlite://`.
+fn normalise_sqlite_url(database_url: &str) -> String {
+    if database_url.starts_with("sqlite://") || database_url.starts_with("sqlite::memory:") {
+        database_url.to_string()
+    } else {
+        format!("sqlite://{}", database_url)
+    }
+}
+
 /// Thread-safe fee data store backed by SQLite
 pub struct FeeStore {
     pool: SqlitePool,
@@ -101,7 +115,14 @@ impl FeeStore {
     ///   SQLite will retry for up to 5 s before giving up, covering brief contention.
     /// - `max_connections(5)`: caps the pool so writers queue rather than race.
     pub async fn connect(database_url: &str) -> Result<Self, FeeStoreError> {
-        let options = SqliteConnectOptions::from_str(database_url)?
+        // Normalise bare file paths to a `sqlite://` URL. Without the scheme,
+        // `SqliteConnectOptions::from_str` falls back to defaults and silently
+        // ignores the WAL / busy_timeout / pool settings below, which caused
+        // `SQLITE_BUSY` errors and dropped fee records under concurrency
+        // (ISSUE-013).
+        let normalised_url = normalise_sqlite_url(database_url);
+
+        let options = SqliteConnectOptions::from_str(&normalised_url)?
             .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_millis(5000))
             .create_if_missing(true);
@@ -529,5 +550,90 @@ mod tests {
         }
 
         assert_eq!(errors, 0, "expected zero DatabaseLocked errors under concurrent writes");
+    }
+
+    #[test]
+    fn test_normalise_sqlite_url() {
+        assert_eq!(normalise_sqlite_url("/tmp/fees.db"), "sqlite:///tmp/fees.db");
+        assert_eq!(normalise_sqlite_url("fees.db"), "sqlite://fees.db");
+        assert_eq!(
+            normalise_sqlite_url("sqlite:///tmp/fees.db"),
+            "sqlite:///tmp/fees.db"
+        );
+        assert_eq!(normalise_sqlite_url("sqlite::memory:"), "sqlite::memory:");
+    }
+
+    /// Open a store from a bare file path (no `sqlite://` scheme) and verify
+    /// that concurrent writes neither fail with `SQLITE_BUSY`/`DatabaseLocked`
+    /// nor lose records (ISSUE-013).
+    #[tokio::test]
+    async fn test_connect_bare_file_path_concurrent_writes() {
+        let dir = std::env::temp_dir().join(format!("feestore-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db_path = dir.join("fees.db");
+        let bare_path = db_path.to_str().expect("utf-8 path").to_string();
+
+        let store = Arc::new(
+            FeeStore::connect(&bare_path)
+                .await
+                .expect("connect from bare file path"),
+        );
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS ledger_fee_samples (
+                ledger_sequence BIGINT PRIMARY KEY,
+                collected_at TEXT NOT NULL,
+                base_reserve BIGINT NOT NULL,
+                base_fee BIGINT NOT NULL,
+                max_fee BIGINT NOT NULL,
+                fee_charged BIGINT NOT NULL,
+                transaction_count INTEGER NOT NULL,
+                ledger_close_time TEXT NOT NULL
+            )",
+        )
+        .execute(store.pool())
+        .await
+        .expect("create table");
+
+        let mut handles = Vec::new();
+        for i in 0..10_i64 {
+            let store = Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                let samples: Vec<LedgerFeeSample> = (0..5)
+                    .map(|j| {
+                        let seq = i * 5 + j;
+                        LedgerFeeSample {
+                            ledger_sequence: seq,
+                            collected_at: Utc::now(),
+                            base_reserve: 100,
+                            base_fee: 100,
+                            max_fee: 1000,
+                            fee_charged: 100,
+                            transaction_count: 1,
+                            ledger_close_time: Utc::now(),
+                        }
+                    })
+                    .collect();
+                store.batch_insert_samples(&samples).await
+            }));
+        }
+
+        for handle in handles {
+            let result = handle.await.expect("task join");
+            if let Err(e) = result {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("database is locked") && !msg.contains("SQLITE_BUSY"),
+                    "unexpected lock error under concurrent writes: {msg}"
+                );
+                panic!("write failed: {msg}");
+            }
+        }
+
+        let count = store.get_sample_count().await.expect("count samples");
+        assert_eq!(count, 50, "all concurrently written records must persist");
+
+        store.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -39,6 +39,8 @@ impl SharedResultsStore {
 
     /// Create a new shared result
     pub async fn create(&self, mut shared: SharedResult) -> Result<SharedResult, SharedResultsStoreError> {
+        validate_created_by(&shared.created_by)?;
+
         let now = Utc::now();
         
         let query = r#"
@@ -216,6 +218,8 @@ impl SharedResultsStore {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<SharedResult>, SharedResultsStoreError> {
+        validate_created_by(created_by)?;
+
         let query = r#"
             SELECT id, share_id, result_data, metadata, created_at, expires_at,
                    access_count, created_by, updated_at
@@ -280,6 +284,30 @@ impl SharedResultsStore {
     }
 }
 
+/// Maximum allowed length (in bytes) for the `created_by` field
+const MAX_CREATED_BY_BYTES: usize = 256;
+
+/// Validate the `created_by` value before it is bound into SQLite.
+///
+/// Rejects values longer than 256 bytes and values containing
+/// non-printable UTF-8 characters.
+fn validate_created_by(value: &str) -> Result<(), SharedResultsStoreError> {
+    if value.len() > MAX_CREATED_BY_BYTES {
+        return Err(SharedResultsStoreError::InvalidRequest(format!(
+            "created_by exceeds maximum length of {} bytes",
+            MAX_CREATED_BY_BYTES
+        )));
+    }
+
+    if value.chars().any(|c| !c.is_ascii_graphic() && c != ' ') {
+        return Err(SharedResultsStoreError::InvalidRequest(
+            "created_by contains non-printable characters".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Generate a unique share ID
 pub fn generate_share_id() -> String {
     nanoid!(12, &nanoid::alphabet::ALPHANUMERIC)
@@ -294,5 +322,42 @@ mod tests {
         let id = generate_share_id();
         assert_eq!(id.len(), 12);
         assert!(id.chars().all(|c| c.is_alphanumeric()));
+    }
+
+    #[test]
+    fn test_validate_created_by_accepts_max_length() {
+        let value = "a".repeat(MAX_CREATED_BY_BYTES);
+        assert!(validate_created_by(&value).is_ok());
+    }
+
+    #[test]
+    fn test_validate_created_by_rejects_too_long() {
+        let value = "a".repeat(MAX_CREATED_BY_BYTES + 1);
+        assert!(matches!(
+            validate_created_by(&value),
+            Err(SharedResultsStoreError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_created_by_rejects_non_printable() {
+        assert!(matches!(
+            validate_created_by("user\nname"),
+            Err(SharedResultsStoreError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            validate_created_by("user\u{0000}name"),
+            Err(SharedResultsStoreError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            validate_created_by("user\u{0007}"),
+            Err(SharedResultsStoreError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_created_by_accepts_printable() {
+        assert!(validate_created_by("user name-123").is_ok());
+        assert!(validate_created_by("").is_ok());
     }
 }

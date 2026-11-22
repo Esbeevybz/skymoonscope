@@ -76,6 +76,22 @@ impl DutchAuction {
             panic!("Already sold");
         }
 
+        // Authorise the seller before any NFT transfer can occur
+        let seller: Address = env.storage().instance().get(&DataKey::Seller).unwrap();
+        seller.require_auth();
+
+        // Verify the seller still owns the token before transferring it
+        let nft_contract: Address = env.storage().instance().get(&DataKey::NftContract).unwrap();
+        let token_id: i128 = env.storage().instance().get(&DataKey::TokenId).unwrap();
+        let owner: Address = env.invoke_contract(
+            &nft_contract,
+            &Symbol::new(&env, "owner_of"),
+            Vec::from_array(&env, [token_id.into_val(&env)]),
+        );
+        if owner != seller {
+            panic!("Seller no longer owns the token");
+        }
+
         let current_price = Self::get_current_price(env.clone());
 
         let payment_token: Address = env.storage().instance().get(&DataKey::PaymentToken).unwrap();
@@ -88,8 +104,6 @@ impl DutchAuction {
         );
 
         // Transfer NFT to buyer
-        let nft_contract: Address = env.storage().instance().get(&DataKey::NftContract).unwrap();
-        let token_id: i128 = env.storage().instance().get(&DataKey::TokenId).unwrap();
         env.invoke_contract(
             &nft_contract,
             &Symbol::new(&env, "transfer"),
@@ -97,7 +111,6 @@ impl DutchAuction {
         );
 
         // Transfer payment to seller
-        let seller: Address = env.storage().instance().get(&DataKey::Seller).unwrap();
         env.invoke_contract(
             &payment_token,
             &Symbol::new(&env, "transfer"),
