@@ -20,6 +20,8 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::task_dispatcher::{BoundedTaskDispatcher, DispatchOutcome, TaskPriority};
+
 type HmacSha256 = Hmac<Sha256>;
 
 pub const SIGNATURE_HEADER: &str = "x-Sky Moon Scope-signature";
@@ -277,24 +279,47 @@ pub struct WebhookWorker {
 
 impl WebhookWorker {
     pub fn start(registry: SubscriptionRegistry, config: WebhookConfig) -> Self {
-        Self::start_with_client(registry, config, Client::new())
+        Self::start_with_client(
+            registry,
+            config,
+            Client::new(),
+            BoundedTaskDispatcher::default(),
+        )
     }
 
     fn start_with_client(
         registry: SubscriptionRegistry,
         config: WebhookConfig,
         client: Client,
+        dispatcher: BoundedTaskDispatcher,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel(config.queue_capacity);
         let task = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 for subscription in registry.matching(&event).await {
-                    if let Err(error) = deliver(&client, &config, &subscription, &event).await {
-                        tracing::error!(
-                            subscription_id = %subscription.id,
-                            event_id = %event.id,
-                            error = %error,
-                            "contract event webhook delivery exhausted retries"
+                    let event_id = event.id;
+                    let client = client.clone();
+                    let config = config.clone();
+                    let dispatcher = dispatcher.clone();
+                    let event = event.clone();
+                    let outcome = dispatcher
+                        .dispatch(TaskPriority::Low, async move {
+                            if let Err(error) =
+                                deliver(&client, &config, &subscription, &event).await
+                            {
+                                tracing::error!(
+                                    subscription_id = %subscription.id,
+                                    event_id = %event.id,
+                                    error = %error,
+                                    "contract event webhook delivery exhausted retries"
+                                );
+                            }
+                        })
+                        .await;
+                    if let DispatchOutcome::Dropped = outcome {
+                        tracing::warn!(
+                            event_id = %event_id,
+                            "webhook delivery task dropped: dispatcher at capacity"
                         );
                     }
                 }
