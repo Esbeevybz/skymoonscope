@@ -196,29 +196,31 @@ impl XdrTransactionResultDecoder {
 
     /// Decodes a `SorobanTransactionMeta` into API-friendly diagnostics.
     ///
-    /// This is fallible because field values are attacker-controlled: a
-    /// malformed payload can encode resource fees whose sum overflows `i64`.
-    /// Such inputs return `Err` instead of panicking.
+    /// Fee values are RPC-provided and can be negative or overflow when added.
+    /// Totals are clamped to a non-negative, saturating sum while preserving the
+    /// reported components for diagnostics.
     pub fn decode_soroban_meta(
         meta: &SorobanTransactionMeta,
     ) -> Result<DecodedTransactionResult, XdrDecodeError> {
         let fees = match &meta.ext {
             SorobanTransactionMetaExt::V0 => ResourceFeeBreakdown::default(),
             SorobanTransactionMetaExt::V1(fees) => {
-                let total = fees
-                    .total_non_refundable_resource_fee_charged
-                    .checked_add(fees.total_refundable_resource_fee_charged)
-                    .ok_or_else(|| {
-                        XdrDecodeError::CorruptPayload(XdrDecodeErrorInfo {
-                            kind: "soroban_metadata".to_string(),
-                            offset: None,
-                            message: "resource fee total overflows i64".to_string(),
-                        })
-                    })?;
+                let non_refundable = fees.total_non_refundable_resource_fee_charged;
+                let refundable = fees.total_refundable_resource_fee_charged;
+                let rent = fees.rent_fee_charged;
+                if non_refundable < 0 || refundable < 0 || rent < 0 {
+                    tracing::warn!(
+                        non_refundable,
+                        refundable,
+                        rent,
+                        "negative Soroban resource fee component reported by RPC"
+                    );
+                }
+                let total = non_refundable.saturating_add(refundable).max(0);
                 ResourceFeeBreakdown {
-                    non_refundable: fees.total_non_refundable_resource_fee_charged,
-                    refundable: fees.total_refundable_resource_fee_charged,
-                    rent: fees.rent_fee_charged,
+                    non_refundable,
+                    refundable,
+                    rent,
                     total,
                 }
             }
@@ -439,7 +441,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_fee_total_overflow_instead_of_panicking() {
+    fn clamps_negative_fee_total_to_zero() {
+        let meta = SorobanTransactionMeta {
+            ext: SorobanTransactionMetaExt::V1(SorobanTransactionMetaExtV1 {
+                ext: ExtensionPoint::V0,
+                total_non_refundable_resource_fee_charged: 100,
+                total_refundable_resource_fee_charged: -150,
+                rent_fee_charged: 0,
+            }),
+            events: VecM::default(),
+            return_value: ScVal::Void,
+            diagnostic_events: VecM::default(),
+        };
+
+        let decoded = XdrTransactionResultDecoder::decode_soroban_meta(&meta).unwrap();
+        assert_eq!(decoded.fees.non_refundable, 100);
+        assert_eq!(decoded.fees.refundable, -150);
+        assert_eq!(decoded.fees.total, 0);
+    }
+
+    #[test]
+    fn saturates_fee_total_on_i64_overflow() {
         let meta = SorobanTransactionMeta {
             ext: SorobanTransactionMetaExt::V1(SorobanTransactionMetaExtV1 {
                 ext: ExtensionPoint::V0,
@@ -452,15 +474,13 @@ mod tests {
             diagnostic_events: VecM::default(),
         };
 
-        // The helper must return Err rather than overflow-panicking.
-        let error = XdrTransactionResultDecoder::decode_soroban_meta(&meta).unwrap_err();
-        assert!(matches!(error, XdrDecodeError::CorruptPayload(_)));
-        assert_eq!(error.offset(), None);
+        let decoded = XdrTransactionResultDecoder::decode_soroban_meta(&meta).unwrap();
+        assert_eq!(decoded.fees.total, i64::MAX);
 
-        // ...and the same crafted payload through the string entry point.
+        // The same crafted payload remains decodable through the string entry point.
         let xdr = meta.to_xdr_base64(Limits::none()).unwrap();
-        let error = XdrTransactionResultDecoder::decode_soroban_meta_xdr(&xdr).unwrap_err();
-        assert!(matches!(error, XdrDecodeError::CorruptPayload(_)));
+        let decoded = XdrTransactionResultDecoder::decode_soroban_meta_xdr(&xdr).unwrap();
+        assert_eq!(decoded.fees.total, i64::MAX);
     }
 
     #[test]

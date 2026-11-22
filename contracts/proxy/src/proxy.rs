@@ -19,13 +19,23 @@ pub const TIMELOCK_DELAY: u64 = 172_800; // 48 hours in seconds (48 * 60 * 60)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingUpgrade {
     pub new_implementation: Address,
+    /// Hash of the implementation's logic artifact, supplied by the proposer.
+    pub logic_hash: BytesN<32>,
     pub eta: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpgradedEvent {
+    pub logic_hash: BytesN<32>,
+    pub interface_version: u32,
 }
 
 #[contracttype]
 pub enum DataKey {
     Admin,
     Implementation,
+    InterfaceVersion,
     Counter,
     Storage(BytesN<32>),
     PendingUpgrade,
@@ -45,6 +55,9 @@ impl Proxy {
         env.storage()
             .instance()
             .set(&DataKey::Implementation, &implementation);
+        env.storage()
+            .instance()
+            .set(&DataKey::InterfaceVersion, &1u32);
         env.storage().instance().set(&DataKey::Counter, &0i32);
     }
 
@@ -52,33 +65,19 @@ impl Proxy {
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
-    /// Single audited gate for every privileged operation (issue #80).
-    ///
-    /// The admin lives in `instance` storage, written once by `initialize`, and
-    /// every upgrade operation funnels through this helper so there is exactly
-    /// one place where the check can be wrong.
-    ///
-    /// The workspace pins `soroban-sdk` 22, which does not expose
-    /// `Env::invoker()`, so the requirement is expressed as
-    /// `admin.require_auth()`: the transaction must carry an authorization for
-    /// the admin covering this contract, this function and these arguments. A
-    /// caller that cannot produce the admin's authorization therefore cannot
-    /// repoint the implementation.
-    fn require_admin(env: &Env) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
-        admin.require_auth();
-        Ok(())
-    }
-
     pub fn get_implementation(env: Env) -> Address {
         env.storage()
             .instance()
             .get(&DataKey::Implementation)
             .unwrap()
+    }
+
+    /// Returns the interface generation, starting at 1 and incrementing on each upgrade.
+    pub fn interface_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::InterfaceVersion)
+            .unwrap_or(1)
     }
 
     /// Assert the caller is authorised as the recorded admin.
@@ -97,13 +96,15 @@ impl Proxy {
         env.storage().persistent().get(&DataKey::PendingUpgrade)
     }
 
-    /// Step 1: Propose an upgrade with a 48-hour timelock delay
-    pub fn propose_upgrade(env: Env, new_implementation: Address) {
+    /// Step 1: Propose an upgrade with a 48-hour timelock delay.
+    /// `logic_hash` identifies the implementation artifact for upgrade observers.
+    pub fn propose_upgrade(env: Env, new_implementation: Address, logic_hash: BytesN<32>) {
         Self::require_admin(&env);
 
         let eta = env.ledger().timestamp() + TIMELOCK_DELAY;
         let proposal = PendingUpgrade {
             new_implementation: new_implementation.clone(),
+            logic_hash,
             eta,
         };
 
@@ -113,7 +114,6 @@ impl Proxy {
 
         env.events()
             .publish((symbol_short!("propose"),), (new_implementation, eta));
-        Ok(())
     }
 
     /// Step 2: Execute the pending upgrade once 48 hours have passed
@@ -130,15 +130,27 @@ impl Proxy {
             panic!("Timelock delay of 48 hours has not elapsed");
         }
 
+        Self::apply_upgrade(&env, &proposal);
+    }
+
+    fn apply_upgrade(env: &Env, proposal: &PendingUpgrade) {
         env.storage()
-            .persistent()
+            .instance()
             .set(&DataKey::Implementation, &proposal.new_implementation);
-
+        let interface_version = Self::interface_version(env.clone())
+            .checked_add(1)
+            .expect("interface version overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::InterfaceVersion, &interface_version);
         env.storage().persistent().remove(&DataKey::PendingUpgrade);
-
-        env.events()
-            .publish((symbol_short!("upgraded"),), proposal.new_implementation);
-        Ok(())
+        env.events().publish(
+            (symbol_short!("upgraded"),),
+            UpgradedEvent {
+                logic_hash: proposal.logic_hash.clone(),
+                interface_version,
+            },
+        );
     }
 
     /// Step 3: Admin can cancel a pending upgrade
@@ -148,7 +160,6 @@ impl Proxy {
         env.storage().persistent().remove(&DataKey::PendingUpgrade);
 
         env.events().publish((symbol_short!("cancel"),), ());
-        Ok(())
     }
 
     /// Legacy upgrade method kept for backward compatibility (delegates to proposal flow)
@@ -156,8 +167,8 @@ impl Proxy {
     /// Retained name, but the behaviour is the timelocked proposal: an upgrade
     /// is never applied immediately, so this alias cannot be used to skip the
     /// 48-hour delay.
-    pub fn upgrade_to(env: Env, implementation: Address) {
-        Self::propose_upgrade(env, implementation);
+    pub fn upgrade_to(env: Env, implementation: Address, logic_hash: BytesN<32>) {
+        Self::propose_upgrade(env, implementation, logic_hash);
     }
 
     /// Transfer proxy administration. Admin only.
@@ -192,15 +203,9 @@ impl Proxy {
             panic!("Timelock delay of 48 hours has not elapsed");
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Implementation, &proposal.new_implementation);
-        env.storage().persistent().remove(&DataKey::PendingUpgrade);
-
-        env.events()
-            .publish((symbol_short!("upgraded"),), proposal.new_implementation);
+        Self::apply_upgrade(&env, &proposal);
         // The upgraded implementation is invoked separately by the caller.
-        Ok(Val::from(0i32))
+        Val::from(0i32)
     }
 
     pub fn delegate_call(env: Env, method: Symbol, args: Vec<Val>) -> Val {
@@ -235,7 +240,6 @@ impl Proxy {
     /// directly and not subject to the admin check.
     fn write_value(env: &Env, value: i32) {
         env.storage().instance().set(&DataKey::Counter, &value);
-        Ok(())
     }
 
     pub fn set_storage(env: Env, key: BytesN<32>, value: Val) {
@@ -243,7 +247,6 @@ impl Proxy {
         env.storage()
             .persistent()
             .set(&DataKey::Storage(key), &value);
-        Ok(())
     }
 
     pub fn get_storage(env: Env, key: BytesN<32>) -> Option<Val> {
