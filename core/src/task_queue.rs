@@ -63,6 +63,17 @@ impl BoundedTaskDispatcher {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    /// Close the dispatcher, releasing any callers blocked in `dispatch`.
+    ///
+    /// After this returns, pending and future `Normal`-priority dispatches
+    /// resolve to [`DispatchOutcome::Dropped`] instead of waiting for a
+    /// permit, so a graceful shutdown cannot be stalled by tasks queued on
+    /// `acquire_owned`.
+    pub fn shutdown(&self) {
+        self.semaphore.close();
+    }
+=======
+
     /// Dispatch `task` onto a background Tokio task, honouring `priority`.
     ///
     /// `Normal` tasks always run: dispatch waits for a free slot, providing
@@ -76,8 +87,15 @@ impl BoundedTaskDispatcher {
         let permit = match priority {
             TaskPriority::Normal => match self.semaphore.clone().acquire_owned().await {
                 Ok(permit) => permit,
-                // Semaphore closed: dispatcher is shutting down.
-                Err(_) => return DispatchOutcome::Dropped,
+                // Semaphore closed: dispatcher is shutting down, so let
+                // blocked callers exit cleanly instead of hanging.
+                Err(_) => {
+                    tracing::debug!(
+                        capacity = self.capacity,
+                        "bounded task dispatcher is shutting down — dropping normal-priority task"
+                    );
+                    return DispatchOutcome::Dropped;
+                }
             },
             TaskPriority::Low => match self.semaphore.clone().try_acquire_owned() {
                 Ok(permit) => permit,
@@ -178,6 +196,40 @@ mod tests {
             .await
             .expect("second task must complete after permit is released");
         assert_eq!(dispatcher.dropped_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_pending_normal_dispatch() {
+        let dispatcher = BoundedTaskDispatcher::new(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        // Occupy the only slot so the next Normal dispatch must wait.
+        let outcome = dispatcher
+            .dispatch(TaskPriority::Low, async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+            })
+            .await;
+        assert_eq!(outcome, DispatchOutcome::Spawned);
+
+        started_rx
+            .await
+            .expect("first task must start and acquire permit");
+
+        let pending = dispatcher.dispatch(TaskPriority::Normal, async {
+            unreachable!("dropped tasks must never run");
+        });
+
+        // Closing the dispatcher must release the blocked caller.
+        dispatcher.shutdown();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("shutdown must release blocked normal-priority dispatch");
+        assert_eq!(outcome, DispatchOutcome::Dropped);
+
+        let _ = release_tx.send(());
     }
 
     #[tokio::test]

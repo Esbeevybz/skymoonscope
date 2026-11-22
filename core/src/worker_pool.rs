@@ -13,6 +13,8 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+use crate::sys_alarms::{self, AlarmSeverity};
+
 type Task = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// Receiver half of the pool's queue, shared by every worker.
@@ -28,6 +30,9 @@ const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// A worker that stays up this long counts as recovered and forgets the
 /// backoff it accumulated while it was failing.
 const RESTART_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
+/// Consecutive failures above which a worker is considered to be in a
+/// death-loop and a critical `SysAlarm` is raised.
+const RESTART_BACKOFF_ALARM_THRESHOLD: u32 = 10;
 /// Default maximum time shutdown waits for queued and in-flight tasks to drain.
 const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -50,6 +55,9 @@ struct WorkerSlot {
     restart_at: Option<tokio::time::Instant>,
     /// When the current worker was (re)started.
     started_at: tokio::time::Instant,
+    /// Whether a critical death-loop alarm is currently raised for this slot,
+    /// so it is emitted once instead of on every supervisor tick.
+    alarm_active: bool,
 }
 
 impl WorkerSlot {
@@ -60,6 +68,7 @@ impl WorkerSlot {
             failures: 0,
             restart_at: None,
             started_at: tokio::time::Instant::now(),
+            alarm_active: false,
         }
     }
 
@@ -82,6 +91,13 @@ impl WorkerSlot {
                 && now.saturating_duration_since(self.started_at) >= RESTART_BACKOFF_RESET_AFTER
             {
                 self.failures = 0;
+                if self.alarm_active {
+                    self.alarm_active = false;
+                    sys_alarms::clear_alarm(
+                        "event_worker_restart_loop",
+                        "event worker recovered after repeated restarts",
+                    );
+                }
             }
             return None;
         }
@@ -335,6 +351,19 @@ async fn supervise(
                 delay_ms = delay.as_millis(),
                 "scheduling event worker restart"
             );
+
+            if slot.failures > RESTART_BACKOFF_ALARM_THRESHOLD && !slot.alarm_active {
+                slot.alarm_active = true;
+                sys_alarms::raise_alarm(
+                    "event_worker_restart_loop",
+                    AlarmSeverity::Critical,
+                    format!(
+                        "event worker {index} is in a restart death-loop \
+                         ({consecutive_failures} consecutive failures)",
+                        consecutive_failures = slot.failures
+                    ),
+                );
+            }
         }
 
         for (index, slot) in slots.iter_mut().enumerate() {
@@ -406,6 +435,7 @@ mod tests {
                 failures: 5,
                 restart_at: None,
                 started_at: tokio::time::Instant::now(),
+                alarm_active: false,
             };
 
             // Still inside the healthy window: the failure count is preserved.
@@ -418,6 +448,12 @@ mod tests {
             let _ = slot.take_finished(later).await;
             assert_eq!(slot.failures, 0);
         });
+    }
+
+    #[test]
+    fn test_alarm_threshold_is_above_reset_window() {
+        assert!(RESTART_BACKOFF_ALARM_THRESHOLD >= 1);
+        assert_eq!(restart_backoff(RESTART_BACKOFF_ALARM_THRESHOLD), RESTART_BACKOFF_MAX);
     }
 
     #[test]

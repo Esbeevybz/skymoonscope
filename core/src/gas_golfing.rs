@@ -30,6 +30,38 @@ pub struct GasGolfingReport {
     pub summary: HashMap<String, usize>, // pattern_type -> count
 }
 
+/// Maximum accepted WASM binary size for a single gas-golfing analysis request.
+///
+/// The analyzer scans the whole binary in memory, so an unbounded input would
+/// let a single authenticated user allocate arbitrarily large buffers per
+/// concurrent request.  Inputs above this cap are rejected before any parsing
+/// or allocation happens; the route layer maps the resulting error to
+/// HTTP 413 Payload Too Large.
+pub const MAX_WASM_BYTES: usize = 2 * 1024 * 1024;
+
+/// Error returned when a gas-golfing analysis request is rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GasGolfingError {
+    /// The submitted WASM binary exceeds [`MAX_WASM_BYTES`].
+    ///
+    /// The route layer must map this to HTTP 413 Payload Too Large.
+    PayloadTooLarge { size: usize, max: usize },
+}
+
+impl std::fmt::Display for GasGolfingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GasGolfingError::PayloadTooLarge { size, max } => write!(
+                f,
+                "WASM binary too large: {} bytes exceeds the {} byte limit",
+                size, max
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GasGolfingError {}
+
 pub struct GasGolfingAnalyzer;
 
 impl Default for GasGolfingAnalyzer {
@@ -101,6 +133,25 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 impl GasGolfingAnalyzer {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Analyze a WASM binary, rejecting inputs larger than [`MAX_WASM_BYTES`]
+    /// before any parsing or allocation takes place.
+    ///
+    /// The route layer should call this entry point and map
+    /// [`GasGolfingError::PayloadTooLarge`] to HTTP 413 Payload Too Large.
+    pub fn analyze_wasm_checked(
+        &self,
+        wasm_bytes: &[u8],
+        contract_name: &str,
+    ) -> Result<GasGolfingReport, GasGolfingError> {
+        if wasm_bytes.len() > MAX_WASM_BYTES {
+            return Err(GasGolfingError::PayloadTooLarge {
+                size: wasm_bytes.len(),
+                max: MAX_WASM_BYTES,
+            });
+        }
+        Ok(self.analyze_wasm(wasm_bytes, contract_name))
     }
 
     pub fn analyze_wasm(&self, wasm_bytes: &[u8], contract_name: &str) -> GasGolfingReport {
@@ -469,6 +520,41 @@ mod tests {
     // -------------------------------------------------------------------------
     // Smoke test: basic end-to-end contract analysis
     // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // Payload size cap (ISSUE-031)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_oversized_wasm_is_rejected() {
+        let analyzer = GasGolfingAnalyzer::new();
+
+        // One byte over the cap must be rejected before analysis begins.
+        let oversized = vec![0u8; MAX_WASM_BYTES + 1];
+        let err = analyzer
+            .analyze_wasm_checked(&oversized, "too_big")
+            .expect_err("oversized WASM must be rejected");
+
+        assert_eq!(
+            err,
+            GasGolfingError::PayloadTooLarge {
+                size: MAX_WASM_BYTES + 1,
+                max: MAX_WASM_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn test_wasm_at_size_cap_is_accepted() {
+        let analyzer = GasGolfingAnalyzer::new();
+
+        let at_cap = vec![0u8; MAX_WASM_BYTES];
+        let report = analyzer
+            .analyze_wasm_checked(&at_cap, "at_cap")
+            .expect("WASM exactly at the cap must be accepted");
+
+        assert_eq!(report.contract_name, "at_cap");
+    }
 
     #[test]
     fn test_gas_golfing_analyzer_basic() {

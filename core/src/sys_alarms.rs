@@ -47,7 +47,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Default alarm threshold, matching the spec from issue #592.
 pub const DEFAULT_THRESHOLD_PERCENT: f64 = 85.0;
@@ -373,6 +373,24 @@ impl AlertDeduper {
     }
 }
 
+/// Severity of a [`SysAlarmEvent`].
+///
+/// Resource-threshold alarms are informational (`Warning`); subsystem
+/// failures that need operator attention — a worker pool death-loop, a
+/// poisoned mutex — are raised as `Critical`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlarmSeverity {
+    Warning,
+    Critical,
+}
+
+impl Default for AlarmSeverity {
+    fn default() -> Self {
+        Self::Warning
+    }
+}
+
 /// JSON payload posted to the webhook on threshold events. Kept stable
 /// for downstream scrapers / pagers.
 #[derive(Debug, Clone, Serialize)]
@@ -382,6 +400,14 @@ pub struct SysAlarmEvent {
     pub event: &'static str,
     /// Emitting subsystem, e.g. `"cpu"`, `"memory"`, or `"fee_collector"`.
     pub resource: &'static str,
+    /// Alarm severity. Defaults to `Warning` for resource-threshold events.
+    #[serde(default)]
+    pub severity: AlarmSeverity,
+    /// Free-form human-readable detail, e.g. the consecutive failure count
+    /// that tripped a worker-pool death-loop alarm. Empty for resource
+    /// threshold events.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
     pub value_percent: f64,
     pub threshold_percent: f64,
     pub process_memory_bytes: u64,
@@ -600,6 +626,8 @@ impl SysAlarmMonitor {
         let payload = SysAlarmEvent {
             event,
             resource,
+            severity: AlarmSeverity::Warning,
+            detail: String::new(),
             value_percent,
             threshold_percent: self.config.threshold_percent,
             process_memory_bytes,
@@ -647,6 +675,51 @@ pub async fn emit_sys_alarm(webhook_url: Option<&str>, payload: &SysAlarmEvent) 
             warn!(error = %err, url, "Failed to POST sysalarm webhook");
         }
     }
+}
+
+/// Raise a `Critical`-severity [`SysAlarmEvent`] from a non-resource-monitor
+/// code path (worker-pool death-loops, poisoned mutexes, …).
+///
+/// Builds the payload once so callers such as `worker_pool.rs` and
+/// `simulation_service.rs` do not duplicate payload construction, logs it at
+/// `error!` level, and forwards it through [`emit_sys_alarm`] — which is a
+/// no-op beyond the log when no webhook URL is configured.
+///
+/// `event` and `resource` are `&'static str` so the payload stays cheap to
+/// build on a hot failure path; `detail` carries the human-readable context
+/// (e.g. `"consecutive_failures=12"`).
+pub async fn emit_critical_alarm(
+    webhook_url: Option<&str>,
+    event: &'static str,
+    resource: &'static str,
+    detail: &str,
+) {
+    error!(
+        event,
+        resource,
+        detail,
+        severity = "critical",
+        "Critical sysalarm raised"
+    );
+
+    let payload = SysAlarmEvent {
+        event,
+        resource,
+        severity: AlarmSeverity::Critical,
+        detail: detail.to_string(),
+        value_percent: 0.0,
+        threshold_percent: 0.0,
+        process_memory_bytes: 0,
+        total_memory_bytes: 0,
+        pid: std::process::id(),
+        node_id: std::env::var(ENV_INSTANCE_ID)
+            .ok()
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .filter(|s| !s.trim().is_empty()),
+        timestamp: chrono::Utc::now(),
+    };
+
+    emit_sys_alarm(webhook_url, &payload).await;
 }
 
 #[cfg(test)]
@@ -853,6 +926,8 @@ mod tests {
         let event = SysAlarmEvent {
             event: "threshold_breach",
             resource: "cpu",
+            severity: AlarmSeverity::Warning,
+            detail: String::new(),
             value_percent: 92.5,
             threshold_percent: 85.0,
             process_memory_bytes: 123_456_789,
@@ -864,9 +939,25 @@ mod tests {
         let json = serde_json::to_string(&event).expect("serialize");
         assert!(json.contains("\"event\":\"threshold_breach\""));
         assert!(json.contains("\"resource\":\"cpu\""));
+        assert!(json.contains("\"severity\":\"warning\""));
         assert!(json.contains("\"value_percent\":92.5"));
         assert!(json.contains("\"pid\":4242"));
         assert!(json.contains("\"node_id\":\"node-a\""));
+        // Empty detail is omitted from the payload.
+        assert!(!json.contains("\"detail\""));
+    }
+
+    #[tokio::test]
+    async fn emit_critical_alarm_without_webhook_is_a_noop() {
+        // No URL configured: the helper must log and return without a
+        // network call (and without panicking).
+        emit_critical_alarm(
+            None,
+            "worker_pool_death_loop",
+            "worker_pool",
+            "consecutive_failures=12",
+        )
+        .await;
     }
 
     // ── Config-from-env tests ──────────────────────────────────────────
@@ -1055,6 +1146,8 @@ mod tests {
         let payload = SysAlarmEvent {
             event: "fee_store_write_failed",
             resource: "fee_collector",
+            severity: AlarmSeverity::Warning,
+            detail: String::new(),
             value_percent: 5.0,
             threshold_percent: 5.0,
             process_memory_bytes: 3,
