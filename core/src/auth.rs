@@ -28,6 +28,9 @@ use utoipa::ToSchema;
 const CHALLENGE_EXPIRY_SECS: u64 = 300;
 const JWT_EXPIRY_SECS: u64 = 86400;
 const WEB_AUTH_DOMAIN: &str = "sky-moon-scope";
+/// Conservative upper bound on Soroban XDR blob size accepted/emitted by the
+/// SEP-10 challenge flow. Prevents unbounded heap allocation from crafted input.
+const MAX_XDR_BYTES: usize = 4096;
 
 pub struct AuthState {
     pub encoding_key: EncodingKey,
@@ -63,7 +66,20 @@ impl AuthState {
         let priv_key = if let Some(pem) = jwt_private_key_pem {
             RsaPrivateKey::from_pkcs8_pem(&pem).expect("Invalid RSA Private Key PEM")
         } else {
-            tracing::info!("Generating ephemeral RSA keypair for local development...");
+            let app_env = std::env::var("APP_ENV")
+                .or_else(|_| std::env::var("ENVIRONMENT"))
+                .unwrap_or_default();
+            if app_env.eq_ignore_ascii_case("production") {
+                panic!(
+                    "JWT_PRIVATE_KEY_PEM must be set in production; refusing to generate an \
+                     ephemeral RSA keypair (all issued JWTs would be invalidated on restart)"
+                );
+            }
+            tracing::error!(
+                "JWT_PRIVATE_KEY_PEM is not set: generating an ephemeral RSA keypair. \
+                 All previously issued JWTs will be invalidated on restart. \
+                 This must never happen in production."
+            );
             let mut rng = rand::thread_rng();
             RsaPrivateKey::new(&mut rng, 2048).expect("Failed to generate RSA key")
         };
@@ -120,6 +136,24 @@ impl AuthState {
         if !token_data.claims.scopes.contains(&"simulate".to_string()) {
             return Err(AppError::Unauthorized(
                 "Missing required scope 'simulate'".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validates a token and additionally requires the `admin` scope.
+    /// Used to guard privileged endpoints such as the emergency pause toggle.
+    pub fn validate_admin_token(&self, token: &str) -> Result<(), AppError> {
+        self.validate_token(token)?;
+
+        let validation = Validation::new(Algorithm::RS256);
+        let token_data = decode::<Claims>(token, &self.decoding_key, &validation)
+            .map_err(|e| AppError::Unauthorized(format!("Invalid token: {e}")))?;
+
+        if !token_data.claims.scopes.contains(&"admin".to_string()) {
+            return Err(AppError::Unauthorized(
+                "Missing required scope 'admin'".into(),
             ));
         }
 
@@ -187,7 +221,7 @@ fn network_id(passphrase: &str) -> [u8; 32] {
 
 fn tx_hash(tx: &Transaction, net_id: &[u8; 32]) -> Result<[u8; 32], AppError> {
     let tx_xdr = tx
-        .to_xdr(Limits::none())
+        .to_xdr(Limits::len(MAX_XDR_BYTES))
         .map_err(|e| AppError::Internal(format!("XDR encode error: {e}")))?;
     let mut h = Sha256::new();
     h.update(net_id);
@@ -264,7 +298,7 @@ fn build_challenge_envelope(
     });
 
     let xdr = envelope
-        .to_xdr(Limits::none())
+        .to_xdr(Limits::len(MAX_XDR_BYTES))
         .map_err(|e| AppError::Internal(format!("XDR encode error: {e}")))?;
 
     Ok(BASE64.encode(&xdr))
@@ -275,7 +309,7 @@ fn verify_challenge_envelope(state: &AuthState, signed_xdr_b64: &str) -> Result<
         .decode(signed_xdr_b64)
         .map_err(|_| AppError::BadRequest("Invalid base64".into()))?;
 
-    let envelope = TransactionEnvelope::from_xdr(&raw, Limits::none())
+    let envelope = TransactionEnvelope::from_xdr(&raw, Limits::len(MAX_XDR_BYTES))
         .map_err(|_| AppError::BadRequest("Invalid transaction XDR".into()))?;
 
     let inner = match envelope {
@@ -469,22 +503,36 @@ pub async fn verify_handler(
     Ok(Json(VerifyResponse { token }))
 }
 
-/// Emergency pause toggle endpoint (for administrative control).
+/// Emergency pause toggle endpoint (admin-only).
 /// This endpoint allows operators to pause all message verification in emergency scenarios.
+/// Requires a valid Bearer token carrying the `admin` scope.
 #[utoipa::path(
     post,
     path = "/auth/emergency-pause",
     request_body = EmergencyPauseRequest,
     responses(
         (status = 200, description = "Emergency pause toggled", body = EmergencyPauseResponse),
-        (status = 400, description = "Invalid request")
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Missing or invalid admin credentials")
     ),
     tag = "Auth"
 )]
 pub async fn emergency_pause_handler(
     Extension(state): Extension<Arc<AuthState>>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<EmergencyPauseRequest>,
 ) -> Result<Json<EmergencyPauseResponse>, AppError> {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| AppError::Unauthorized("Missing Authorization header".into()))?;
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| AppError::Unauthorized("Expected Bearer token".into()))?;
+
+    state.validate_admin_token(token)?;
+
     state.set_verification_paused(payload.paused);
 
     let message = if payload.paused {
@@ -556,4 +604,98 @@ pub async fn jwks_handler(
             use_: "sig".to_string(),
         }],
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> AuthState {
+        AuthState::new(
+            Some(test_rsa_pem()),
+            Some([7u8; 32]),
+            "Test SDF Network ; September 2015".to_string(),
+            false,
+        )
+    }
+
+    fn test_rsa_pem() -> String {
+        let mut rng = rand::thread_rng();
+        let key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa key");
+        key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .expect("pem")
+            .to_string()
+    }
+
+    fn token_with_scopes(state: &AuthState, scopes: Vec<&str>) -> String {
+        let now = now_secs();
+        let claims = Claims {
+            sub: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_string(),
+            iss: WEB_AUTH_DOMAIN.to_string(),
+            iat: now,
+            exp: now + JWT_EXPIRY_SECS,
+            scopes: scopes.into_iter().map(|s| s.to_string()).collect(),
+        };
+        let header = Header::new(Algorithm::RS256);
+        encode(&header, &claims, &state.encoding_key).expect("jwt")
+    }
+
+    #[test]
+    fn validate_admin_token_rejects_missing_admin_scope() {
+        let state = test_state();
+        let token = token_with_scopes(&state, vec!["simulate"]);
+        let err = state.validate_admin_token(&token).unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn validate_admin_token_accepts_admin_scope() {
+        let state = test_state();
+        let token = token_with_scopes(&state, vec!["simulate", "admin"]);
+        assert!(state.validate_admin_token(&token).is_ok());
+    }
+
+    #[test]
+    fn validate_admin_token_rejects_garbage() {
+        let state = test_state();
+        let err = state.validate_admin_token("not-a-token").unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn oversized_xdr_is_rejected() {
+        let state = test_state();
+        let oversized = BASE64.encode(vec![0u8; MAX_XDR_BYTES * 4]);
+        let err = verify_challenge_envelope(&state, &oversized).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn challenge_envelope_roundtrip_within_limits() {
+        let state = test_state();
+        let client = [3u8; 32];
+        let b64 = build_challenge_envelope(&state, &client).expect("challenge");
+        let raw = BASE64.decode(&b64).expect("b64");
+        assert!(raw.len() <= MAX_XDR_BYTES);
+    }
+
+    #[test]
+    #[should_panic(expected = "JWT_PRIVATE_KEY_PEM must be set in production")]
+    fn production_startup_without_jwt_key_panics() {
+        // Serialize env mutation with other tests via a scoped guard.
+        std::env::set_var("APP_ENV", "production");
+        let result = std::panic::catch_unwind(|| {
+            AuthState::new(
+                None,
+                Some([1u8; 32]),
+                "Test SDF Network ; September 2015".to_string(),
+                false,
+            )
+        });
+        std::env::remove_var("APP_ENV");
+        match result {
+            Ok(_) => panic!("expected panic in production without JWT key"),
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
 }
