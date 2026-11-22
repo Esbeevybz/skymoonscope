@@ -13,6 +13,17 @@ fn ensure_not_paused(e: &Env, operation: u32) {
     }
 }
 
+/// Returns true if `addr` is the zero/default Soroban `Address`.
+///
+/// Soroban `Address` does not expose a direct zero check, so we compare the
+/// address against a freshly constructed zero-account address for the same
+/// network. A zero address is represented by an all-zero 32-byte account id.
+fn is_zero_address(e: &Env, addr: &Address) -> bool {
+    let zero_bytes = [0u8; 32];
+    let zero = Address::from_string_bytes(&soroban_sdk::Bytes::from_array(e, &zero_bytes));
+    addr == &zero
+}
+
 pub trait TokenTrait {
     fn initialize(e: Env, admin: Address, decimal: u32, name: String, symbol: String);
     fn mint(e: Env, to: Address, amount: i128);
@@ -67,6 +78,9 @@ impl TokenTrait for Token {
     fn set_admin(e: Env, new_admin: Address) {
         let admin = read_administrator(&e);
         admin.require_auth();
+        // Validate new_admin before any state mutation so a zero address cannot
+        // permanently lock the token's admin operations.
+        assert!(!is_zero_address(&e, &new_admin), "invalid new_admin: zero address");
         e.storage().instance().extend_ttl(100, 100);
         // Use EmergencyGuard multi-sig to rotate the guard admin list, then update token admin.
         EmergencyGuard::rotate_admin(
