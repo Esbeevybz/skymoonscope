@@ -518,6 +518,7 @@ fn test_burn_from_emits_event() {
     client.burn_from(&spender, &user, &300);
     assert_eq!(client.balance(&user), 700);
     assert_eq!(client.allowance(&user, &spender), 200);
+    assert_eq!(client.total_supply(), 700);
 
     let events = env.events().all();
     assert!(events.len() > initial_events_count);

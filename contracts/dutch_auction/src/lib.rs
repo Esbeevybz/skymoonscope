@@ -12,6 +12,16 @@ pub enum DataKey {
     StartLedger,
     EndLedger,
     Sold,
+    Expired,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionExpiredEvent {
+    pub seller: Address,
+    pub nft_contract: Address,
+    pub token_id: i128,
+    pub end_ledger: u32,
 }
 
 #[contract]
@@ -65,6 +75,7 @@ impl DutchAuction {
             .instance()
             .set(&DataKey::EndLedger, &end_ledger);
         env.storage().instance().set(&DataKey::Sold, &false);
+        env.storage().instance().set(&DataKey::Expired, &false);
     }
 
     /// Computes the current Dutch auction price via linear decay between
@@ -113,6 +124,10 @@ impl DutchAuction {
         let sold: bool = env.storage().instance().get(&DataKey::Sold).unwrap();
         if sold {
             panic!("Already sold");
+        }
+        let expired: bool = env.storage().instance().get(&DataKey::Expired).unwrap();
+        if expired {
+            panic!("Auction expired");
         }
 
         let current_price = Self::get_current_price(env.clone());
@@ -169,6 +184,37 @@ impl DutchAuction {
         );
 
         env.storage().instance().set(&DataKey::Sold, &true);
+    }
+
+    pub fn expire(env: Env) {
+        let end_ledger: u32 = env.storage().instance().get(&DataKey::EndLedger).unwrap();
+        if env.ledger().sequence() <= end_ledger {
+            panic!("Auction has not expired");
+        }
+
+        let sold: bool = env.storage().instance().get(&DataKey::Sold).unwrap();
+        if sold {
+            panic!("Already sold");
+        }
+        let expired: bool = env.storage().instance().get(&DataKey::Expired).unwrap();
+        if expired {
+            panic!("Already expired");
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "auction_expired"),),
+            AuctionExpiredEvent {
+                seller: env.storage().instance().get(&DataKey::Seller).unwrap(),
+                nft_contract: env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::NftContract)
+                    .unwrap(),
+                token_id: env.storage().instance().get(&DataKey::TokenId).unwrap(),
+                end_ledger,
+            },
+        );
+        env.storage().instance().set(&DataKey::Expired, &true);
     }
 
     // If not sold by end, seller can reclaim NFT

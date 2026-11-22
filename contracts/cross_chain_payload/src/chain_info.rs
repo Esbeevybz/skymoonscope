@@ -10,6 +10,8 @@ pub struct ChainInfo {
     pub chain_name: String,
     /// Network version or fork identifier
     pub network_version: u32,
+    /// Version of this chain's verification configuration
+    pub chain_version: u32,
     /// Contract registry or bridge contract identifier on this chain
     pub bridge_contract: BytesN<32>,
     /// Consensus round or epoch number

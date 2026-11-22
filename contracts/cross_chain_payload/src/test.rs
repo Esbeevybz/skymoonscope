@@ -19,12 +19,14 @@ fn test_chain_info_creation() {
         chain_id: 1,
         chain_name: String::from_str(&e, "stellar"),
         network_version: 1,
+        chain_version: 1,
         bridge_contract,
         consensus_round: 100,
         is_active: true,
     };
 
     assert_eq!(chain_info.chain_id, 1);
+    assert_eq!(chain_info.chain_version, 1);
     assert_eq!(chain_info.consensus_round, 100);
     assert!(chain_info.is_active);
 }
@@ -39,6 +41,7 @@ fn test_bridge_endpoint_creation() {
         chain_id: 1,
         chain_name: String::from_str(&e, "chain-1"),
         network_version: 1,
+        chain_version: 1,
         bridge_contract: bridge_contract.clone(),
         consensus_round: 100,
         is_active: true,
@@ -48,6 +51,7 @@ fn test_bridge_endpoint_creation() {
         chain_id: 2,
         chain_name: String::from_str(&e, "chain-2"),
         network_version: 1,
+        chain_version: 1,
         bridge_contract,
         consensus_round: 100,
         is_active: true,

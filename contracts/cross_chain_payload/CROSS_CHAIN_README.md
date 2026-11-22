@@ -14,6 +14,7 @@ Defines structures for identifying and managing blockchain networks in a cross-c
   - `chain_id`: Unique identifier for the blockchain
   - `chain_name`: Human-readable chain name
   - `network_version`: Fork/version tracking
+  - `chain_version`: Verification configuration version
   - `bridge_contract`: Registry contract identifier
   - `consensus_round`: Current consensus epoch
   - `is_active`: Network availability status

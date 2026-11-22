@@ -184,6 +184,11 @@ Topic: `("lp_fee", "withdraw")`
 - Base trading fee configurable by admin
 - Optional oracle-based dynamic fee adjustment
 - Volatility-based fee tiers
+- Oracle observations include their update ledger and are rejected when older
+  than the configured maximum age.
+
+Configured oracle contracts must expose both `latest_price` and
+`last_updated_ledger`.
 
 ### 5. ERC-20 Compatible LP Tokens
 - `transfer`, `approve`, `transferFrom` for LP shares
@@ -212,8 +217,14 @@ pub fn set_fee(e: Env, fee_bps: i128) -> Result<(), Error>
 // Set LP deposit/withdrawal fee
 pub fn set_lp_fee_bps(e: Env, fee_bps: i128) -> Result<(), Error>
 
-// Configure fee oracle for dynamic adjustment
-pub fn configure_fee_oracle(e: Env, oracle: Address, base_fee_bps: i128, timelock_ledgers: u32) -> Result<(), Error>
+// Configure fee oracle, timelock, and maximum oracle age in ledgers
+pub fn configure_fee_oracle(
+    e: Env,
+    oracle: Address,
+    base_fee_bps: i128,
+    timelock_ledgers: u32,
+    max_oracle_age_ledgers: u32,
+) -> Result<(), Error>
 
 // Emergency controls
 pub fn guard_pause(e: Env, admin: Address, operation: u32, paused: bool) -> Result<(), Error>
@@ -231,6 +242,7 @@ pub fn resume(e: Env, approvers: Vec<Address>) -> Result<(), Error>
 | `Admin` | Address | Primary admin address |
 | `Guard` | GuardState | Emergency pause state and admin list |
 | `Oracle` | OracleConfig | Dynamic fee oracle configuration |
+| `MaxOracleAgeLedgers` | u32 | Maximum age allowed for oracle observations |
 | `PendingFeeUpdate` | PendingFeeUpdate | Timelocked fee update |
 
 ## Constants
@@ -238,6 +250,7 @@ pub fn resume(e: Env, approvers: Vec<Address>) -> Result<(), Error>
 // Trading fees
 pub const MAX_FEE_BPS: i128 = 100;              // 1% max trading fee
 pub const DEFAULT_BASE_FEE_BPS: i128 = 30;      // 0.3% default trading fee
+pub const DEFAULT_MAX_ORACLE_AGE_LEDGERS: u32 = 30;
 
 // LP fees
 pub const DEFAULT_LP_FEE_BPS: i128 = 5;         // 0.05% default LP fee
@@ -257,7 +270,7 @@ pub const MAX_LP_FEE_BPS: i128 = 100;           // 1% max LP fee
 | 8 | InsufficientAllowance | Insufficient token allowance |
 | 9 | InvalidFee | Fee rate out of bounds |
 | 10 | OracleNotConfigured | Fee oracle not configured |
-| 11 | InvalidOraclePrice | Invalid price from oracle |
+| 11 | InvalidOraclePrice | Invalid or stale price from oracle |
 | 12 | TimelockNotElapsed | Timelock period not elapsed |
 | 13 | NoPendingFeeUpdate | No pending fee update exists |
 | 14 | Paused | Operation is paused |
