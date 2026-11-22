@@ -195,20 +195,57 @@ impl WasmInstrumenter {
         }
 
         // Build func_names: index 0..defined_func_count maps to export name or fallback
-        let func_names: Vec<String> = (0..defined_func_count)
+        let mut name_counts: HashMap<String, u32> = HashMap::new();
+        for name in export_names.values() {
+            *name_counts.entry(name.clone()).or_insert(0) += 1;
+        }
+
+        let mut func_names: Vec<String> = (0..defined_func_count)
             .map(|i| {
                 let abs_idx = import_func_count + i;
                 export_names
                     .get(&abs_idx)
-                    .cloned()
+                    .map(|name| {
+                        if name_counts.get(name).copied().unwrap_or(0) > 1 {
+                            format!("{name}[{abs_idx}]")
+                        } else {
+                            name.clone()
+                        }
+                    })
                     .unwrap_or_else(|| format!("func[{i}]"))
             })
             .collect();
 
+        // Guard against an exported name already resembling a disambiguated name,
+        // or against another export/fallback producing the same final key.
+        let mut used_names: HashMap<String, u32> = HashMap::new();
+        for i in 0..defined_func_count {
+            let abs_idx = import_func_count + i;
+            let original = func_names[i as usize].clone();
+            if used_names.contains_key(&original) {
+                let mut candidate = format!("{original}[{abs_idx}]");
+                let mut suffix = 1u32;
+                while used_names.contains_key(&candidate) {
+                    candidate = format!("{original}[{abs_idx}:{suffix}]");
+                    suffix += 1;
+                }
+                func_names[i as usize] = candidate.clone();
+                used_names.insert(candidate, abs_idx);
+            } else {
+                used_names.insert(original, abs_idx);
+            }
+        }
+
         // Build export_map: export name → absolute function index
         let export_map: HashMap<String, u32> = export_names
             .into_iter()
-            .map(|(idx, name)| (name, idx))
+            .filter_map(|(idx, _name)| {
+                let defined_idx = idx.checked_sub(import_func_count)?;
+                func_names
+                    .get(defined_idx as usize)
+                    .cloned()
+                    .map(|name| (name, idx))
+            })
             .collect();
 
         Ok(WasmInstrumenter {
@@ -3450,19 +3487,38 @@ pub fn profile_contract_with_flamegraph(
     // ── Invoke via wrapper (instrumented) or original (budget fallback) ───────
     // The wrapper `sky_moon_scope_count_{i}` calls the original function and returns
     // the counter as a soroban I64Small in one invocation, so globals stay alive.
-    let (invoke_sym, use_wrapper) = if !use_budget_fallback {
+    let (invoke_sym, use_wrapper, resolved_profile_name) = if !use_budget_fallback {
         // Find the defined-function index for the requested function name
-        let wrapper_idx = func_names.iter().position(|n| n == &function_name);
+        let wrapper_idx = func_names.iter().position(|n| n == &function_name).or_else(|| {
+            func_names.iter().position(|n| {
+                match n.strip_prefix(&format!("{function_name}[")) {
+                    Some(suffix) => suffix.ends_with(']'),
+                    None => false,
+                }
+            })
+        });
         if let Some(idx) = wrapper_idx {
             let wrapper_name = format!("sky_moon_scope_count_{idx}");
-            (Symbol::new(&env, &wrapper_name), true)
+            (
+                Symbol::new(&env, &wrapper_name),
+                true,
+                func_names[idx].clone(),
+            )
         } else {
             // function_name not in defined functions — try calling it directly
             // (it may be an import or the name lookup failed)
-            (Symbol::new(&env, &function_name), false)
+            (
+                Symbol::new(&env, &function_name),
+                false,
+                function_name.clone(),
+            )
         }
     } else {
-        (Symbol::new(&env, &function_name), false)
+        (
+            Symbol::new(&env, &function_name),
+            false,
+            function_name.clone(),
+        )
     };
 
     env.cost_estimate().budget().reset_unlimited();
@@ -3508,7 +3564,7 @@ pub fn profile_contract_with_flamegraph(
             .map(|v| v.get_payload() >> 8)
             .unwrap_or(0);
         let mut map: HashMap<String, u64> = HashMap::new();
-        map.insert(function_name.clone(), count);
+        map.insert(resolved_profile_name, count);
         (map, "instrumented".to_string())
     };
 
@@ -4478,6 +4534,47 @@ mod tests {
         let wasm = minimal_wasm();
         let instr = WasmInstrumenter::new(&wasm).expect("should parse valid WASM");
         assert_eq!(instr.func_names(), &["add"]);
+    }
+
+    #[test]
+    fn test_wasm_instrumenter_disambiguates_duplicate_export_names() {
+        use wasm_encoder::{
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection,
+        };
+
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        module.section(&types);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        functions.function(0);
+        module.section(&functions);
+
+        let mut exports = ExportSection::new();
+        exports.export("transfer", ExportKind::Func, 0);
+        exports.export("transfer", ExportKind::Func, 1);
+        module.section(&exports);
+
+        let mut codes = CodeSection::new();
+        let mut first = Function::new(vec![]);
+        first.instruction(&wasm_encoder::Instruction::End);
+        codes.function(&first);
+        let mut second = Function::new(vec![]);
+        second.instruction(&wasm_encoder::Instruction::End);
+        codes.function(&second);
+        module.section(&codes);
+
+        let wasm = module.finish();
+        let instr = WasmInstrumenter::new(&wasm).expect("should parse duplicate exports");
+
+        assert_eq!(
+            instr.func_names(),
+            &["transfer[0]".to_string(), "transfer[1]".to_string()]
+        );
+        assert_eq!(instr.export_map().get("transfer[0]"), Some(&0));
+        assert_eq!(instr.export_map().get("transfer[1]"), Some(&1));
     }
 
     #[test]

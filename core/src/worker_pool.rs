@@ -1,4 +1,12 @@
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -20,6 +28,8 @@ const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// A worker that stays up this long counts as recovered and forgets the
 /// backoff it accumulated while it was failing.
 const RESTART_BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
+/// Default maximum time shutdown waits for queued and in-flight tasks to drain.
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error)]
 pub enum TaskQueueError {
@@ -33,7 +43,7 @@ pub enum TaskQueueError {
 #[derive(Debug)]
 struct WorkerSlot {
     /// `None` while the slot is down, waiting out its restart backoff.
-    handle: Option<JoinHandle<()>>,
+    handle: Option<Arc<Mutex<Option<JoinHandle<()>>>>>,
     /// Consecutive restarts that were not separated by a healthy run.
     failures: u32,
     /// Instant before which the next restart must not happen.
@@ -46,7 +56,7 @@ impl WorkerSlot {
     /// Wraps a freshly started worker.
     fn start(handle: JoinHandle<()>) -> Self {
         Self {
-            handle: Some(handle),
+            handle: Some(Arc::new(Mutex::new(Some(handle)))),
             failures: 0,
             restart_at: None,
             started_at: tokio::time::Instant::now(),
@@ -60,9 +70,10 @@ impl WorkerSlot {
     /// backoff once it has been healthy for [`RESTART_BACKOFF_RESET_AFTER`],
     /// so a pool that crashes once a day does not keep restarting with a
     /// long-since-saturated delay.
-    fn take_finished(&mut self, now: tokio::time::Instant) -> Option<JoinHandle<()>> {
-        let finished = self
-            .handle
+    async fn take_finished(&mut self, now: tokio::time::Instant) -> Option<JoinHandle<()>> {
+        let shared = self.handle.as_ref()?;
+        let mut handle_slot = shared.lock().await;
+        let finished = handle_slot
             .as_ref()
             .is_some_and(|handle| handle.is_finished());
 
@@ -75,7 +86,9 @@ impl WorkerSlot {
             return None;
         }
 
-        self.handle.take()
+        let finished_handle = handle_slot.take();
+        self.handle = None;
+        finished_handle
     }
 }
 
@@ -90,6 +103,11 @@ impl WorkerSlot {
 pub struct EventWorkerPool {
     runtime: Arc<Runtime>,
     sender: mpsc::Sender<Task>,
+    receiver: SharedReceiver,
+    worker_handles: Arc<Mutex<Vec<Arc<Mutex<Option<JoinHandle<()>>>>>>>>,
+    supervisor_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    shutting_down: Arc<AtomicBool>,
+    drain_timeout: Duration,
 }
 
 impl EventWorkerPool {
@@ -98,6 +116,14 @@ impl EventWorkerPool {
     /// # Arguments
     /// * `worker_threads` - The number of OS threads to allocate to this pool.
     pub fn new(worker_threads: usize) -> std::io::Result<Self> {
+        Self::new_with_drain_timeout(worker_threads, DEFAULT_DRAIN_TIMEOUT)
+    }
+
+    /// Initializes a pool with a configurable maximum shutdown drain duration.
+    pub fn new_with_drain_timeout(
+        worker_threads: usize,
+        drain_timeout: Duration,
+    ) -> std::io::Result<Self> {
         let runtime = Builder::new_multi_thread()
             .worker_threads(worker_threads)
             .thread_name("event-parser-worker")
@@ -109,20 +135,41 @@ impl EventWorkerPool {
         // instead of panicking at construction time.
         let (sender, receiver) = mpsc::channel(worker_threads.max(1));
         let receiver: SharedReceiver = Arc::new(Mutex::new(receiver));
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let worker_handles = Arc::new(Mutex::new(Vec::new()));
 
-        let slots = (0..worker_threads)
-            .map(|_| WorkerSlot::start(runtime.spawn(worker_loop(Arc::clone(&receiver)))))
+        let slots: Vec<_> = (0..worker_threads)
+            .map(|_| {
+                let handle = runtime.spawn(worker_loop(Arc::clone(&receiver)));
+                let slot = WorkerSlot::start(handle);
+                if let Some(shared_handle) = slot.handle.clone() {
+                    worker_handles.blocking_lock().push(shared_handle);
+                }
+                slot
+            })
             .collect();
 
         // The supervisor runs on this runtime and respawns workers with
         // `tokio::spawn`, so it needs no `Runtime` handle of its own: dropping
         // the last `EventWorkerPool` clone shuts the runtime down and takes
         // every task — supervisor included — with it.
-        runtime.spawn(supervise(slots, receiver));
+        let supervisor_handle = Arc::new(Mutex::new(None));
+        let supervisor_join = runtime.spawn(supervise(
+            slots,
+            Arc::clone(&receiver),
+            Arc::clone(&worker_handles),
+            Arc::clone(&shutting_down),
+        ));
+        *supervisor_handle.blocking_lock() = Some(supervisor_join);
 
         Ok(Self {
             runtime: Arc::new(runtime),
             sender,
+            receiver,
+            worker_handles,
+            supervisor_handle,
+            shutting_down,
+            drain_timeout,
         })
     }
 
@@ -135,6 +182,9 @@ impl EventWorkerPool {
         F: std::future::Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(TaskQueueError::Closed);
+        }
         let (result_sender, result_receiver) = oneshot::channel();
         let task = async move {
             let result = future.await;
@@ -152,6 +202,50 @@ impl EventWorkerPool {
                 .await
                 .expect("event worker task ended before returning its result")
         }))
+    }
+
+    /// Stops accepting work and drains queued and in-flight tasks.
+    ///
+    /// After `drain_timeout`, any workers that have not finished are aborted.
+    /// Shutdown is safe to call more than once.
+    pub async fn shutdown(&self) {
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        self.sender.close();
+
+        if let Some(supervisor) = self.supervisor_handle.lock().await.take() {
+            supervisor.abort();
+        }
+
+        let shared_handles = {
+            let handles = self.worker_handles.lock().await;
+            handles.clone()
+        };
+        let mut handles = Vec::new();
+        for shared in shared_handles {
+            if let Some(handle) = shared.lock().await.take() {
+                handles.push(handle);
+            }
+        }
+
+        let join_result = tokio::time::timeout(self.drain_timeout, async {
+            for handle in &handles {
+                let _ = handle.await;
+            }
+        })
+        .await;
+
+        if join_result.is_err() {
+            for handle in &handles {
+                handle.abort();
+            }
+            warn!(
+                timeout_ms = self.drain_timeout.as_millis(),
+                "event worker drain timed out; aborted remaining workers"
+            );
+        }
     }
 
     /// Spawns a blocking (CPU-heavy) task on the dedicated event worker pool.
@@ -192,7 +286,12 @@ async fn worker_loop(receiver: SharedReceiver) {
 /// its replacement is started as soon as the exponential backoff for its
 /// consecutive failures has elapsed. Because the supervisor wakes on a fixed
 /// tick, restart delays are effectively rounded up to whole ticks.
-async fn supervise(slots: Vec<WorkerSlot>, receiver: SharedReceiver) {
+async fn supervise(
+    slots: Vec<WorkerSlot>,
+    receiver: SharedReceiver,
+    worker_handles: Arc<Mutex<Vec<Arc<Mutex<Option<JoinHandle<()>>>>>>>,
+    shutting_down: Arc<AtomicBool>,
+) {
     let mut slots = slots;
 
     let mut ticker = tokio::time::interval(SUPERVISOR_TICK);
@@ -203,10 +302,13 @@ async fn supervise(slots: Vec<WorkerSlot>, receiver: SharedReceiver) {
 
     loop {
         ticker.tick().await;
+        if shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
         let now = tokio::time::Instant::now();
 
         for (index, slot) in slots.iter_mut().enumerate() {
-            let Some(finished) = slot.take_finished(now) else {
+            let Some(finished) = slot.take_finished(now).await else {
                 continue;
             };
 
@@ -243,7 +345,13 @@ async fn supervise(slots: Vec<WorkerSlot>, receiver: SharedReceiver) {
                 continue;
             }
 
-            slot.handle = Some(tokio::spawn(worker_loop(Arc::clone(&receiver))));
+            let handle = tokio::spawn(worker_loop(Arc::clone(&receiver)));
+            let shared_handle = Arc::new(Mutex::new(Some(handle)));
+            worker_handles
+                .lock()
+                .await
+                .push(Arc::clone(&shared_handle));
+            slot.handle = Some(shared_handle);
             slot.started_at = now;
             slot.restart_at = None;
             info!(worker = index, "event worker restarted");
@@ -301,13 +409,13 @@ mod tests {
             };
 
             // Still inside the healthy window: the failure count is preserved.
-            let _ = slot.take_finished(tokio::time::Instant::now());
+            let _ = slot.take_finished(tokio::time::Instant::now()).await;
             assert_eq!(slot.failures, 5);
 
             // Past the threshold with a live worker: backoff starts over.
-            slot.handle = Some(tokio::spawn(async {}));
+            slot.handle = Some(Arc::new(Mutex::new(Some(tokio::spawn(async {})))));
             let later = tokio::time::Instant::now() + RESTART_BACKOFF_RESET_AFTER;
-            let _ = slot.take_finished(later);
+            let _ = slot.take_finished(later).await;
             assert_eq!(slot.failures, 0);
         });
     }
@@ -393,6 +501,65 @@ mod tests {
             .expect("the supervisor must respawn the dead worker");
 
             assert_eq!(recovered.unwrap(), "worker is back");
+        });
+    }
+
+    #[test]
+    fn test_shutdown_drains_in_flight_tasks() {
+        let pool = EventWorkerPool::new(1).expect("Failed to create worker pool");
+
+        pool.runtime.block_on(async {
+            let (started_sender, started_receiver) = oneshot::channel();
+            let (release_sender, release_receiver) = oneshot::channel();
+            let task = pool
+                .spawn(async move {
+                    let _ = started_sender.send(());
+                    let _ = release_receiver.await;
+                    42
+                })
+                .unwrap();
+
+            started_receiver.await.unwrap();
+            let shutdown = tokio::spawn({
+                let shutdown_pool = pool.clone();
+                async move { shutdown_pool.shutdown().await }
+            });
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                pool.spawn(async { () }),
+                Err(TaskQueueError::Closed)
+            ));
+
+            release_sender.send(()).unwrap();
+            shutdown.await.unwrap();
+            assert_eq!(task.await.unwrap(), 42);
+        });
+    }
+
+    #[test]
+    fn test_shutdown_timeout_aborts_remaining_tasks() {
+        let pool = EventWorkerPool::new_with_drain_timeout(
+            1,
+            Duration::from_millis(25),
+        )
+        .expect("Failed to create worker pool");
+
+        pool.runtime.block_on(async {
+            let (started_sender, started_receiver) = oneshot::channel();
+            let task = pool
+                .spawn(async move {
+                    let _ = started_sender.send(());
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                })
+                .unwrap();
+            started_receiver.await.unwrap();
+
+            pool.shutdown().await;
+            assert!(task.await.is_err());
+            assert!(matches!(
+                pool.spawn(async { () }),
+                Err(TaskQueueError::Closed)
+            ));
         });
     }
 }

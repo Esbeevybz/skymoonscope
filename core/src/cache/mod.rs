@@ -39,11 +39,28 @@ struct CacheEntry<T> {
     timestamp: u64,
 }
 
-fn current_timestamp_millis() -> u64 {
+fn current_timestamp_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as u64
+        .as_secs()
+}
+
+fn normalized_timestamp_secs(timestamp: u64) -> u64 {
+    // Accept entries written by older builds that used milliseconds.
+    if timestamp >= 1_000_000_000_000 {
+        timestamp / 1_000
+    } else {
+        timestamp
+    }
+}
+
+fn timestamp_is_expired(timestamp: u64, now_secs: u64, ttl_secs: u64) -> bool {
+    let timestamp_secs = normalized_timestamp_secs(timestamp);
+    match timestamp_secs.checked_add(ttl_secs) {
+        Some(expires_at) => expires_at <= now_secs,
+        None => true,
+    }
 }
 
 pub struct SimulationCache {
@@ -124,6 +141,11 @@ impl SimulationCache {
 
         if let Ok(Some(bytes)) = self.l2.get(key) {
             if let Ok(entry) = serde_json::from_slice::<CacheEntry<SimulationResult>>(&bytes) {
+                if timestamp_is_expired(entry.timestamp, current_timestamp_secs(), CACHE_TTL_SECS) {
+                    let _ = self.l2.remove(key);
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 self.touch(key);
                 self.l1.insert(key.to_string(), entry.data.clone()).await;
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -147,12 +169,13 @@ impl SimulationCache {
     pub async fn set(&self, key: String, result: SimulationResult) {
         let entry = CacheEntry {
             ledger_sequence: result.latest_ledger,
-            timestamp: current_timestamp_millis(),
+            timestamp: current_timestamp_secs(),
             data: result.clone(),
         };
 
         if let Ok(bytes) = serde_json::to_vec(&entry) {
             if self.l2.insert(&key, bytes).is_ok() {
+                self.evict_expired();
                 self.evict_to_size();
             }
         }
@@ -166,7 +189,7 @@ impl SimulationCache {
         let Ok(mut entry) = serde_json::from_slice::<CacheEntry<SimulationResult>>(&bytes) else {
             return;
         };
-        entry.timestamp = current_timestamp_millis();
+        entry.timestamp = current_timestamp_secs();
         if let Ok(updated) = serde_json::to_vec(&entry) {
             let _ = self.l2.insert(key, updated);
         }
@@ -208,6 +231,27 @@ impl SimulationCache {
         if removed > 0 {
             tracing::debug!(removed, "evicted least-recently-used simulation cache entries");
         }
+    }
+
+    fn evict_expired(&self) -> u64 {
+        let now_secs = current_timestamp_secs();
+        let mut removed = 0u64;
+        for item in self.l2.iter() {
+            let Ok((key, value)) = item else {
+                continue;
+            };
+            let should_evict = match serde_json::from_slice::<CacheEntry<SimulationResult>>(value.as_ref()) {
+                Ok(entry) => timestamp_is_expired(entry.timestamp, now_secs, CACHE_TTL_SECS),
+                Err(_) => true,
+            };
+            if should_evict && self.l2.remove(&key).is_ok() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            tracing::debug!(removed, "evicted expired simulation cache entries");
+        }
+        removed
     }
 
     pub fn log_stats(&self) {
@@ -311,10 +355,7 @@ impl ContractCache {
         let entry = CacheEntry {
             data: entry_bytes,
             ledger_sequence,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            timestamp: current_timestamp_secs(),
         };
         if let Ok(bytes) = serde_json::to_vec(&entry) {
             let _ = self.ledger_tree.insert(key_64.clone(), bytes);
@@ -362,6 +403,29 @@ mod tests {
 
         assert!(bounded.get("old").await.is_none());
         assert!(bounded.get("new").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn evicts_simulation_entries_after_ttl() {
+        let dir = tempdir().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let cache = SimulationCache::new_with_max_cache_size_bytes(&db, 0);
+        let tree = db.open_tree("simulation_results").unwrap();
+
+        let expired = CacheEntry {
+            data: result(),
+            ledger_sequence: 1,
+            timestamp: current_timestamp_secs().saturating_sub(CACHE_TTL_SECS + 1),
+        };
+        tree.insert(
+            "expired",
+            serde_json::to_vec(&expired).expect("serialize expired entry"),
+        )
+        .unwrap();
+
+        assert_eq!(cache.evict_expired(), 1);
+        assert!(cache.get("expired").await.is_none());
+        assert!(tree.get("expired").unwrap().is_none());
     }
 
     #[test]
