@@ -1,6 +1,7 @@
 #![allow(clippy::type_complexity)]
 
 use crate::errors::AppError;
+use crate::sys_alarms::{self, SysAlarm};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -115,11 +116,29 @@ impl ConcurrencyLimiter {
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, usize>> {
         // A panic in another request must not poison the limiter and lock every
-        // other API key out, so recover from a poisoned mutex instead.
-        self.in_flight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        // other API key out, so recover from a poisoned mutex instead of
+        // propagating the panic to concurrent simulations.
+        match self.in_flight.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                report_poisoned_limiter();
+                poisoned.into_inner()
+            }
+        }
     }
+}
+
+/// Emit a critical system alarm when the concurrency limiter's mutex is found
+/// poisoned. The guard is recovered and normal operation continues, but the
+/// event is surfaced so operators can investigate the original panic.
+fn report_poisoned_limiter() {
+    let alarm = SysAlarm::critical(
+        "simulation_service.concurrency_limiter",
+        "ConcurrencyLimiter mutex was poisoned by a panicking simulation task; \
+         recovered the guard and continued",
+    );
+    eprintln!("[CRITICAL] {alarm}");
+    sys_alarms::emit(alarm);
 }
 
 /// RAII guard for a reserved per-key simulation slot.
@@ -142,10 +161,15 @@ impl ConcurrencyPermit {
 
 impl Drop for ConcurrencyPermit {
     fn drop(&mut self) {
-        let mut in_flight = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Recover from a poisoned mutex rather than panicking inside `drop`,
+        // which would abort the process if the drop runs during unwinding.
+        let mut in_flight = match self.in_flight.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                report_poisoned_limiter();
+                poisoned.into_inner()
+            }
+        };
         if let Some(count) = in_flight.get_mut(&self.api_key) {
             *count = count.saturating_sub(1);
             if *count == 0 {

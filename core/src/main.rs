@@ -1881,6 +1881,7 @@ pub struct GasGolfingResponse {
     responses(
         (status = 200, description = "Gas golfing analysis completed", body = GasGolfingResponse),
         (status = 400, description = "Invalid WASM data"),
+        (status = 413, description = "WASM payload exceeds the 2 MB limit"),
         (status = 500, description = "Analysis failed")
     ),
     tag = "Analysis"
@@ -1896,9 +1897,30 @@ async fn analyze_gas_golfing(
         "Received gas golfing analysis request"
     );
 
+    // ── Enforce the per-request WASM size cap before decoding (issue #529) ──
+    // Base64 expands by 4/3, so bound the encoded payload first to avoid
+    // allocating a large decoded buffer for oversized inputs.
+    const MAX_WASM_BYTES: usize = 2 * 1024 * 1024; // 2 MB
+    const MAX_BASE64_LEN: usize = (MAX_WASM_BYTES / 3 + 1) * 4;
+    if payload.wasm_bytes.len() > MAX_BASE64_LEN {
+        return Err(AppError::PayloadTooLarge(format!(
+            "WASM file too large: encoded payload of {} bytes exceeds the {} byte (2 MB) decoded limit",
+            payload.wasm_bytes.len(),
+            MAX_WASM_BYTES,
+        )));
+    }
+
     let wasm_bytes = BASE64
         .decode(&payload.wasm_bytes)
         .map_err(|e| AppError::BadRequest(format!("Invalid base64 WASM data: {}", e)))?;
+
+    if wasm_bytes.len() > MAX_WASM_BYTES {
+        return Err(AppError::PayloadTooLarge(format!(
+            "WASM file too large: {} bytes exceeds the {} byte (2 MB) limit",
+            wasm_bytes.len(),
+            MAX_WASM_BYTES,
+        )));
+    }
 
     let contract_name = payload.contract_name.clone();
 
