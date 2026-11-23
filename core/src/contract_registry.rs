@@ -19,10 +19,34 @@ pub struct ContractRegisterEntry {
     pub wasm_hash: String,
 }
 
+/// Whether a [`ContractRegister`] was explicitly configured.
+///
+/// This distinguishes "not configured" (the `VERIFIED_CONTRACTS` env var is
+/// absent — permissive development mode) from "explicitly empty" (the env var
+/// is present but empty — deny-all production mode). Without this distinction
+/// an empty register would silently accept every contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterMode {
+    /// No whitelist was configured; verification is permissive (dev mode).
+    Unconfigured,
+    /// A whitelist was explicitly configured; only listed contracts pass.
+    Configured,
+}
+
 /// Whitelist of `contract_id -> expected WASM bytecode hash` (lowercase hex).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ContractRegister {
     entries: HashMap<String, String>,
+    mode: RegisterMode,
+}
+
+impl Default for ContractRegister {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            mode: RegisterMode::Unconfigured,
+        }
+    }
 }
 
 impl ContractRegister {
@@ -32,7 +56,19 @@ impl ContractRegister {
                 .into_iter()
                 .map(|(id, hash)| (id, hash.to_lowercase()))
                 .collect(),
+            mode: RegisterMode::Configured,
         }
+    }
+
+    /// The configuration mode of this register.
+    pub fn mode(&self) -> RegisterMode {
+        self.mode
+    }
+
+    /// Whether this register was explicitly configured (as opposed to being
+    /// absent and therefore running in permissive development mode).
+    pub fn is_configured(&self) -> bool {
+        self.mode == RegisterMode::Configured
     }
 
     /// Register a single contract in the whitelist, rejecting a duplicate
@@ -61,8 +97,12 @@ impl ContractRegister {
     }
 
     /// Parse a whitelist from a JSON array of `{"contract_id", "wasm_hash"}`
-    /// entries, e.g. the `VERIFIED_CONTRACTS` environment variable. An empty
-    /// or absent value yields an empty (deny-all) register.
+    /// entries, e.g. the `VERIFIED_CONTRACTS` environment variable.
+    ///
+    /// An explicitly empty value yields an empty **deny-all** register: every
+    /// contract is rejected by [`verify_bytecode`]. Use
+    /// [`ContractRegister::unconfigured`] for the permissive development mode
+    /// where the env var is absent.
     ///
     /// A `contract_id` appearing more than once is rejected with a
     /// [`ContractRegistryError::Conflict`] rather than silently keeping the
@@ -70,17 +110,65 @@ impl ContractRegister {
     pub fn from_json(json: &str) -> Result<Self, ContractRegistryError> {
         let trimmed = json.trim();
         if trimmed.is_empty() {
-            return Ok(Self::default());
+            // Explicitly empty: deny-all, never permissive.
+            return Ok(Self {
+                entries: HashMap::new(),
+                mode: RegisterMode::Configured,
+            });
         }
 
         let entries: Vec<ContractRegisterEntry> = serde_json::from_str(trimmed)
             .map_err(|e| ContractRegistryError::InvalidWhitelist(e.to_string()))?;
 
-        let mut register = Self::default();
+        let mut register = Self {
+            entries: HashMap::new(),
+            mode: RegisterMode::Configured,
+        };
         for entry in entries {
             register.register(entry.contract_id, entry.wasm_hash)?;
         }
         Ok(register)
+    }
+
+    /// Build a register for the case where no whitelist was configured at all
+    /// (the `VERIFIED_CONTRACTS` env var is absent). This is permissive
+    /// development mode: [`verify_bytecode`] accepts every contract.
+    pub fn unconfigured() -> Self {
+        Self::default()
+    }
+
+    /// Parse the `VERIFIED_CONTRACTS` environment variable.
+    ///
+    /// * `None` (absent) → permissive development mode.
+    /// * `Some("")` (present but empty) → deny-all production mode.
+    ///
+    /// A startup warning is logged when the resulting register is empty.
+    pub fn from_env_value(value: Option<&str>) -> Result<Self, ContractRegistryError> {
+        let register = match value {
+            None => Self::unconfigured(),
+            Some(json) => Self::from_json(json)?,
+        };
+        register.warn_if_empty();
+        Ok(register)
+    }
+
+    /// Log a startup warning when the register is empty, since an empty
+    /// configured register denies every contract and an unconfigured one
+    /// accepts every contract.
+    pub fn warn_if_empty(&self) {
+        if !self.is_empty() {
+            return;
+        }
+        match self.mode {
+            RegisterMode::Configured => tracing::warn!(
+                "VERIFIED_CONTRACTS is explicitly empty: contract whitelist is in deny-all mode \
+                 and every event will be rejected"
+            ),
+            RegisterMode::Unconfigured => tracing::warn!(
+                "VERIFIED_CONTRACTS is not set: contract whitelist is empty and running in \
+                 permissive development mode — every contract will be accepted"
+            ),
+        }
     }
 
     pub fn expected_hash(&self, contract_id: &str) -> Option<&str> {
@@ -282,10 +370,19 @@ pub async fn verify_bytecode<S: ContractBytecodeSource>(
     registry: &ContractRegister,
     contract_id: &str,
 ) -> Result<(), ContractRegistryError> {
-    let expected = registry
-        .expected_hash(contract_id)
-        .ok_or_else(|| ContractRegistryError::NotWhitelisted(contract_id.to_string()))?
-        .to_string();
+    let expected = match registry.expected_hash(contract_id) {
+        Some(hash) => hash.to_string(),
+        None => {
+            // An unconfigured register runs in permissive development mode;
+            // an explicitly configured (possibly empty) register denies all.
+            if registry.is_configured() {
+                return Err(ContractRegistryError::NotWhitelisted(
+                    contract_id.to_string(),
+                ));
+            }
+            return Ok(());
+        }
+    };
 
     let wasm_bytes = source
         .fetch_wasm(contract_id)
@@ -389,6 +486,43 @@ mod tests {
     fn from_json_empty_string_yields_empty_register() {
         let registry = ContractRegister::from_json("").expect("empty whitelist is valid");
         assert!(registry.is_empty());
+        // An explicitly empty value is deny-all, not permissive.
+        assert!(registry.is_configured());
+        assert_eq!(registry.mode(), RegisterMode::Configured);
+    }
+
+    #[tokio::test]
+    async fn explicitly_empty_register_denies_every_contract() {
+        let wasm = b"legit-contract-wasm".to_vec();
+        let source = FakeSource {
+            wasm_by_contract: HashMap::from([("CGOOD".to_string(), wasm.clone())]),
+        };
+        let registry = ContractRegister::from_json("").expect("empty whitelist is valid");
+
+        let err = verify_bytecode(&source, &registry, "CGOOD").await.unwrap_err();
+        assert!(matches!(err, ContractRegistryError::NotWhitelisted(id) if id == "CGOOD"));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_register_is_permissive_in_development_mode() {
+        let source = FakeSource {
+            wasm_by_contract: HashMap::new(),
+        };
+        let registry = ContractRegister::unconfigured();
+        assert!(!registry.is_configured());
+        assert_eq!(registry.mode(), RegisterMode::Unconfigured);
+
+        assert!(verify_bytecode(&source, &registry, "CANY").await.is_ok());
+    }
+
+    #[test]
+    fn from_env_value_distinguishes_absent_from_empty() {
+        let absent = ContractRegister::from_env_value(None).expect("absent is valid");
+        assert!(!absent.is_configured());
+
+        let empty = ContractRegister::from_env_value(Some("")).expect("empty is valid");
+        assert!(empty.is_configured());
+        assert!(empty.is_empty());
     }
 
     #[test]

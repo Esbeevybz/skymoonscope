@@ -107,8 +107,8 @@ impl SimulationCache {
         };
 
         if let Ok(bytes) = serde_json::to_vec(&entry) {
-            if self.l2.insert(&key, bytes).is_ok() {
-                self.evict_to_size();
+            if self.make_room_for(&key, bytes.len() as u64) {
+                let _ = self.l2.insert(&key, bytes);
             }
         }
         self.l1.insert(key, result).await;
@@ -123,11 +123,67 @@ impl SimulationCache {
         };
         entry.timestamp = current_timestamp_millis();
         if let Ok(updated) = serde_json::to_vec(&entry) {
-            let _ = self.l2.insert(key, updated);
+            if self.make_room_for(key, updated.len() as u64) {
+                let _ = self.l2.insert(key, updated);
+            }
         }
     }
 
-    fn evict_to_size(&self) {
+    /// Ensures there is room in the L2 tree for an entry of `incoming_size`
+    /// bytes stored under `key`, evicting the oldest entries by stored
+    /// timestamp as needed. Returns `true` if the write may proceed.
+    ///
+    /// A `max_cache_size_bytes` of zero means unlimited.
+    fn make_room_for(&self, key: &str, incoming_size: u64) -> bool {
+        if self.max_cache_size_bytes == 0 {
+            return true;
+        }
+
+        // Account for the fact that overwriting `key` replaces its existing
+        // value rather than adding to the total.
+        let existing_size = self
+            .l2
+            .get(key)
+            .ok()
+            .flatten()
+            .map(|v| v.len() as u64)
+            .unwrap_or(0);
+        let projected = self
+            .current_size()
+            .saturating_sub(existing_size)
+            .saturating_add(incoming_size);
+
+        if projected <= self.max_cache_size_bytes {
+            return true;
+        }
+
+        self.evict_to_size(self.max_cache_size_bytes.saturating_sub(incoming_size));
+        self.current_size().saturating_add(incoming_size) <= self.max_cache_size_bytes
+    }
+
+    /// Current on-disk footprint of the L2 tree, falling back to a logical
+    /// sum of key/value sizes if Sled cannot report it.
+    fn current_size(&self) -> u64 {
+        match self.l2.size_on_disk() {
+            Ok(size) => size,
+            Err(_) => self.logical_size(),
+        }
+    }
+
+    fn logical_size(&self) -> u64 {
+        let mut total = 0u64;
+        for item in self.l2.iter() {
+            let Ok((key, value)) = item else {
+                continue;
+            };
+            total = total.saturating_add(key.len() as u64 + value.len() as u64);
+        }
+        total
+    }
+
+    /// Evicts the oldest entries (by stored timestamp) until the tree's
+    /// footprint is at or below `target_bytes`.
+    fn evict_to_size(&self, target_bytes: u64) {
         if self.max_cache_size_bytes == 0 {
             return;
         }
@@ -145,14 +201,14 @@ impl SimulationCache {
             entries.push((entry.timestamp, key, value.len() as u64));
         }
 
-        if total_size <= self.max_cache_size_bytes {
+        if total_size <= target_bytes {
             return;
         }
 
         entries.sort_by_key(|(timestamp, _, _)| *timestamp);
         let mut removed = 0u64;
         for (_, key, value_size) in entries {
-            if total_size <= self.max_cache_size_bytes {
+            if total_size <= target_bytes {
                 break;
             }
             if self.l2.remove(&key).is_ok() {
@@ -284,6 +340,32 @@ mod tests {
 
         assert!(bounded.get("old").await.is_none());
         assert!(bounded.get("new").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn keeps_tree_within_cap_when_writing_many_entries() {
+        let dir = tempdir().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let cap = 8 * 1024;
+        let cache = SimulationCache::new_with_max_cache_size_bytes(&db, cap);
+
+        for i in 0..200u64 {
+            let mut r = result();
+            r.latest_ledger = i;
+            cache.set(format!("key-{i}"), r).await;
+        }
+
+        let tree = db.open_tree("simulation_results").unwrap();
+        let logical: u64 = tree
+            .iter()
+            .filter_map(|item| item.ok())
+            .map(|(k, v)| k.len() as u64 + v.len() as u64)
+            .sum();
+        assert!(
+            logical <= cap,
+            "tree logical size {logical} exceeded cap {cap}"
+        );
+        assert!(tree.len() < 200, "expected eviction to remove entries");
     }
 }
 

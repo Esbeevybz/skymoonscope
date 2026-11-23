@@ -10,10 +10,17 @@
 //! service already connects to for its job queue.
 
 use redis::{AsyncCommands, Client as RedisClient, ExistenceCheck, SetExpiry, SetOptions};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::time::Instant;
 use uuid::Uuid;
+
+/// Number of consecutive Redis connection failures after which a `Critical`
+/// `SysAlarm` is emitted (Issue #506).  A single transient blip is tolerated;
+/// sustained unreachability means leader-only work (e.g. fee collection) has
+/// silently stopped and needs to be surfaced.
+const DEFAULT_CONNECTION_FAILURE_ALARM_THRESHOLD: u64 = 3;
 
 const RENEW_SCRIPT: &str = r#"
 if redis.call("GET", KEYS[1]) == ARGV[1] then
@@ -65,6 +72,30 @@ pub struct RedisLeaderLock {
     lease_deadline: std::sync::Mutex<Option<Instant>>,
     /// Earliest instant at which the next renewal should be attempted.
     next_renewal: std::sync::Mutex<Option<Instant>>,
+    /// Consecutive Redis connection failures observed by
+    /// `try_acquire_or_renew` (Issue #506).  Reset to zero on a successful
+    /// connection.
+    consecutive_connection_failures: AtomicU64,
+    /// Threshold at which consecutive connection failures raise a `Critical`
+    /// `SysAlarm`.
+    connection_failure_alarm_threshold: u64,
+    /// Last Redis connection error observed, for health reporting.
+    last_connection_error: StdMutex<Option<String>>,
+}
+
+/// Snapshot of leader-lock health, suitable for a health-check endpoint
+/// (Issue #506).
+#[derive(Debug, Clone)]
+pub struct LeaderLockHealth {
+    /// Whether this instance currently holds the lease.
+    pub is_leader: bool,
+    /// Number of consecutive Redis connection failures.
+    pub consecutive_connection_failures: u64,
+    /// Last Redis connection error observed, if any.
+    pub last_error: Option<String>,
+    /// Whether the lock is considered degraded (connection failures have
+    /// crossed the alarm threshold).
+    pub degraded: bool,
 }
 
 impl RedisLeaderLock {
@@ -82,7 +113,87 @@ impl RedisLeaderLock {
             renewal_interval_ms,
             lease_deadline: std::sync::Mutex::new(None),
             next_renewal: std::sync::Mutex::new(None),
+            consecutive_connection_failures: AtomicU64::new(0),
+            connection_failure_alarm_threshold: DEFAULT_CONNECTION_FAILURE_ALARM_THRESHOLD,
+            last_connection_error: StdMutex::new(None),
         }
+    }
+
+    /// Override the number of consecutive Redis connection failures required
+    /// before a `Critical` `SysAlarm` is emitted (default: 3).
+    pub fn with_connection_failure_alarm_threshold(mut self, threshold: u64) -> Self {
+        self.connection_failure_alarm_threshold = threshold.max(1);
+        self
+    }
+
+    /// Number of consecutive Redis connection failures observed.
+    pub fn consecutive_connection_failures(&self) -> u64 {
+        self.consecutive_connection_failures.load(Ordering::Relaxed)
+    }
+
+    /// Whether the leader lock is degraded, i.e. consecutive Redis connection
+    /// failures have reached the alarm threshold.
+    pub fn is_degraded(&self) -> bool {
+        self.consecutive_connection_failures() >= self.connection_failure_alarm_threshold
+    }
+
+    /// Health snapshot for a health-check endpoint (Issue #506).
+    pub fn health(&self) -> LeaderLockHealth {
+        let consecutive_connection_failures = self.consecutive_connection_failures();
+        let is_leader = self
+            .lease_deadline
+            .lock()
+            .expect("leader lock deadline mutex poisoned")
+            .is_some_and(|deadline| Instant::now() < deadline);
+        let last_error = self
+            .last_connection_error
+            .lock()
+            .expect("leader lock error mutex poisoned")
+            .clone();
+        LeaderLockHealth {
+            is_leader,
+            consecutive_connection_failures,
+            last_error,
+            degraded: consecutive_connection_failures >= self.connection_failure_alarm_threshold,
+        }
+    }
+
+    /// Record a Redis connection failure, emitting a `Critical` `SysAlarm`
+    /// once the consecutive-failure threshold is crossed (Issue #506).
+    fn record_connection_failure(&self, error: &redis::RedisError) {
+        let failures = self
+            .consecutive_connection_failures
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        *self
+            .last_connection_error
+            .lock()
+            .expect("leader lock error mutex poisoned") = Some(error.to_string());
+
+        tracing::warn!(
+            error = %error,
+            consecutive_failures = failures,
+            "leader lock: failed to connect to Redis"
+        );
+
+        if failures >= self.connection_failure_alarm_threshold {
+            crate::sys_alarms::emit_critical(
+                "leader_lock_redis_unreachable",
+                format!(
+                    "RedisLeaderLock cannot reach Redis ({failures} consecutive failures); \
+                     leader-only work is not running: {error}"
+                ),
+            );
+        }
+    }
+
+    /// Record a successful Redis connection, resetting the failure counter.
+    fn record_connection_success(&self) {
+        self.consecutive_connection_failures.store(0, Ordering::Relaxed);
+        *self
+            .last_connection_error
+            .lock()
+            .expect("leader lock error mutex poisoned") = None;
     }
 
     /// Override the proactive renewal interval (default: 40% of the TTL).
@@ -173,9 +284,12 @@ impl RedisLeaderLock {
         }
 
         let mut conn = match self.redis.get_multiplexed_async_connection().await {
-            Ok(c) => c,
+            Ok(c) => {
+                self.record_connection_success();
+                c
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "leader lock: failed to connect to Redis");
+                self.record_connection_failure(&e);
                 return false;
             }
         };
@@ -312,5 +426,30 @@ mod tests {
         )
         .with_renewal_interval(Duration::from_secs(5));
         assert_eq!(lock.renewal_interval_ms, 100);
+    }
+
+    #[test]
+    fn health_reports_no_failures_initially() {
+        let lock = RedisLeaderLock::new(
+            RedisClient::open("redis://127.0.0.1/").expect("valid Redis URL"),
+            "test",
+            Duration::from_secs(1),
+        );
+        let health = lock.health();
+        assert_eq!(health.consecutive_connection_failures, 0);
+        assert!(health.last_error.is_none());
+        assert!(!health.degraded);
+        assert!(!lock.is_degraded());
+    }
+
+    #[test]
+    fn connection_failure_threshold_override_is_clamped() {
+        let lock = RedisLeaderLock::new(
+            RedisClient::open("redis://127.0.0.1/").expect("valid Redis URL"),
+            "test",
+            Duration::from_secs(1),
+        )
+        .with_connection_failure_alarm_threshold(0);
+        assert_eq!(lock.connection_failure_alarm_threshold, 1);
     }
 }

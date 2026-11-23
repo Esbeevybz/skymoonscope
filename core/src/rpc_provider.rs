@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-const CIRCUIT_BREAKER_THRESHOLD: u64 = 3;
-const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+pub const DEFAULT_CIRCUIT_BREAKER_THRESHOLD: u64 = 3;
+pub const DEFAULT_CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_OBSERVATION_TTL: Duration = Duration::from_secs(5 * 60);
 const PEER_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
@@ -119,6 +119,10 @@ pub struct RegistryConfig {
     pub instance_id: String,
     pub public_base_url: Option<String>,
     pub seed_peers: Vec<String>,
+    /// Number of consecutive failures before a provider's circuit breaker trips.
+    pub circuit_breaker_threshold: u64,
+    /// How long a tripped circuit breaker stays open before retrying.
+    pub circuit_breaker_cooldown: Duration,
 }
 
 impl Default for RegistryConfig {
@@ -127,6 +131,8 @@ impl Default for RegistryConfig {
             instance_id: "local".to_string(),
             public_base_url: None,
             seed_peers: Vec::new(),
+            circuit_breaker_threshold: DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
+            circuit_breaker_cooldown: DEFAULT_CIRCUIT_BREAKER_COOLDOWN,
         }
     }
 }
@@ -252,6 +258,8 @@ pub struct ProviderRegistry {
     instance_id: String,
     public_base_url: Option<String>,
     latency_cursor: AtomicUsize,
+    circuit_breaker_threshold: u64,
+    circuit_breaker_cooldown: Duration,
 }
 
 impl ProviderRegistry {
@@ -294,11 +302,21 @@ impl ProviderRegistry {
             instance_id: config.instance_id,
             public_base_url: config.public_base_url.map(|url| normalize_base_url(&url)),
             latency_cursor: AtomicUsize::new(0),
+            circuit_breaker_threshold: config.circuit_breaker_threshold.max(1),
+            circuit_breaker_cooldown: config.circuit_breaker_cooldown,
         })
     }
 
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    pub fn circuit_breaker_threshold(&self) -> u64 {
+        self.circuit_breaker_threshold
+    }
+
+    pub fn circuit_breaker_cooldown(&self) -> Duration {
+        self.circuit_breaker_cooldown
     }
 
     pub fn public_base_url(&self) -> Option<&str> {
@@ -438,7 +456,7 @@ impl ProviderRegistry {
                 .await
                 .replace(Utc::now());
 
-            if prev + 1 >= CIRCUIT_BREAKER_THRESHOLD {
+            if prev + 1 >= self.circuit_breaker_threshold {
                 let mut tripped = state.tripped_at.write().await;
                 if tripped.is_none() {
                     let provider = state.provider.read().await;
@@ -575,7 +593,7 @@ impl ProviderRegistry {
         let effective_score = clamp_score((local_score * 2 + peer_score) / 3);
         let healthy = !tripped
             && (effective_score >= MIN_PROVIDER_SCORE || remote_healthy)
-            && (consecutive_failures < CIRCUIT_BREAKER_THRESHOLD || remote_healthy);
+            && (consecutive_failures < self.circuit_breaker_threshold || remote_healthy);
 
         ProviderHealthReport {
             name: provider.name.clone(),
@@ -677,7 +695,7 @@ impl ProviderRegistry {
                         "Provider health check failed"
                     );
 
-                    if prev + 1 >= CIRCUIT_BREAKER_THRESHOLD {
+                    if prev + 1 >= self.circuit_breaker_threshold {
                         let mut tripped = state.tripped_at.write().await;
                         *tripped = Some(Instant::now());
                     }
@@ -862,7 +880,7 @@ impl ProviderRegistry {
         }
 
         state.local_score.load(Ordering::Relaxed) >= MIN_PROVIDER_SCORE
-            || state.consecutive_failures.load(Ordering::Relaxed) < CIRCUIT_BREAKER_THRESHOLD
+            || state.consecutive_failures.load(Ordering::Relaxed) < self.circuit_breaker_threshold
     }
 
     pub async fn registry_snapshot(&self) -> RegistrySnapshot {
@@ -949,7 +967,7 @@ impl ProviderRegistry {
         let tripped_at = *state.tripped_at.read().await;
         match tripped_at {
             None => false,
-            Some(when) if when.elapsed() >= CIRCUIT_BREAKER_COOLDOWN => {
+            Some(when) if when.elapsed() >= self.circuit_breaker_cooldown => {
                 *state.tripped_at.write().await = None;
                 false
             }
@@ -1014,7 +1032,7 @@ mod tests {
     async fn test_circuit_breaker_trips_after_threshold() {
         let registry = ProviderRegistry::new(vec![make_provider("a", "http://a.test")]);
 
-        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+        for _ in 0..registry.circuit_breaker_threshold() {
             registry.report_failure("http://a.test").await;
         }
 
@@ -1022,10 +1040,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_circuit_breaker_threshold_is_configurable() {
+        let registry = ProviderRegistry::new_with_config(
+            vec![make_provider("a", "http://a.test")],
+            RegistryConfig {
+                circuit_breaker_threshold: 1,
+                ..RegistryConfig::default()
+            },
+        );
+
+        assert_eq!(registry.circuit_breaker_threshold(), 1);
+        registry.report_failure("http://a.test").await;
+        assert!(registry.healthy_providers().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_cooldown_is_configurable() {
+        let registry = ProviderRegistry::new_with_config(
+            vec![make_provider("a", "http://a.test")],
+            RegistryConfig {
+                circuit_breaker_threshold: 1,
+                circuit_breaker_cooldown: Duration::from_millis(10),
+                ..RegistryConfig::default()
+            },
+        );
+
+        assert_eq!(
+            registry.circuit_breaker_cooldown(),
+            Duration::from_millis(10)
+        );
+        registry.report_failure("http://a.test").await;
+        assert!(registry.healthy_providers().await.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(registry.healthy_providers().await.len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_success_clears_tripped_provider() {
         let registry = ProviderRegistry::new(vec![make_provider("a", "http://a.test")]);
 
-        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+        for _ in 0..registry.circuit_breaker_threshold() {
             registry.report_failure("http://a.test").await;
         }
         assert!(registry.healthy_providers().await.is_empty());
@@ -1042,6 +1097,7 @@ mod tests {
                 instance_id: "node-a".to_string(),
                 public_base_url: Some("http://node-a.test".to_string()),
                 seed_peers: Vec::new(),
+                ..RegistryConfig::default()
             },
         );
 
@@ -1114,6 +1170,7 @@ mod tests {
                 instance_id: "node-a".to_string(),
                 public_base_url: Some("http://node-a.test".to_string()),
                 seed_peers: vec!["http://node-b.test".to_string()],
+                ..RegistryConfig::default()
             },
         );
 
@@ -1240,7 +1297,7 @@ mod tests {
             registry.record_rtt("http://fast-down.test", 10_000);
             registry.record_rtt("http://slow-up.test", 500_000);
         }
-        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+        for _ in 0..registry.circuit_breaker_threshold() {
             registry.report_failure("http://fast-down.test").await;
         }
         let ordered = registry.providers_by_latency().await;
@@ -1254,7 +1311,7 @@ mod tests {
             make_provider("a", "http://a.test"),
             make_provider("b", "http://b.test"),
         ]);
-        for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
+        for _ in 0..registry.circuit_breaker_threshold() {
             registry.report_failure("http://a.test").await;
             registry.report_failure("http://b.test").await;
         }
