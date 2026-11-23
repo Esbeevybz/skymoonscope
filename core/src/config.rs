@@ -170,6 +170,16 @@ fn default_log_format_json() -> bool {
     false
 }
 
+/// Consecutive provider failures before the circuit breaker opens (issue #507).
+fn default_circuit_breaker_threshold() -> u64 {
+    3
+}
+
+/// How long (seconds) an open circuit breaker stays open before probing again.
+fn default_circuit_breaker_cooldown_secs() -> u64 {
+    300
+}
+
 // ---------------------------------------------------------------------------
 // AppConfig struct
 // ---------------------------------------------------------------------------
@@ -281,6 +291,16 @@ pub struct AppConfig {
     /// Env: `REGISTRY_SEED_PEERS` · Default: `""`
     #[serde(default)]
     pub registry_seed_peers: String,
+
+    /// Number of consecutive failures before a provider's circuit breaker opens.
+    /// Env: `CIRCUIT_BREAKER_THRESHOLD` · Default: `3`
+    #[serde(default = "default_circuit_breaker_threshold")]
+    pub circuit_breaker_threshold: u64,
+
+    /// Cooldown (seconds) an open circuit breaker waits before probing again.
+    /// Env: `CIRCUIT_BREAKER_COOLDOWN_SECS` · Default: `300`
+    #[serde(default = "default_circuit_breaker_cooldown_secs")]
+    pub circuit_breaker_cooldown_secs: u64,
 
     // --- Health & gossip ---
 
@@ -585,6 +605,14 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         .set_default("registry_instance_id", "")?
         .set_default("registry_public_url", "")?
         .set_default("registry_seed_peers", "")?
+        .set_default(
+            "circuit_breaker_threshold",
+            default_circuit_breaker_threshold(),
+        )?
+        .set_default(
+            "circuit_breaker_cooldown_secs",
+            default_circuit_breaker_cooldown_secs(),
+        )?
         .set_default("health_check_interval_secs", default_health_check_interval_secs())?
         .set_default("gossip_interval_secs", default_gossip_interval_secs())?
         .set_default("simulation_timeout_secs", default_simulation_timeout_secs())?
@@ -762,6 +790,34 @@ mod tests {
     }
 
     #[test]
+    fn circuit_breaker_defaults_are_applied() {
+        let _guard = EnvGuard(vec![
+            "CIRCUIT_BREAKER_THRESHOLD".into(),
+            "CIRCUIT_BREAKER_COOLDOWN_SECS".into(),
+        ]);
+        env::remove_var("CIRCUIT_BREAKER_THRESHOLD");
+        env::remove_var("CIRCUIT_BREAKER_COOLDOWN_SECS");
+
+        let cfg = load_config().expect("load_config should succeed with defaults");
+        assert_eq!(cfg.circuit_breaker_threshold, 3);
+        assert_eq!(cfg.circuit_breaker_cooldown_secs, 300);
+    }
+
+    #[test]
+    fn circuit_breaker_can_be_overridden_from_env() {
+        let _guard = EnvGuard(vec![
+            "CIRCUIT_BREAKER_THRESHOLD".into(),
+            "CIRCUIT_BREAKER_COOLDOWN_SECS".into(),
+        ]);
+
+        env::set_var("CIRCUIT_BREAKER_THRESHOLD", "5");
+        env::set_var("CIRCUIT_BREAKER_COOLDOWN_SECS", "30");
+        let cfg = load_config().expect("load_config should succeed");
+        assert_eq!(cfg.circuit_breaker_threshold, 5);
+        assert_eq!(cfg.circuit_breaker_cooldown_secs, 30);
+    }
+
+    #[test]
     fn alarm_dedup_window_defaults_to_sixty_seconds() {
         let _guard = EnvGuard(vec!["ALARM_DEDUP_WINDOW_SECS".into()]);
         env::remove_var("ALARM_DEDUP_WINDOW_SECS");
@@ -868,6 +924,8 @@ mod tests {
             registry_instance_id: String::new(),
             registry_public_url: String::new(),
             registry_seed_peers: String::new(),
+            circuit_breaker_threshold: 3,
+            circuit_breaker_cooldown_secs: 300,
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
@@ -911,6 +969,8 @@ mod tests {
             registry_instance_id: String::new(),
             registry_public_url: String::new(),
             registry_seed_peers: String::new(),
+            circuit_breaker_threshold: 3,
+            circuit_breaker_cooldown_secs: 300,
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,
@@ -968,6 +1028,8 @@ mod tests {
             registry_instance_id: String::new(),
             registry_public_url: String::new(),
             registry_seed_peers: String::new(),
+            circuit_breaker_threshold: 3,
+            circuit_breaker_cooldown_secs: 300,
             health_check_interval_secs: 30,
             gossip_interval_secs: 30,
             simulation_timeout_secs: 30,

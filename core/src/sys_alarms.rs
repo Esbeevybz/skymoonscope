@@ -373,6 +373,42 @@ impl AlertDeduper {
     }
 }
 
+/// Severity attached to an ad-hoc [`SysAlarmEvent`].
+///
+/// The sampling monitor only ever emits breach/recovery events, but
+/// non-sampling subsystems (the leader lock, the fee collector's
+/// dead-letter path, …) need to signal how urgent a failure is. The
+/// enum is `#[non_exhaustive]`-free on purpose so callers can match
+/// exhaustively, and it serialises to a stable lowercase string for
+/// downstream pagers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlarmSeverity {
+    /// Informational — nothing is broken, but operators may care.
+    Info,
+    /// Degraded behaviour; the subsystem is still making progress.
+    Warning,
+    /// The subsystem has stopped doing its job and needs attention now.
+    Critical,
+}
+
+impl AlarmSeverity {
+    /// Stable lowercase label used in logs and webhook payloads.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AlarmSeverity::Info => "info",
+            AlarmSeverity::Warning => "warning",
+            AlarmSeverity::Critical => "critical",
+        }
+    }
+}
+
+impl Default for AlarmSeverity {
+    fn default() -> Self {
+        Self::Warning
+    }
+}
+
 /// JSON payload posted to the webhook on threshold events. Kept stable
 /// for downstream scrapers / pagers.
 #[derive(Debug, Clone, Serialize)]
@@ -389,6 +425,15 @@ pub struct SysAlarmEvent {
     pub pid: u32,
     pub node_id: Option<String>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Severity of the event. Defaults to [`AlarmSeverity::Warning`] for
+    /// the sampling monitor's breach/recovery events; ad-hoc callers set
+    /// it explicitly via [`emit_ad_hoc_alarm`].
+    #[serde(default)]
+    pub severity: AlarmSeverity,
+    /// Optional human-readable detail for ad-hoc alarms. `None` for the
+    /// sampling monitor's threshold events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Background tokio task that owns the `sysinfo::System` handle. Spawn
@@ -607,10 +652,96 @@ impl SysAlarmMonitor {
             pid: std::process::id(),
             node_id: node_id.map(|s| s.to_string()),
             timestamp: chrono::Utc::now(),
+            severity: if currently_above {
+                AlarmSeverity::Warning
+            } else {
+                AlarmSeverity::Info
+            },
+            message: None,
         };
 
         emit_sys_alarm(self.config.webhook_url.as_deref(), &payload).await;
     }
+}
+
+/// Emit an ad-hoc alarm from a non-sampling subsystem (e.g. the leader
+/// lock reporting Redis connection failures) with an explicit severity
+/// and message.
+///
+/// This reuses the exact same webhook transport as
+/// [`SysAlarmMonitor::fire_alert`] via [`emit_sys_alarm`], so operators
+/// have one alert channel and one payload shape regardless of which
+/// subsystem raised the alarm. The event is also logged at a level that
+/// matches `severity` so log-only deployments still see it.
+///
+/// `deduper` / `dedup_window` are optional: pass `Some` to rate limit a
+/// flapping condition (the caller owns the [`AlertDeduper`] so state
+/// persists across calls), or `None` to always emit.
+pub async fn emit_ad_hoc_alarm(
+    webhook_url: Option<&str>,
+    deduper: Option<&mut AlertDeduper>,
+    dedup_window: Duration,
+    severity: AlarmSeverity,
+    event: &'static str,
+    resource: &'static str,
+    message: impl Into<String>,
+) {
+    if let Some(deduper) = deduper {
+        if !deduper.should_emit(resource, Instant::now(), dedup_window) {
+            debug!(
+                resource,
+                event,
+                severity = severity.as_str(),
+                window_secs = dedup_window.as_secs(),
+                "Suppressing duplicate ad-hoc alarm inside dedup window"
+            );
+            return;
+        }
+    }
+
+    let message = message.into();
+    match severity {
+        AlarmSeverity::Critical => warn!(
+            resource,
+            event,
+            severity = severity.as_str(),
+            message = %message,
+            "Critical subsystem alarm"
+        ),
+        AlarmSeverity::Warning => warn!(
+            resource,
+            event,
+            severity = severity.as_str(),
+            message = %message,
+            "Subsystem alarm"
+        ),
+        AlarmSeverity::Info => info!(
+            resource,
+            event,
+            severity = severity.as_str(),
+            message = %message,
+            "Subsystem alarm"
+        ),
+    }
+
+    let payload = SysAlarmEvent {
+        event,
+        resource,
+        value_percent: 0.0,
+        threshold_percent: 0.0,
+        process_memory_bytes: 0,
+        total_memory_bytes: 0,
+        pid: std::process::id(),
+        node_id: std::env::var(ENV_INSTANCE_ID)
+            .ok()
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .filter(|s| !s.trim().is_empty()),
+        timestamp: chrono::Utc::now(),
+        severity,
+        message: Some(message),
+    };
+
+    emit_sys_alarm(webhook_url, &payload).await;
 }
 
 /// POST a [`SysAlarmEvent`] to the configured webhook, using the same
@@ -860,6 +991,8 @@ mod tests {
             pid: 4242,
             node_id: Some("node-a".to_string()),
             timestamp: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            severity: AlarmSeverity::Warning,
+            message: None,
         };
         let json = serde_json::to_string(&event).expect("serialize");
         assert!(json.contains("\"event\":\"threshold_breach\""));
@@ -867,6 +1000,76 @@ mod tests {
         assert!(json.contains("\"value_percent\":92.5"));
         assert!(json.contains("\"pid\":4242"));
         assert!(json.contains("\"node_id\":\"node-a\""));
+        assert!(json.contains("\"severity\":\"warning\""));
+        // Sampling-monitor events carry no ad-hoc message.
+        assert!(!json.contains("\"message\""));
+    }
+
+    #[test]
+    fn alarm_severity_serializes_to_stable_labels() {
+        assert_eq!(AlarmSeverity::Info.as_str(), "info");
+        assert_eq!(AlarmSeverity::Warning.as_str(), "warning");
+        assert_eq!(AlarmSeverity::Critical.as_str(), "critical");
+        assert_eq!(
+            serde_json::to_string(&AlarmSeverity::Critical).unwrap(),
+            "\"critical\""
+        );
+    }
+
+    #[test]
+    fn ad_hoc_event_serializes_severity_and_message() {
+        let event = SysAlarmEvent {
+            event: "redis_connection_failed",
+            resource: "leader_lock",
+            value_percent: 0.0,
+            threshold_percent: 0.0,
+            process_memory_bytes: 0,
+            total_memory_bytes: 0,
+            pid: 1,
+            node_id: None,
+            timestamp: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            severity: AlarmSeverity::Critical,
+            message: Some("redis unreachable".to_string()),
+        };
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert!(json.contains("\"severity\":\"critical\""));
+        assert!(json.contains("\"message\":\"redis unreachable\""));
+    }
+
+    #[tokio::test]
+    async fn emit_ad_hoc_alarm_without_webhook_is_a_noop() {
+        // No URL configured: must return without a network call.
+        emit_ad_hoc_alarm(
+            None,
+            None,
+            Duration::ZERO,
+            AlarmSeverity::Critical,
+            "redis_connection_failed",
+            "leader_lock",
+            "redis unreachable",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn emit_ad_hoc_alarm_respects_dedup_window() {
+        let mut deduper = AlertDeduper::new();
+        let window = Duration::from_secs(60);
+        // First call records the emission; the second inside the window is
+        // suppressed (no panic, no network call since URL is None).
+        emit_ad_hoc_alarm(
+            None,
+            Some(&mut deduper),
+            window,
+            AlarmSeverity::Critical,
+            "redis_connection_failed",
+            "leader_lock",
+            "first",
+        )
+        .await;
+        assert!(deduper
+            .remaining("leader_lock", Instant::now(), window)
+            .is_some());
     }
 
     // ── Config-from-env tests ──────────────────────────────────────────
@@ -1062,6 +1265,8 @@ mod tests {
             pid: std::process::id(),
             node_id: None,
             timestamp: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            severity: AlarmSeverity::Warning,
+            message: None,
         };
 
         // No URL configured: the helper must return without attempting a

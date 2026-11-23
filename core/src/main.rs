@@ -230,6 +230,15 @@ struct AppConfig {
     /// Env: `ALARM_DEDUP_WINDOW_SECS`. Default 60.
     #[serde(default = "default_alarm_dedup_window_secs")]
     alarm_dedup_window_secs: u64,
+    /// Number of consecutive provider failures before the circuit breaker
+    /// opens (issue #507). Env: `CIRCUIT_BREAKER_THRESHOLD`. Default 3.
+    #[serde(default = "default_circuit_breaker_threshold")]
+    circuit_breaker_threshold: u32,
+    /// Seconds a tripped circuit breaker stays open before probing the
+    /// provider again (issue #507). Env: `CIRCUIT_BREAKER_COOLDOWN_SECS`.
+    /// Default 300 (5 minutes).
+    #[serde(default = "default_circuit_breaker_cooldown_secs")]
+    circuit_breaker_cooldown_secs: u64,
 }
 
 fn default_health_check_interval() -> u64 {
@@ -320,6 +329,16 @@ fn default_event_bus_capacity() -> usize {
 /// library config surface agree on a single default.
 fn default_alarm_dedup_window_secs() -> u64 {
     60
+}
+
+/// Default circuit-breaker failure threshold (issue #507).
+fn default_circuit_breaker_threshold() -> u32 {
+    3
+}
+
+/// Default circuit-breaker cooldown in seconds (issue #507).
+fn default_circuit_breaker_cooldown_secs() -> u64 {
+    300
 }
 
 fn default_allowed_origins() -> String {
@@ -2792,18 +2811,54 @@ async fn main() {
     // Broadcast channel used to stop all background worker loops on process exit.
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let mut worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    // Issue #506: populated when the fee collector's leader lock is created so
+    // the `/health/leader` endpoint can report leader-lock degradation.
+    let mut leader_lock_health: Option<Arc<leader_lock::RedisLeaderLock>> = None;
 
     // ── Multi-node RPC setup ────────────────────────────────────────────
     let providers = build_providers(&config);
     let provider_names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
     tracing::info!(providers = ?provider_names, "RPC provider pool");
 
-    let registry = ProviderRegistry::new_with_config(providers, build_registry_config(&config));
+    let mut registry_config = build_registry_config(&config);
+    // Issue #507: circuit-breaker tuning is operator-configurable so a brief
+    // provider outage does not take every instance offline for a fixed window.
+    registry_config.circuit_breaker_threshold = config.circuit_breaker_threshold;
+    registry_config.circuit_breaker_cooldown =
+        std::time::Duration::from_secs(config.circuit_breaker_cooldown_secs);
+    let registry = ProviderRegistry::new_with_config(providers, registry_config);
     tracing::info!(
         instance_id = registry.instance_id(),
         public_url = ?registry.public_base_url(),
+        circuit_breaker_threshold = config.circuit_breaker_threshold,
+        circuit_breaker_cooldown_secs = config.circuit_breaker_cooldown_secs,
         "Provider registry initialized"
     );
+
+    // ── Contract register (issue #509) ──────────────────────────────────
+    // Distinguish "not configured" (permissive development mode) from
+    // "explicitly empty" (deny-all production mode). An empty register is
+    // logged loudly at startup so operators notice a misconfiguration.
+    let contract_register = match env::var("VERIFIED_CONTRACTS") {
+        Ok(raw) => {
+            let register = crate::contract_registry::ContractRegister::from_json(&raw);
+            if register.is_empty() {
+                tracing::warn!(
+                    severity = "warning",
+                    "VERIFIED_CONTRACTS is set but empty; contract register is in deny-all mode"
+                );
+            }
+            register
+        }
+        Err(_) => {
+            tracing::warn!(
+                severity = "warning",
+                "VERIFIED_CONTRACTS is not set; contract register is in permissive development mode"
+            );
+            crate::contract_registry::ContractRegister::permissive()
+        }
+    };
+    let contract_register = Arc::new(contract_register);
 
     // Spawn background health checker.
     let health_interval = std::time::Duration::from_secs(config.health_check_interval_secs);
@@ -2947,11 +3002,14 @@ async fn main() {
 
         let leader_redis_client = redis::Client::open(config.redis_url.as_str())
             .expect("Failed to create Redis client for leader lock");
-        let leader_lock = leader_lock::RedisLeaderLock::new(
+        let leader_lock = Arc::new(leader_lock::RedisLeaderLock::new(
             leader_redis_client,
             "sky-moon-scope:leader:fee_collector",
             std::time::Duration::from_secs(config.fee_collection_interval_secs.max(1) * 3),
-        );
+        ));
+        // Issue #506: expose the leader lock so the health endpoint can report
+        // degraded state and the last Redis error instead of failing silently.
+        leader_lock_health = Some(Arc::clone(&leader_lock));
         match leader_lock.load_scripts().await {
             Ok(()) => {
                 let collector = Arc::new(FeeCollector::new(
@@ -2959,7 +3017,7 @@ async fn main() {
                     Arc::clone(&fee_store),
                     collector_config,
                     Arc::clone(&metrics),
-                    Arc::new(leader_lock),
+                    Arc::clone(&leader_lock),
                 ));
 
                 let fee_shutdown = shutdown_tx.subscribe();
@@ -3124,6 +3182,9 @@ async fn main() {
         .route("/health", get(health_check))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        // Issue #506: leader-lock health reflects Redis connectivity so a
+        // degraded leader election surfaces instead of silently skipping work.
+        .route("/health/leader", get(leader_health))
         .route("/metrics", get(metrics_handler))
         .route("/api/v1/contracts/batch-state", post(batch_contract_state))
         .route("/auth/challenge", post(auth::challenge_handler))
@@ -3155,6 +3216,12 @@ async fn main() {
         .layer(Extension(SharedResultsState {
             store: shared_results_store,
             base_url: format!("http://0.0.0.0:{}", config.server_port),
+        }))
+        .layer(Extension(LeaderLockHealthState {
+            lock: leader_lock_health,
+        }))
+        .layer(Extension(ContractRegisterState {
+            register: Arc::clone(&contract_register),
         }))
         // GraphQL contract execution history + token metadata query layer.
         .route(
@@ -3408,6 +3475,13 @@ mod tests {
     fn test_app_config_default_simulation_timeout() {
         // Verify the default timeout function returns 30 seconds
         assert_eq!(default_simulation_timeout_secs(), 30);
+    }
+
+    #[test]
+    fn test_app_config_default_circuit_breaker_values() {
+        // Issue #507: circuit-breaker tuning defaults.
+        assert_eq!(default_circuit_breaker_threshold(), 3);
+        assert_eq!(default_circuit_breaker_cooldown_secs(), 300);
     }
 
     #[test]
@@ -3753,4 +3827,54 @@ async fn analyze_simulation(
 ) -> Result<Json<AnalysisResult>, AppError> {
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
+}
+
+/// Shared handle to the fee collector's leader lock for health reporting
+/// (issue #506). `None` when fee analysis is disabled or the lock could not
+/// be constructed.
+#[derive(Clone)]
+struct LeaderLockHealthState {
+    lock: Option<Arc<leader_lock::RedisLeaderLock>>,
+}
+
+/// Shared handle to the verified-contract register (issue #509).
+#[derive(Clone)]
+struct ContractRegisterState {
+    register: Arc<crate::contract_registry::ContractRegister>,
+}
+
+/// `/health/leader` — reports leader-lock status including degraded state and
+/// the last Redis error (issue #506).
+async fn leader_health(
+    Extension(state): Extension<LeaderLockHealthState>,
+) -> impl IntoResponse {
+    match state.lock {
+        None => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "disabled",
+                "degraded": false,
+                "leader": false,
+                "last_error": Value::Null,
+            })),
+        ),
+        Some(lock) => {
+            let health = lock.health();
+            let status = if health.degraded {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "status": if health.degraded { "degraded" } else { "ok" },
+                    "degraded": health.degraded,
+                    "leader": health.is_leader,
+                    "consecutive_failures": health.consecutive_failures,
+                    "last_error": health.last_error,
+                })),
+            )
+        }
+    }
 }
