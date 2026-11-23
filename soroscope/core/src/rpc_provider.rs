@@ -873,7 +873,18 @@ impl ProviderRegistry {
                 .await;
         }
 
-        for peer in snapshot.peers {
+        let mut peers = snapshot.peers;
+        if peers.len() > MAX_GOSSIP_PEERS {
+            tracing::warn!(
+                instance_id = %snapshot.instance_id,
+                received = peers.len(),
+                limit = MAX_GOSSIP_PEERS,
+                "Truncating oversized gossip peer list"
+            );
+            peers.truncate(MAX_GOSSIP_PEERS);
+        }
+
+        for peer in peers {
             self.register_peer(
                 &peer.base_url,
                 peer.instance_id,
@@ -882,7 +893,18 @@ impl ProviderRegistry {
             .await;
         }
 
-        for snapshot_provider in snapshot.providers {
+        let mut providers = snapshot.providers;
+        if providers.len() > MAX_GOSSIP_PROVIDERS {
+            tracing::warn!(
+                instance_id = %snapshot.instance_id,
+                received = providers.len(),
+                limit = MAX_GOSSIP_PROVIDERS,
+                "Truncating oversized gossip provider list"
+            );
+            providers.truncate(MAX_GOSSIP_PROVIDERS);
+        }
+
+        for snapshot_provider in providers {
             let provider = RpcProvider {
                 name: snapshot_provider.provider.name,
                 url: snapshot_provider.provider.url,
@@ -1069,6 +1091,97 @@ mod tests {
             .providers
             .iter()
             .any(|provider| provider.provider.url == "http://private.test"));
+    }
+
+    #[tokio::test]
+    async fn test_merge_snapshot_truncates_oversized_provider_list() {
+        let registry = ProviderRegistry::new_with_config(
+            vec![make_provider("seed", "http://seed.test")],
+            RegistryConfig {
+                instance_id: "node-a".to_string(),
+                public_base_url: Some("http://node-a.test".to_string()),
+                seed_peers: Vec::new(),
+            },
+        );
+
+        let providers = (0..MAX_GOSSIP_PROVIDERS + 50)
+            .map(|i| GossipProviderSnapshot {
+                provider: PublicRpcProvider {
+                    name: format!("shared-{i}"),
+                    url: format!("http://shared-{i}.test"),
+                },
+                score: 90,
+                latest_ledger: Some(1),
+                consecutive_failures: 0,
+                healthy: true,
+                observed_at: Utc::now(),
+            })
+            .collect::<Vec<_>>();
+
+        registry
+            .merge_snapshot(RegistrySnapshot {
+                instance_id: "node-b".to_string(),
+                base_url: Some("http://node-b.test".to_string()),
+                generated_at: Utc::now(),
+                peers: Vec::new(),
+                providers,
+            })
+            .await;
+
+        // Seed provider + at most MAX_GOSSIP_PROVIDERS discovered providers.
+        let states = registry.states.read().await;
+        assert_eq!(states.len(), 1 + MAX_GOSSIP_PROVIDERS);
+        drop(states);
+
+        // Only the first MAX entries are retained.
+        let reports = registry.provider_reports().await;
+        assert!(reports
+            .iter()
+            .any(|report| report.url == "http://shared-0.test"));
+        assert!(!reports
+            .iter()
+            .any(|report| report.url == format!("http://shared-{}.test", MAX_GOSSIP_PROVIDERS)));
+    }
+
+    #[tokio::test]
+    async fn test_merge_snapshot_truncates_oversized_peer_list() {
+        let registry = ProviderRegistry::new_with_config(
+            vec![make_provider("seed", "http://seed.test")],
+            RegistryConfig {
+                instance_id: "node-a".to_string(),
+                public_base_url: Some("http://node-a.test".to_string()),
+                seed_peers: Vec::new(),
+            },
+        );
+
+        let peers = (0..MAX_GOSSIP_PEERS + 50)
+            .map(|i| PeerAdvertisement {
+                instance_id: Some(format!("node-{i}")),
+                base_url: format!("http://node-{i}.test"),
+            })
+            .collect::<Vec<_>>();
+
+        registry
+            .merge_snapshot(RegistrySnapshot {
+                instance_id: "node-b".to_string(),
+                base_url: Some("http://node-b.test".to_string()),
+                generated_at: Utc::now(),
+                peers,
+                providers: Vec::new(),
+            })
+            .await;
+
+        // The advertising peer itself plus at most MAX_GOSSIP_PEERS peers.
+        let peer_count = registry.peers.read().await.len();
+        assert_eq!(peer_count, 1 + MAX_GOSSIP_PEERS);
+
+        let reports = registry.peer_reports().await;
+        assert!(reports
+            .iter()
+            .any(|report| report.base_url == "http://node-0.test"));
+        assert!(!reports
+            .iter()
+            .any(|report| report.base_url == format!("http://node-{}.test", MAX_GOSSIP_PEERS)));
     }
 
     #[tokio::test]
