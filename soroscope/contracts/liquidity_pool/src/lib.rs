@@ -818,7 +818,14 @@ impl LiquidityPool {
         Ok(shares)
     }
 
-    pub fn swap(e: Env, to: Address, buy_a: bool, out: i128, in_max: i128) -> Result<i128, Error> {
+    pub fn swap(
+        e: Env,
+        to: Address,
+        buy_a: bool,
+        out: i128,
+        in_max: i128,
+        min_amount_out: i128,
+    ) -> Result<i128, Error> {
         require_not_paused(&e, PauseType::SWAP)?;
         to.require_auth();
         let mut pool = load_pool(&e)?;
@@ -829,6 +836,10 @@ impl LiquidityPool {
         };
         if out >= reserve_out {
             return Err(Error::InsufficientLiquidity);
+        }
+        // Issue #515: enforce the caller's minimum output to protect against slippage.
+        if out < min_amount_out {
+            return Err(Error::SlippageExceeded);
         }
         let fee_scale = 10_000i128 - pool.fee_bps;
         let numerator = reserve_in

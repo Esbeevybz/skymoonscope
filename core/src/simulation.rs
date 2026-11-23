@@ -282,6 +282,11 @@ impl WasmInstrumenter {
     /// read within the same WASM instance lifetime (globals reset between
     /// separate `invoke_contract` calls in the soroban test Env).
     ///
+    /// Counter globals are appended *after* every pre-existing global, so the
+    /// indices of all original globals (including any the host reads by index)
+    /// are preserved unchanged. The original global section is re-encoded
+    /// verbatim and the counters are only ever appended at the tail.
+    ///
     /// Returns the re-encoded WASM bytes.
     pub fn instrument(&self, wasm_bytes: &[u8]) -> Result<Vec<u8>, SimulationError> {
         use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
@@ -344,6 +349,11 @@ impl WasmInstrumenter {
                 _ => {}
             }
         }
+
+        // Counter globals are appended after all pre-existing globals, so the
+        // first injected counter lives at `existing_global_count`. This keeps
+        // every original global index untouched (no aliasing / shifting).
+        let counter_global_base = existing_global_count;
 
         // The new wrapper type index will be `existing_type_count` (appended).
         // Wrapper type: () -> i64
@@ -616,7 +626,7 @@ impl WasmInstrumenter {
                         }
 
                         let mut f = Function::new(locals);
-                        let counter_global_idx = existing_global_count + defined_func_idx;
+                        let counter_global_idx = counter_global_base + defined_func_idx;
 
                         // Prepend counter increment: global.get N; i64.const 1; i64.add; global.set N
                         f.instruction(&Instruction::GlobalGet(counter_global_idx));
@@ -644,7 +654,7 @@ impl WasmInstrumenter {
                     // Append N wrapper function bodies.
                     // Each wrapper: call original func, drop return values, read counter, encode as I64Small.
                     for i in 0..n {
-                        let counter_global_idx = existing_global_count + i;
+                        let counter_global_idx = counter_global_base + i;
                         let orig_func_idx = import_func_count + i;
                         let ret_count = func_type_indices
                             .get(i as usize)
@@ -726,7 +736,7 @@ impl WasmInstrumenter {
                     if !saw_code_section && n > 0 {
                         let mut codes = CodeSection::new();
                         for i in 0..n {
-                            let counter_global_idx = existing_global_count + i;
+                            let counter_global_idx = counter_global_base + i;
                             let orig_func_idx = import_func_count + i;
                             let ret_count = func_type_indices
                                 .get(i as usize)
@@ -4612,6 +4622,127 @@ mod tests {
             }
         }
         assert!(found, "accessor export sky_moon_scope_count_0 not found");
+    }
+
+    /// Build a minimal WASM module that already defines `global_count` mutable
+    /// i64 globals (initialised to distinct constants) plus one exported
+    /// function that reads global 0.
+    fn wasm_with_existing_globals(global_count: u32) -> Vec<u8> {
+        use wasm_encoder::{
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, GlobalSection,
+            GlobalType, Instruction, Module, TypeSection, ValType,
+        };
+
+        let mut module = Module::new();
+
+        let mut types = TypeSection::new();
+        types.ty().function([], [ValType::I64]);
+        module.section(&types);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        module.section(&functions);
+
+        let mut globals = GlobalSection::new();
+        for i in 0..global_count {
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I64,
+                    mutable: true,
+                    shared: false,
+                },
+                &wasm_encoder::ConstExpr::i64_const(i as i64),
+            );
+        }
+        module.section(&globals);
+
+        let mut exports = ExportSection::new();
+        exports.export("add", ExportKind::Func, 0);
+        module.section(&exports);
+
+        let mut codes = CodeSection::new();
+        let mut f = Function::new(vec![]);
+        // Read global 0 so the original global index is actually referenced.
+        f.instruction(&Instruction::GlobalGet(0));
+        f.instruction(&Instruction::End);
+        codes.function(&f);
+        module.section(&codes);
+
+        module.finish()
+    }
+
+    /// Collect (val_type, mutable, init_i64) for every global in `wasm`.
+    fn collect_globals(wasm: &[u8]) -> Vec<(ValType, bool, Option<i64>)> {
+        use wasmparser::{Parser, Payload};
+        let mut out = Vec::new();
+        for payload in Parser::new(0).parse_all(wasm) {
+            if let Ok(Payload::GlobalSection(reader)) = payload {
+                for global in reader {
+                    let global = global.unwrap();
+                    let init = match global.init_expr.get_operators_reader().read().unwrap() {
+                        wasmparser::Operator::I64Const(v) => Some(v),
+                        _ => None,
+                    };
+                    out.push((global.ty.content_type, global.ty.mutable, init));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_wasm_instrumenter_preserves_existing_global_indices() {
+        let wasm = wasm_with_existing_globals(3);
+        let original_globals = collect_globals(&wasm);
+        assert_eq!(original_globals.len(), 3);
+
+        let instr = WasmInstrumenter::new(&wasm).unwrap();
+        let instrumented = instr.instrument(&wasm).unwrap();
+        let new_globals = collect_globals(&instrumented);
+
+        // Original globals must remain at their original indices, unchanged.
+        assert!(new_globals.len() >= original_globals.len());
+        for (idx, orig) in original_globals.iter().enumerate() {
+            assert_eq!(
+                &new_globals[idx], orig,
+                "global at index {idx} was altered by instrumentation"
+            );
+        }
+
+        // Injected counters are appended after the originals.
+        let injected = &new_globals[original_globals.len()..];
+        assert_eq!(injected.len(), instr.func_names().len());
+        for g in injected {
+            assert_eq!(g.0, ValType::I64);
+            assert!(g.1, "counter globals must be mutable");
+            assert_eq!(g.2, Some(0), "counter globals must init to 0");
+        }
+    }
+
+    #[test]
+    fn test_wasm_instrumenter_existing_globals_still_execute() {
+        use soroban_sdk::testutils::Ledger;
+        use soroban_sdk::{Env, Symbol, Val};
+
+        let wasm = wasm_with_existing_globals(2);
+        let instr = WasmInstrumenter::new(&wasm).unwrap();
+        let instrumented = instr.instrument(&wasm).unwrap();
+
+        let env = Env::default();
+        env.ledger().set_protocol_version(22);
+        env.mock_all_auths();
+        let contract_id = env.register(&*instrumented, ());
+        env.cost_estimate().budget().reset_unlimited();
+
+        // The wrapper calls the original function, which reads global 0.
+        let wrapper_sym = Symbol::new(&env, "sky_moon_scope_count_0");
+        let empty_args: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.invoke_contract::<Val>(&contract_id, &wrapper_sym, empty_args)
+        }));
+        assert!(result.is_ok(), "wrapper should succeed with existing globals");
+        let count = result.unwrap().get_payload() >> 8;
+        assert!(count > 0, "counter should be > 0, got {count}");
     }
 
     // ── FlamegraphBuilder unit tests ──────────────────────────────────────────

@@ -50,6 +50,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::Stream;
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Status};
+use x509_parser::prelude::{FromDer, X509Certificate};
 
 use crate::ws::{SimulationBus, SimulationEvent};
 
@@ -529,9 +530,120 @@ fn load_cert_chain(path: &str) -> io::Result<String> {
     Ok(chain)
 }
 
+/// Validate the loaded certificate chain (Issue #016).
+///
+/// Rejects the configuration when:
+///
+/// * the leaf certificate's `not_after` field is in the past (expired), or
+/// * the issuer chain is incomplete — i.e. the leaf is not signed by the next
+///   certificate up, and so on, until a self-signed root is reached.
+///
+/// `certs` must be in file order (leaf first, root last), matching what
+/// [`load_cert_chain`] produces.
+fn validate_cert_chain(certs: &[Vec<u8>]) -> io::Result<()> {
+    if certs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "certificate chain is empty",
+        ));
+    }
+
+    // Parse every certificate up front so we can inspect validity and issuers.
+    let mut parsed: Vec<X509Certificate<'_>> = Vec::with_capacity(certs.len());
+    for (idx, der) in certs.iter().enumerate() {
+        let (_, cert) = X509Certificate::from_der(der).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to parse certificate at chain index {idx}: {e}"),
+            )
+        })?;
+        parsed.push(cert);
+    }
+
+    // 1. Expiry check on the leaf certificate.
+    let leaf = &parsed[0];
+    let now = chrono::Utc::now().timestamp();
+    let not_after = leaf.validity().not_after.timestamp();
+    if not_after < now {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "leaf certificate expired at {} (now {})",
+                leaf.validity().not_after,
+                chrono::Utc::now()
+            ),
+        ));
+    }
+    let not_before = leaf.validity().not_before.timestamp();
+    if not_before > now {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "leaf certificate is not yet valid (not_before {})",
+                leaf.validity().not_before
+            ),
+        ));
+    }
+
+    // 2. Chain completeness: each certificate must be issued by the next one
+    //    up, ending at a self-signed root.
+    for idx in 0..parsed.len() {
+        let cert = &parsed[idx];
+        let is_self_signed = cert.subject() == cert.issuer();
+        if is_self_signed {
+            // A self-signed certificate is only acceptable as the final root.
+            if idx != parsed.len() - 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "certificate at chain index {idx} is self-signed but is not the last \
+                         certificate in the chain; the issuer chain is incomplete"
+                    ),
+                ));
+            }
+            break;
+        }
+
+        // Non-root certificates must be followed by their issuer.
+        let Some(issuer) = parsed.get(idx + 1) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "certificate at chain index {idx} (subject '{}') has no issuer in the \
+                     chain; the issuer chain is incomplete",
+                    cert.subject()
+                ),
+            ));
+        };
+        if cert.issuer() != issuer.subject() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "certificate at chain index {idx} (subject '{}') is not issued by the next \
+                     certificate in the chain (issuer '{}', next subject '{}'); the issuer \
+                     chain is incomplete",
+                    cert.subject(),
+                    cert.issuer(),
+                    issuer.subject()
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Load the Tonic server [`Identity`] (full certificate chain + private key).
 fn load_identity(tls: &TlsConfig) -> io::Result<Identity> {
     let cert_chain = load_cert_chain(&tls.cert_chain)?;
+
+    // Re-parse the normalised chain so we can validate it before handing it to
+    // rustls (Issue #016). `load_cert_chain` already guarantees at least one
+    // well-formed CERTIFICATE block.
+    let mut reader = BufReader::new(cert_chain.as_bytes());
+    let certs = read_cert_chain(&mut reader).collect::<io::Result<Vec<_>>>()?;
+    validate_cert_chain(&certs)?;
+
     let key = fs::read_to_string(&tls.private_key).map_err(|e| {
         io::Error::new(
             e.kind(),
@@ -854,6 +966,125 @@ mod tests {
             loaded.matches("END CERTIFICATE").count(),
             2,
             "expected both certificate terminators to be preserved"
+        );
+    }
+
+    // ── Certificate chain validation (Issue #016) ─────────────────────────
+
+    /// Issue a leaf certificate signed by `ca` that expired in the past.
+    fn make_expired_leaf(ca: &RcCert, ca_key: &KeyPair) -> (RcCert, KeyPair) {
+        let mut params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("leaf params");
+        params.is_ca = IsCa::NoCa;
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "localhost".to_string());
+        params.distinguished_name = dn;
+        // Valid from 2020-01-01 to 2020-02-01 — firmly in the past.
+        params.not_before = time::OffsetDateTime::from_unix_timestamp(1_577_836_800)
+            .expect("not_before");
+        params.not_after = time::OffsetDateTime::from_unix_timestamp(1_580_515_200)
+            .expect("not_after");
+        let key = KeyPair::generate().expect("generate leaf key");
+        let cert = params
+            .signed_by(&key, ca, ca_key)
+            .expect("sign expired leaf with ca");
+        (cert, key)
+    }
+
+    fn der_of(cert: &RcCert) -> Vec<u8> {
+        cert.der().as_ref().to_vec()
+    }
+
+    #[test]
+    fn validate_cert_chain_accepts_valid_chain() {
+        let (ca, ca_key) = make_test_ca();
+        let (leaf, _leaf_key) = make_test_leaf(&ca, &ca_key);
+        let chain = vec![der_of(&leaf), der_of(&ca)];
+        validate_cert_chain(&chain).expect("valid chain must be accepted");
+    }
+
+    #[test]
+    fn validate_cert_chain_rejects_expired_leaf() {
+        let (ca, ca_key) = make_test_ca();
+        let (leaf, _leaf_key) = make_expired_leaf(&ca, &ca_key);
+        let chain = vec![der_of(&leaf), der_of(&ca)];
+        let err = validate_cert_chain(&chain).expect_err("expired leaf must be rejected");
+        assert!(
+            err.to_string().contains("expired"),
+            "error should mention expiry, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_cert_chain_rejects_self_signed_leaf() {
+        // A self-signed leaf (not a CA) presented as the only certificate.
+        let mut params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("leaf params");
+        params.is_ca = IsCa::NoCa;
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "localhost".to_string());
+        params.distinguished_name = dn;
+        let key = KeyPair::generate().expect("generate key");
+        let leaf = params.self_signed(&key).expect("self-sign leaf");
+        let chain = vec![der_of(&leaf)];
+        let err =
+            validate_cert_chain(&chain).expect_err("self-signed leaf must be rejected");
+        assert!(
+            err.to_string().contains("incomplete"),
+            "error should mention incomplete chain, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_cert_chain_rejects_incomplete_chain() {
+        // Leaf only, issued by a CA that is not present in the chain.
+        let (ca, ca_key) = make_test_ca();
+        let (leaf, _leaf_key) = make_test_leaf(&ca, &ca_key);
+        let chain = vec![der_of(&leaf)];
+        let err = validate_cert_chain(&chain)
+            .expect_err("leaf without its issuer must be rejected");
+        assert!(
+            err.to_string().contains("incomplete"),
+            "error should mention incomplete chain, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_cert_chain_rejects_mismatched_issuer() {
+        // Leaf signed by CA A, but chain presents unrelated CA B.
+        let (ca_a, ca_a_key) = make_test_ca();
+        let (leaf, _leaf_key) = make_test_leaf(&ca_a, &ca_a_key);
+        let (ca_b, _ca_b_key) = make_test_ca();
+        let chain = vec![der_of(&leaf), der_of(&ca_b)];
+        let err = validate_cert_chain(&chain)
+            .expect_err("mismatched issuer must be rejected");
+        assert!(
+            err.to_string().contains("incomplete"),
+            "error should mention incomplete chain, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_server_tls_rejects_expired_chain() {
+        let (ca, ca_key) = make_test_ca();
+        let (leaf, leaf_key) = make_expired_leaf(&ca, &ca_key);
+        let chain_pem = format!("{}\n{}", leaf.pem(), ca.pem());
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cert_path = dir.path().join("chain.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, chain_pem).expect("write chain");
+        std::fs::write(&key_path, leaf_key.serialize_pem()).expect("write key");
+
+        let tls = TlsConfig {
+            cert_chain: cert_path.display().to_string(),
+            private_key: key_path.display().to_string(),
+            ca_cert: None,
+        };
+        let err = build_server_tls(&tls).expect_err("expired chain must be rejected");
+        assert!(
+            err.to_string().contains("expired"),
+            "error should mention expiry, got: {err}"
         );
     }
 }

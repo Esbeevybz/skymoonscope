@@ -42,8 +42,11 @@ impl TimelockEscrow {
 
         write_config(&e, &config);
         write_guardians(&e, &guardians);
+        // Always reset approvals and bump the epoch so stale guardian approvals
+        // from a previous (e.g. cancelled) escrow epoch can never count toward
+        // the new quorum.
         write_approvals(&e, 0u32);
-        write_epoch(&e, 0u32);
+        write_epoch(&e, read_epoch(&e) + 1);
 
         e.storage().instance().extend_ttl(100, 100);
         Ok(())
