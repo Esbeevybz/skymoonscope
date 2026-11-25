@@ -18,6 +18,9 @@
 /// 3. **Report** – collate per-path resource measurements and surface the
 ///    worst-case and best-case profiles alongside a static branch inventory.
 use crate::simulation::{profile_contract, SimulationError, SorobanResources};
+
+/// Maximum allowed WASM byte size for caller-supplied binaries (Issue #520).
+pub const MAX_WASM_BYTE_SIZE: usize = 2 * 1024 * 1024; // 2 MB
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -880,6 +883,13 @@ pub fn analyze_wasm_branches(
     function_name: String,
     args: Vec<String>,
 ) -> Result<WasmBranchAnalysisResult, SimulationError> {
+    if wasm_bytes.len() > MAX_WASM_BYTE_SIZE {
+        return Err(SimulationError::InvalidContract(format!(
+            "WASM byte length {} exceeds maximum allowed limit of {} bytes",
+            wasm_bytes.len(),
+            MAX_WASM_BYTE_SIZE
+        )));
+    }
     // ── 1. Static analysis ────────────────────────────────────────────────────
     let (total_branch_count, max_nesting_depth, branch_type_breakdown, branches, estimated_paths) =
         match extract_function_body(&wasm_bytes, &function_name) {

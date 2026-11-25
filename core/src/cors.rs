@@ -34,11 +34,22 @@ pub fn build_cors_layer(allowed_origins: &str) -> CorsLayer {
         })
         .collect();
 
+    let is_prod = std::env::var("ENVIRONMENT")
+        .map(|v| v.eq_ignore_ascii_case("production"))
+        .unwrap_or(false);
+
     let allow_origin = if origins.is_empty() {
-        tracing::warn!(
-            "CORS_ALLOWED_ORIGINS is not set; allowing any origin (development fallback)"
-        );
-        AllowOrigin::any()
+        if is_prod {
+            tracing::error!(
+                "CORS_ALLOWED_ORIGINS is empty in production; wildcard AllowOrigin::any() disallowed"
+            );
+            AllowOrigin::list(vec![])
+        } else {
+            tracing::warn!(
+                "CORS_ALLOWED_ORIGINS is not set; allowing any origin (development fallback)"
+            );
+            AllowOrigin::any()
+        }
     } else {
         AllowOrigin::list(origins)
     };
