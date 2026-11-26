@@ -53,32 +53,8 @@ impl SchedulerExt for JobQueue {
         // Exponential backoff: 30 s, 60 s, 120 s, …
         let delay_secs = 2_u64.pow(new_retry_count as u32 - 1) * 30;
 
-        // Persist the incremented retry count and reset the status to QUEUED.
-        match &self.pool {
-            super::store::DbPool::Postgres(pool) => {
-                sqlx::query(
-                    "UPDATE jobs SET retry_count = $1, status = 'QUEUED' WHERE id = $2",
-                )
-                .bind(new_retry_count)
-                .bind(&job.id)
-                .execute(pool)
-                .await?;
-            }
-            super::store::DbPool::Sqlite(pool) => {
-                sqlx::query(
-                    "UPDATE jobs SET retry_count = ?1, status = 'QUEUED' WHERE id = ?2",
-                )
-                .bind(new_retry_count)
-                .bind(job.id.0.to_string())
-                .execute(pool)
-                .await?;
-            }
-        }
 
-        // Schedule the Redis re-enqueue as a bounded background task.
-        // If the dispatcher is saturated the retry is silently dropped — the
-        // job stays QUEUED in the DB and will be picked up by the next
-        // cleanup/requeue pass rather than spawning tasks without bound.
+        // Schedule the Redis re-enqueue as a bounded background task first (Issue #519).
         let queue = self.clone();
         let id_str = job.id.0.to_string();
         let outcome = self
@@ -98,6 +74,29 @@ impl SchedulerExt for JobQueue {
                 job_id = %job.id,
                 "Retry dispatcher saturated; retry scheduling dropped for this attempt"
             );
+            return Err(JobError::ProcessingFailed("Retry dispatcher saturated; redis enqueue dropped".to_string()));
+        }
+
+        // Persist the incremented retry count and reset the status to QUEUED only after confirming dispatch.
+        match &self.pool {
+            super::store::DbPool::Postgres(pool) => {
+                sqlx::query(
+                    "UPDATE jobs SET retry_count = $1, status = 'QUEUED' WHERE id = $2",
+                )
+                .bind(new_retry_count)
+                .bind(&job.id)
+                .execute(pool)
+                .await?;
+            }
+            super::store::DbPool::Sqlite(pool) => {
+                sqlx::query(
+                    "UPDATE jobs SET retry_count = ?1, status = 'QUEUED' WHERE id = ?2",
+                )
+                .bind(new_retry_count)
+                .bind(job.id.0.to_string())
+                .execute(pool)
+                .await?;
+            }
         }
 
         tracing::info!(
